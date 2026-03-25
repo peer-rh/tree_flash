@@ -34,9 +34,20 @@ for each step:
 ## Tree Extension Idea
 
 Replace linear acceptance with tree-structured verification:
-- Keep top-k candidates at each draft position → token tree
+- Draft a primary path of sequential tokens from the current anchor
+- Attach an alternative continuation subtree at each node on that primary path
+- Represent each attached subtree as an arbitrary rooted tree over relative paths
 - Verify multiple paths in one target pass with tree attention mask
 - Accept the longest valid path (more accepted tokens per verification step)
+
+## Tree v1
+
+`Tree v1` is parameterized by `seq_depth` and `sub_tree`.
+
+- `seq_depth` is the length of the primary drafted path starting from the current anchor.
+- `sub_tree` is an arbitrary rooted tree shape attached at each node of that primary path.
+- A convenient representation of `sub_tree` is a set of relative paths. For example, `01, 02, 03, 14, 15, 26, 27` defines a depth-2 subtree where node `0` has children `1, 2, 3`, node `1` has children `4, 5`, and node `2` has children `6, 7`.
+- The full verification tree is the primary path plus one attached copy of `sub_tree` at every position along that path.
 
 ## Key Files
 
