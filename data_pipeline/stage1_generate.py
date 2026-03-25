@@ -138,7 +138,7 @@ def main() -> None:
         help="Maximum completion tokens per sample (default: 2048)",
     )
     parser.add_argument(
-        "--temperature", type=float, default=0.0,
+        "--temperature", type=float, default=1.0,
     )
     parser.add_argument(
         "--tp-size", type=int, default=1,

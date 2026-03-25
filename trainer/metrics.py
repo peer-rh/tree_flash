@@ -155,6 +155,7 @@ def validate_loss(
     val_loader,
     target_layer_ids: list[int],
     ar_loss_weight: float,
+    ancestor_matrix: torch.Tensor,
     n_steps: int,
     device: torch.device,
 ) -> dict[str, float]:
@@ -163,13 +164,14 @@ def validate_loss(
 
     Parameters
     ----------
-    model           : DraftWrapper (already fabric.setup'd)
-    target          : frozen target model
-    val_loader      : DataLoader yielding (context_ids, tree_tokens, cumprod_weights)
-    target_layer_ids: list of target layer indices for feature extraction
-    ar_loss_weight  : λ for AR head loss term
-    n_steps         : number of batches to evaluate
-    device          : device for tensors
+    model            : DraftWrapper (already fabric.setup'd)
+    target           : frozen target model
+    val_loader       : DataLoader yielding (context_ids, tree_tokens, tree_probs)
+    target_layer_ids : list of target layer indices for feature extraction
+    ar_loss_weight   : λ for AR head loss term
+    ancestor_matrix  : [tree_size, tree_size] bool (device-resident, from TreeSpec)
+    n_steps          : number of batches to evaluate
+    device           : device for tensors
 
     Returns
     -------
@@ -180,13 +182,13 @@ def validate_loss(
     total, draft_total, ar_total = 0.0, 0.0, 0.0
     count = 0
 
-    for step, (context_ids, tree_tokens, cumprod_weights) in enumerate(val_loader):
+    for step, (context_ids, tree_tokens, tree_probs) in enumerate(val_loader):
         if step >= n_steps:
             break
 
-        context_ids = context_ids.to(device)       # [B, ctx_len]
-        tree_tokens = tree_tokens.to(device)        # [B, tree_size]
-        cumprod_weights = cumprod_weights.to(device) # [B, tree_size]
+        context_ids = context_ids.to(device)    # [B, ctx_len]
+        tree_tokens = tree_tokens.to(device)     # [B, tree_size]
+        tree_probs  = tree_probs.to(device)      # [B, tree_size]
 
         # Target model: get conditioning hidden states
         target_out = target(
@@ -205,7 +207,8 @@ def validate_loss(
         # ar_logits:    [B, tree_size, V]
 
         loss, d_loss, a_loss = compute_loss(
-            draft_logits, ar_logits, tree_tokens, cumprod_weights, ar_loss_weight
+            draft_logits, ar_logits, tree_tokens, tree_probs,
+            ar_loss_weight, ancestor_matrix,
         )
 
         total += loss.item()

@@ -44,8 +44,9 @@ from model.ar_head import ARHead
 from model.draft_wrapper import DraftWrapper
 from trainer.loss import compute_loss
 from trainer.metrics import TreeMetrics, validate_loss, validate_spec
-from dflash.model.dflash import DFlashDraftModel
+from trainer.bench import run_bench, load_bench_prompts
 from dflash.model.utils import extract_context_feature
+from model.draft_model import TreeDraftModel
 
 
 class FabricTrainer:
@@ -77,6 +78,8 @@ class FabricTrainer:
         self.train_loader: DataLoader | None = None
         self.val_loader: DataLoader | None = None
         self.target_layer_ids: list[int] | None = None
+        self.ancestor_matrix: torch.Tensor | None = None
+        self.bench_prompts: list | None = None      # populated by setup() if configured
 
     # ── Setup ────────────────────────────────────────────────────────────────
 
@@ -87,13 +90,13 @@ class FabricTrainer:
 
         # ── Tree spec ────────────────────────────────────────────────────────
         self.tree_spec = TreeSpec(
-            seq_depth=cfg.seq_depth,
+            n_subtrees=cfg.n_subtrees,
             sub_tree_paths=cfg.sub_tree_paths,
         )
         tree_size = self.tree_spec.tree_size
         self.fabric.print(
-            f"Tree: seq_depth={cfg.seq_depth}, sub_tree_paths={cfg.sub_tree_paths}, "
-            f"tree_size={tree_size}"
+            f"Tree: n_subtrees={cfg.n_subtrees}, sub_tree_paths={cfg.sub_tree_paths}, "
+            f"subtree_size={self.tree_spec.subtree_size}, tree_size={tree_size}"
         )
 
         # ── Target model (frozen) ────────────────────────────────────────────
@@ -112,9 +115,9 @@ class FabricTrainer:
         # Either load from a checkpoint or initialise from the target config.
         draft_config = AutoConfig.from_pretrained(cfg.target_model_path)
         if cfg.draft_checkpoint is not None:
-            draft = DFlashDraftModel.from_pretrained(cfg.draft_checkpoint)
+            draft = TreeDraftModel.from_pretrained(cfg.draft_checkpoint)
         else:
-            draft = DFlashDraftModel(draft_config)
+            draft = TreeDraftModel(draft_config)
             # Re-use target embeddings to initialise (they're shared at inference)
             draft.post_init()
 
@@ -122,8 +125,8 @@ class FabricTrainer:
 
         # ── AR head ──────────────────────────────────────────────────────────
         ar_head = ARHead(
-            hidden_size=draft_config.hidden_size,
-            rms_eps=draft_config.rms_norm_eps,
+            config=draft_config,
+            num_draft_layers=len(draft.layers),
         )
         # Inject shared lm_head (frozen reference — not a new parameter)
         ar_head.lm_head = target.lm_head
@@ -171,9 +174,14 @@ class FabricTrainer:
         self.model, self.optimizer = self.fabric.setup(model, optimizer)
         self.scheduler = scheduler
 
+        # Ancestor matrix on device — passed to compute_loss at each step.
+        # Not a model parameter; placed once at setup.
+        self.ancestor_matrix = self.tree_spec.ancestor_matrix.to(device)
+        # [tree_size, tree_size] bool
+
         # ── Dataloaders ──────────────────────────────────────────────────────
-        train_ds = Stage2Dataset(cfg.data_path, split="train")
-        val_ds = Stage2Dataset(cfg.data_path, split="val")
+        train_ds = Stage2Dataset(cfg.data_path, ctx_len=cfg.ctx_len, n_subtrees=cfg.n_subtrees, split="train")
+        val_ds   = Stage2Dataset(cfg.data_path, ctx_len=cfg.ctx_len, n_subtrees=cfg.n_subtrees, split="val")
 
         train_loader = DataLoader(
             train_ds,
@@ -195,6 +203,23 @@ class FabricTrainer:
         self.train_loader, self.val_loader = self.fabric.setup_dataloaders(
             train_loader, val_loader
         )
+
+        # ── Benchmark prompts ────────────────────────────────────────────────
+        # Loaded once on rank 0; bench is skipped on other ranks.
+        if cfg.bench_data_path is not None and self.fabric.is_global_zero:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(cfg.target_model_path)
+            self.bench_prompts = load_bench_prompts(
+                cfg.bench_data_path,
+                tokenizer,
+                cfg.bench_n_prompts,
+                cfg.ctx_len,
+                device,
+            )
+            self.fabric.print(
+                f"Bench: loaded {len(self.bench_prompts)} prompts "
+                f"from {cfg.bench_data_path}"
+            )
 
     # ── Training loop ────────────────────────────────────────────────────────
 
@@ -218,14 +243,14 @@ class FabricTrainer:
         while step < cfg.total_steps:
             # ── Fetch batch ──────────────────────────────────────────────────
             try:
-                context_ids, tree_tokens, cumprod_weights = next(train_iter)
+                context_ids, tree_tokens, tree_probs = next(train_iter)
             except StopIteration:
                 train_iter = iter(self.train_loader)
-                context_ids, tree_tokens, cumprod_weights = next(train_iter)
+                context_ids, tree_tokens, tree_probs = next(train_iter)
 
-            # context_ids:      [B, ctx_len]    int64  (already on device via Fabric)
-            # tree_tokens:      [B, tree_size]  int64
-            # cumprod_weights:  [B, tree_size]  float32
+            # context_ids  : [B, ctx_len]    int64  (on device via Fabric)
+            # tree_tokens  : [B, tree_size]  int64  (-1 = IGNORE_IDX)
+            # tree_probs   : [B, tree_size]  float32 (individual AR probs)
 
             # ── Target conditioning (frozen, no grad) ────────────────────────
             with torch.no_grad():
@@ -256,8 +281,9 @@ class FabricTrainer:
                     draft_logits,
                     ar_logits,
                     tree_tokens,
-                    cumprod_weights,
+                    tree_probs,
                     cfg.ar_loss_weight,
+                    self.ancestor_matrix,
                 )
 
                 # Scale loss by accumulation factor so gradients are correct
@@ -296,6 +322,7 @@ class FabricTrainer:
                         val_loader=self.val_loader,
                         target_layer_ids=self.target_layer_ids,
                         ar_loss_weight=cfg.ar_loss_weight,
+                        ancestor_matrix=self.ancestor_matrix,
                         n_steps=cfg.val_steps,
                         device=device,
                     )
@@ -333,6 +360,28 @@ class FabricTrainer:
                             f"[val spec]  step={step}  "
                             + "  ".join(f"{k}={v:.4f}" for k, v in scalars.items())
                         )
+
+                # ── Benchmark ────────────────────────────────────────────────
+                if (
+                    step % cfg.bench_every == 0
+                    and self.bench_prompts
+                    and self.fabric.is_global_zero
+                ):
+                    self.model.eval()
+                    bench_metrics = run_bench(
+                        model=self.model,
+                        target=self.target,
+                        prompt_tokens=self.bench_prompts,
+                        tree_spec=self.tree_spec,
+                        target_layer_ids=self.target_layer_ids,
+                        max_new_tokens=cfg.bench_max_new_tokens,
+                        n_candidate_tokens=cfg.bench_n_candidate_tokens,
+                    )
+                    self.model.train()
+                    self.fabric.print(
+                        f"[bench]  step={step}  "
+                        + "  ".join(f"{k}={v:.3f}" for k, v in bench_metrics.items())
+                    )
 
                 # ── Checkpoint ───────────────────────────────────────────────
                 if step % cfg.save_every == 0:

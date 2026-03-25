@@ -23,9 +23,12 @@ class TrainConfig:
     batch_size: int = 4         # per-device batch size
 
     # ── Tree ─────────────────────────────────────────────────────────────────
-    seq_depth: int = 8
-    # e.g. ["01","02","03","14","15","26","27"] for a depth-2 sub_tree
-    sub_tree_paths: list[str] = field(default_factory=list)
+    n_subtrees: int = 8          # primary path length used during training
+    # Default subtree: root has children 1,2,3; node 1→(4,5); node 2→(6,7)
+    # subtree_size=7, tree_size = n_subtrees + n_subtrees*7 = 8*8 = 64
+    sub_tree_paths: list[str] = field(
+        default_factory=lambda: ["0-1", "0-2", "0-3", "1-4", "1-5", "2-6", "2-7"]
+    )
 
     # ── Training ─────────────────────────────────────────────────────────────
     lr: float = 3e-4
@@ -43,6 +46,15 @@ class TrainConfig:
     val_spec_every: int = 1_000     # steps between full spec-decode val passes
     val_steps: int = 64             # number of batches per val pass
     save_every: int = 5_000
+
+    # ── Benchmark (generation quality) ───────────────────────────────────────
+    # bench_data_path: JSONL with {"prompt": "..."} lines (pre-formatted).
+    # Set to None to disable.  Only rank-0 runs the benchmark.
+    bench_data_path: Optional[str] = None
+    bench_n_prompts: int = 20           # prompts loaded at setup time
+    bench_max_new_tokens: int = 128
+    bench_every: int = 2_000            # steps between benchmark passes
+    bench_n_candidate_tokens: Optional[int] = None  # None = no pruning
 
     # ── Fabric / hardware ────────────────────────────────────────────────────
     devices: int = 8

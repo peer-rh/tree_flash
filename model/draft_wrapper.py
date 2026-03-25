@@ -1,5 +1,5 @@
 """
-Thin wrapper combining DFlashDraftModel + ARHead for joint training.
+Thin wrapper combining TreeDraftModel + ARHead for joint training.
 
 Key insight from reading dflash/model/dflash.py:
     DFlashDraftModel.forward() returns backbone_hs (the normed final hidden
@@ -7,8 +7,13 @@ Key insight from reading dflash/model/dflash.py:
     The lm_head is called EXTERNALLY: target.lm_head(backbone_hs).
     The embedding table lives on the target model: target.model.embed_tokens.
 
+Shared backbone design:
+    layers[0..N-2]  →  shared_hs
+    shared_hs  →  layers[N-1]  →  norm  →  lm_head  →  draft_logits
+    shared_hs + parent_proj(parent_embeds)  →  ar_layer  →  norm  →  lm_head  →  ar_logits
+
 This wrapper therefore needs references to:
-    draft        — DFlashDraftModel (trainable)
+    draft        — TreeDraftModel (trainable)
     ar_head      — ARHead (trainable)
     lm_head      — shared Linear [H → V] from target (frozen weights)
     embed_tokens — shared Embedding [V → H] from target (frozen weights)
@@ -40,7 +45,7 @@ class DraftWrapper(nn.Module):
 
     Parameters
     ----------
-    draft                : DFlashDraftModel — the 5-layer bidirectional drafter
+    draft                : TreeDraftModel — the bidirectional drafter
     ar_head              : ARHead — tree-topology-aware pruning head
     lm_head              : nn.Linear [H → V] — shared with target, kept frozen
     embed_tokens         : nn.Embedding [V → H] — shared with target, kept frozen
@@ -86,6 +91,10 @@ class DraftWrapper(nn.Module):
         self.register_buffer("position_ids", abs_pos)
         # [1, tree_size]
 
+        # Scratch space for the most-recent infer_forward context; used by ar_qvalues.
+        # Not a buffer — cleared each step, not meant for checkpointing.
+        self._infer_ctx: tuple[Tensor, Tensor, tuple[Tensor, Tensor]] | None = None
+
     def forward(
         self,
         anchor_ids: Tensor,          # [B]          — last context token id per sample
@@ -101,15 +110,9 @@ class DraftWrapper(nn.Module):
         Parameters
         ----------
         anchor_ids        : [B]
-            Token id of the last accepted context token (used as the "parent"
-            of the tree root in the AR head).
         raw_target_hidden : [B, ctx_len, n_feature_layers * H]
-            Concatenated hidden states from target_layer_ids target layers.
-            Passed directly to DFlashDraftModel.forward() which projects them
-            internally (via self.fc + self.hidden_norm).
-        tree_tokens       : [B, tree_size]
-            Ground-truth token ids at each tree node.  Used only for building
-            parent token embeddings (teacher forcing for AR head).
+        tree_tokens       : [B, tree_size] — ground-truth tokens; used to build
+                            parent token embeddings (teacher forcing for AR head)
 
         Returns
         -------
@@ -119,44 +122,50 @@ class DraftWrapper(nn.Module):
         B, tree_size = tree_tokens.shape
 
         # ── Noise embedding ──────────────────────────────────────────────────
-        # All tree positions masked; shape [B, tree_size]
         noise_ids = torch.full(
             (B, tree_size),
             self.mask_token_id,
             dtype=torch.long,
             device=tree_tokens.device,
         )
-        noise_embedding = self.embed_tokens(noise_ids)
-        # [B, tree_size, H]
+        noise_embedding = self.embed_tokens(noise_ids)  # [B, tree_size, H]
 
-        # ── Draft model: bidirectional over ALL tree nodes ───────────────────
-        # position_ids is [1, tree_size]; expand to [B, tree_size]
-        backbone_hs = self.draft(
-            position_ids=self.position_ids.expand(B, -1),
+        # ── Shared backbone: layers[0..N-2] ──────────────────────────────────
+        pos = self.position_ids.expand(B, -1)  # [B, tree_size]
+        shared_hs, target_hidden_proj, pos_emb = self.draft.shared_forward(
+            position_ids=pos,
             noise_embedding=noise_embedding,
-            target_hidden=raw_target_hidden,   # projected inside DFlashDraftModel
+            target_hidden=raw_target_hidden,
             use_cache=False,
         )
-        # backbone_hs: [B, tree_size, H]
+        # shared_hs:          [B, tree_size, H]
+        # target_hidden_proj: [B, ctx_len, H]
+        # pos_emb:            (cos, sin)
 
-        # ── Draft logits via shared lm_head ──────────────────────────────────
-        draft_logits = self.lm_head(backbone_hs)
-        # [B, tree_size, V]
+        # ── Diffusion head: layers[N-1] + norm + lm_head ─────────────────────
+        backbone_hs = self.draft.diffusion_head(
+            shared_hs=shared_hs,
+            target_hidden_proj=target_hidden_proj,
+            position_embeddings=pos_emb,
+            use_cache=False,
+        )
+        draft_logits = self.lm_head(backbone_hs)  # [B, tree_size, V]
 
         # ── AR head: tree-topology-aware ─────────────────────────────────────
         # Build extended token sequence: [anchor, tree_token_0, …, tree_token_{T-1}]
-        # Shape: [B, 1 + tree_size]
         extended_ids = torch.cat([anchor_ids.unsqueeze(1), tree_tokens], dim=1)
-
-        # For each node i: index = adjusted_parent_ids[i]
-        #   root (i=0)  → index 0  → anchor token embedding
-        #   others      → index parent_ids[i] + 1 → parent tree_token embedding
-        # adjusted_parent_ids: [tree_size]; indexing gives [B, tree_size]
+        # For each node i: adjusted_parent_ids[i] indexes into extended_ids
+        #   root (i=0)  → 0  → anchor embedding
+        #   others      → parent_ids[i] + 1  → parent tree_token embedding
         parent_embeds = self.embed_tokens(extended_ids[:, self.adjusted_parent_ids])
         # [B, tree_size, H]
 
-        ar_logits = self.ar_head(backbone_hs, parent_embeds)
-        # [B, tree_size, V]
+        ar_logits = self.ar_head(
+            shared_hs=shared_hs,
+            parent_embeds=parent_embeds,
+            target_hidden_proj=target_hidden_proj,
+            position_embeddings=pos_emb,
+        )  # [B, tree_size, V]
 
         return draft_logits, ar_logits
 
@@ -172,22 +181,14 @@ class DraftWrapper(nn.Module):
         """
         Inference-time draft pass.  No teacher forcing; AR head not called.
 
-        Use this inside validate_spec and the spec-decode loop.  The training
-        ``forward()`` requires ground-truth ``tree_tokens`` for parent embeds
-        (teacher forcing); here we skip the AR head entirely.
-
-        Parameters
-        ----------
-        anchor_ids        : [B]
-        raw_target_hidden : [B, ctx_len, n_feature_layers * H]
-        draft_past_kv     : optional DynamicCache for multi-step decode;
-                            pass None on the first step (empty cache)
+        After this call, (shared_hs, target_hidden_proj, pos_emb) are cached in
+        self._infer_ctx so that ar_qvalues() can be called without re-running the
+        shared backbone (Exp 2+ pruning).
 
         Returns
         -------
         draft_logits : [B, tree_size, V]
-        backbone_hs  : [B, tree_size, H]  — returned for optional AR-head
-                       q-value computation during pruning (Exp 2+)
+        backbone_hs  : [B, tree_size, H]  normed diffusion-head output
         """
         B = anchor_ids.shape[0]
         tree_size = self.position_ids.shape[1]
@@ -199,38 +200,55 @@ class DraftWrapper(nn.Module):
         noise_embedding = self.embed_tokens(noise_ids)  # [B, tree_size, H]
 
         pos = self.position_ids.expand(B, -1) if position_ids is None else position_ids
-        # pos: [B, tree_size] for single-step, [B, n_ctx+tree_size] for multi-step decode
-        backbone_hs = self.draft(
+
+        shared_hs, target_hidden_proj, pos_emb = self.draft.shared_forward(
             position_ids=pos,
             noise_embedding=noise_embedding,
             target_hidden=raw_target_hidden,
             past_key_values=draft_past_kv,
             use_cache=(draft_past_kv is not None),
-        )  # [B, tree_size, H]
+        )
+
+        backbone_hs = self.draft.diffusion_head(
+            shared_hs=shared_hs,
+            target_hidden_proj=target_hidden_proj,
+            position_embeddings=pos_emb,
+            past_key_values=draft_past_kv,
+            use_cache=(draft_past_kv is not None),
+        )
+
+        # Cache context for optional ar_qvalues() call
+        self._infer_ctx = (shared_hs, target_hidden_proj, pos_emb)
 
         draft_logits = self.lm_head(backbone_hs)  # [B, tree_size, V]
         return draft_logits, backbone_hs
 
     def ar_qvalues(
         self,
-        backbone_hs: Tensor,    # [B, tree_size, H]
         anchor_ids: Tensor,     # [B] — true anchor (context last token)
         draft_tokens: Tensor,   # [B, tree_size] — sampled draft tokens
     ) -> Tensor:                # [B, tree_size, V]
         """
         AR head forward at inference time using sampled draft tokens as parents.
 
-        Called after ``infer_forward`` + sampling when pruning is active (Exp 2+).
+        Must be called after infer_forward() in the same step (uses cached context).
         Not needed for Exp 1 (no pruning).
 
         Parameters
         ----------
-        backbone_hs  : [B, tree_size, H] from infer_forward()
-        anchor_ids   : [B] — used as the parent embed of the root node
+        anchor_ids   : [B]
         draft_tokens : [B, tree_size] — draft model's sampled tokens
         """
-        # Build [anchor, tree_token_0, …, tree_token_{T-1}]: [B, 1 + tree_size]
+        assert self._infer_ctx is not None, "Call infer_forward() before ar_qvalues()"
+        shared_hs, target_hidden_proj, pos_emb = self._infer_ctx
+
         extended_ids = torch.cat([anchor_ids.unsqueeze(1), draft_tokens], dim=1)
         parent_embeds = self.embed_tokens(extended_ids[:, self.adjusted_parent_ids])
         # [B, tree_size, H]
-        return self.ar_head(backbone_hs, parent_embeds)  # [B, tree_size, V]
+
+        return self.ar_head(
+            shared_hs=shared_hs,
+            parent_embeds=parent_embeds,
+            target_hidden_proj=target_hidden_proj,
+            position_embeddings=pos_emb,
+        )  # [B, tree_size, V]

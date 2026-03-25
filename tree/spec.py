@@ -3,24 +3,24 @@ Tree structure definition for Tree-v1 speculative decoding.
 
 Tree layout
 -----------
-The full tree is parameterised by ``seq_depth`` and ``sub_tree_paths``.
+The full tree is parameterised by ``n_subtrees`` and ``sub_tree_paths``.
 
 Primary path (the left-most path of the full tree):
-    node 0 → node 1 → … → node seq_depth-1
+    node 0 → node 1 → … → node n_subtrees-1
     parent_ids[0] = -1  (root)
-    parent_ids[i] = i-1  for i in 1..seq_depth-1
+    parent_ids[i] = i-1  for i in 1..n_subtrees-1
 
-Attached sub_tree at primary-path node i:
-    sub_tree_paths is a list of 2-char strings, e.g. ["01","02","14"].
-    "XY" means sub_tree node X has child Y (single-digit indices, node 0 = attachment point).
-    For each primary-path node i, the non-root sub_tree nodes (all nodes except 0)
+Attached subtree at primary-path node i:
+    sub_tree_paths is a list of dash-separated edge strings, e.g. ["0-1","0-2","1-4"].
+    "X-Y" means subtree node X has child Y (node 0 = attachment point).
+    For each primary-path node i, the non-root subtree nodes (all nodes except 0)
     are placed at absolute indices:
-        base_i + local_j   where base_i = seq_depth + i * n_sub
-    and local_j is the 0-based rank of sub_tree node j among non-root nodes sorted ascending.
+        base_i + local_j   where base_i = n_subtrees + i * subtree_size
+    and local_j is the 0-based rank of subtree node j among non-root nodes sorted ascending.
 
 Total tree size:
-    tree_size = seq_depth + seq_depth * n_sub
-    where n_sub = number of non-root sub_tree nodes (= len(unique non-zero nodes in paths))
+    tree_size = n_subtrees + n_subtrees * subtree_size
+    where subtree_size = number of non-root subtree nodes (= len(unique non-zero nodes in paths))
 """
 
 from __future__ import annotations
@@ -33,23 +33,24 @@ import torch
 
 def _parse_sub_tree(paths: list[str]) -> tuple[list[int], dict[int, int]]:
     """
-    Parse sub_tree path strings into a sorted node list and parent map.
+    Parse sub_tree_paths edge strings into a sorted node list and parent map.
 
     Parameters
     ----------
-    paths : e.g. ["01", "02", "14"]
+    paths : e.g. ["0-1", "0-2", "1-4"]  (each string is "parent-child")
 
     Returns
     -------
-    non_root_nodes : sorted list of non-zero sub_tree node indices
+    non_root_nodes : sorted list of non-zero subtree node indices
     parent_map     : {child_node: parent_node} (0-indexed, 0 = attachment root)
     """
     parent_map: dict[int, int] = {}
     all_nodes: set[int] = {0}
     for path in paths:
-        assert len(path) == 2, f"sub_tree path must be 2 chars, got {path!r}"
-        p, c = int(path[0]), int(path[1])
-        assert c not in parent_map, f"node {c} has duplicate parent in sub_tree"
+        parts = path.split("-")
+        assert len(parts) == 2, f"sub_tree edge must be 'X-Y', got {path!r}"
+        p, c = int(parts[0]), int(parts[1])
+        assert c not in parent_map, f"node {c} has duplicate parent in subtree"
         parent_map[c] = p
         all_nodes |= {p, c}
     non_root_nodes = sorted(all_nodes - {0})
@@ -57,7 +58,7 @@ def _parse_sub_tree(paths: list[str]) -> tuple[list[int], dict[int, int]]:
 
 
 def _sub_tree_depth(node: int, parent_map: dict[int, int]) -> int:
-    """Depth of a sub_tree node relative to the sub_tree root (node 0)."""
+    """Depth of a subtree node relative to the subtree root (node 0)."""
     depth = 0
     cur = node
     while cur in parent_map:
@@ -76,13 +77,14 @@ class TreeSpec:
 
     Parameters
     ----------
-    seq_depth       : length of the primary (left-most) path
-    sub_tree_paths  : list of 2-char strings defining the attached sub_tree
+    n_subtrees      : number of primary-path nodes (= primary path length)
+    sub_tree_paths  : list of "X-Y" edge strings defining the attached subtree
                       (empty list → pure chain, no branching)
 
     Derived attributes
     ------------------
-    tree_size            : int  — total number of nodes
+    subtree_size         : int  — number of non-root nodes in one subtree copy
+    tree_size            : int  — total number of nodes = n_subtrees + n_subtrees * subtree_size
     parent_ids           : [tree_size]         long  — -1 for root
     depths               : [tree_size]         long  — 0 for root
     ancestor_matrix      : [tree_size, tree_size] bool
@@ -97,10 +99,11 @@ class TreeSpec:
                            (add ctx_len at the call site when building absolute positions)
     """
 
-    seq_depth: int
+    n_subtrees: int
     sub_tree_paths: list[str] = field(default_factory=list)
 
     # Derived — set in __post_init__
+    subtree_size: int = field(init=False)
     tree_size: int = field(init=False)
     parent_ids: torch.Tensor = field(init=False)          # [tree_size]
     depths: torch.Tensor = field(init=False)              # [tree_size]
@@ -111,25 +114,25 @@ class TreeSpec:
 
     def __post_init__(self) -> None:
         non_root_nodes, parent_map = _parse_sub_tree(self.sub_tree_paths)
-        n_sub = len(non_root_nodes)  # non-root sub_tree nodes per attachment point
+        self.subtree_size = len(non_root_nodes)  # non-root subtree nodes per attachment point
 
-        # local_idx: sub_tree node number → 0-based rank among non-root nodes
+        # local_idx: subtree node number → 0-based rank among non-root nodes
         local_idx: dict[int, int] = {n: i for i, n in enumerate(non_root_nodes)}
 
-        self.tree_size = self.seq_depth + self.seq_depth * n_sub
+        self.tree_size = self.n_subtrees + self.n_subtrees * self.subtree_size
 
         parent_ids_list = [-1] * self.tree_size
         depths_list = [0] * self.tree_size
 
         # ── Primary path ────────────────────────────────────────────────────
-        for i in range(1, self.seq_depth):
+        for i in range(1, self.n_subtrees):
             parent_ids_list[i] = i - 1
             depths_list[i] = i
 
-        # ── Sub_tree copies attached at each primary-path node ───────────────
-        for i in range(self.seq_depth):
-            base = self.seq_depth + i * n_sub   # absolute index of first non-root node
-            primary_depth = i                    # depth of attachment point
+        # ── Subtree copies attached at each primary-path node ───────────────
+        for i in range(self.n_subtrees):
+            base = self.n_subtrees + i * self.subtree_size  # absolute index of first non-root node
+            primary_depth = i                               # depth of attachment point
 
             for sub_node in non_root_nodes:
                 j = local_idx[sub_node]          # 0-based rank
@@ -140,7 +143,7 @@ class TreeSpec:
                     # Parent is the primary-path node itself
                     parent_ids_list[abs_idx] = i
                 else:
-                    # Parent is another non-root sub_tree node
+                    # Parent is another non-root subtree node
                     parent_ids_list[abs_idx] = base + local_idx[sub_parent]
 
                 depths_list[abs_idx] = primary_depth + _sub_tree_depth(sub_node, parent_map)
@@ -181,7 +184,6 @@ class TreeSpec:
         #   root (parent_ids = -1) → 0   (the anchor slot)
         #   others                 → parent_ids[i] + 1
         self.adjusted_parent_ids = self.parent_ids.clone()
-        self.adjusted_parent_ids[self.adjusted_parent_ids == -1] = -1  # keep for clarity
         self.adjusted_parent_ids = self.adjusted_parent_ids + 1
         self.adjusted_parent_ids[0] = 0  # root → anchor at position 0
 
@@ -206,5 +208,5 @@ class TreeSpec:
         return [i for i in range(self.tree_size) if i not in has_child]
 
     def leftmost_path(self) -> list[int]:
-        """The primary path: nodes 0..seq_depth-1."""
-        return list(range(self.seq_depth))
+        """The primary path: nodes 0..n_subtrees-1."""
+        return list(range(self.n_subtrees))
