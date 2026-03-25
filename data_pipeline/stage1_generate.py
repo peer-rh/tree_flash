@@ -1,149 +1,218 @@
 """
 Stage 1: Synthetic dataset generation.
 
-Uses vLLM to generate completions from the target model, storing per-token
-logprobs for anchor selection in Stage 2, and top-b token IDs/probs at each
-position for level-0 tree construction in Stage 2 (avoiding a second forward
-pass through the model).
+Uses vLLM to generate completions from the target model for the DFlash
+training mixture (Nemotron V2 + CodeAlpaca), producing JSONL files consumed
+by Stage 2.
 
-Output format (one JSON-lines file per dataset split):
+Output format (one JSONL file per shard):
 {
-    "prompt_token_ids": List[int],
-    "completion_token_ids": List[int],
-    "chosen_logprobs": List[float],   # log p(chosen_token[t]) at each position
-    "top_token_ids": List[List[int]], # top-b token IDs at each position
-    "top_logprobs": List[List[float]] # log probs for the top-b tokens
+    "prompt":   str,   # chat-template-formatted prompt fed to vLLM
+    "response": str    # decoded model completion
 }
+
+Stage 2 (stage2_trees.py) tokenizes prompt and response independently; the
+prompt text already contains all special tokens from the chat template so
+it is encoded with add_special_tokens=False.
 """
 
 import argparse
 import json
-import math
 import os
+import random
 from pathlib import Path
 
+from datasets import load_dataset, concatenate_datasets
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
-from sys import path as sys_path
-sys_path.insert(0, str(Path(__file__).parent.parent / "dflash"))
-from model.utils import load_and_process_dataset
 
+# ---------------------------------------------------------------------------
+# Dataset loading
+# ---------------------------------------------------------------------------
 
-def build_prompts(dataset, tokenizer, enable_thinking: bool = False):
-    """Convert dataset turns into tokenized chat prompts."""
-    prompts = []
-    for instance in dataset:
-        messages = []
-        for turn in instance["turns"]:
-            messages.append({"role": "user", "content": turn})
-            # For multi-turn we only generate the first turn here;
-            # extend to multi-turn by iterating if needed.
-            break
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking,
+def load_dflash_prompts(
+    tokenizer,
+    num_samples: int = 800_000,
+    max_seq_len: int = 3072,
+) -> list[str]:
+    """
+    Load the DFlash training mixture: Nemotron V2 + CodeAlpaca.
+
+    Returns a list of chat-template-formatted prompt strings, shuffled and
+    filtered to at most num_samples entries whose token length is ≤ 66% of
+    max_seq_len (leaving headroom for the completion).
+    """
+    print("Loading Nemotron and CodeAlpaca datasets...")
+    prompts: list[list[dict]] = []
+
+    # CodeAlpaca (~20 k samples)
+    try:
+        code_ds = load_dataset("HuggingFaceH4/CodeAlpaca_20k", split="train")
+        for row in code_ds:
+            content = row.get("prompt", "")
+            prompts.append([{"role": "user", "content": content}])
+    except Exception as e:
+        print(f"Warning: could not load CodeAlpaca: {e}")
+
+    # Nemotron V2 (streamed to avoid downloading the full ~6 M dataset)
+    try:
+        nemo_ds = concatenate_datasets(
+            load_dataset(
+                "nvidia/Nemotron-Post-Training-Dataset-v2",
+                split=["chat", "math", "code", "stem"],
+            )
         )
-        prompts.append(text)
-    return prompts
+        nemo_ds = nemo_ds.shuffle(seed=42)
+        for row in nemo_ds:
+            if "messages" not in row or not row["messages"]:
+                continue
+            message = next(
+                (m for m in row["messages"] if m["role"] == "user"), None
+            )
+            if message is None:
+                continue
+            if len(message["content"]) >= max_seq_len * 4:
+                # character-level pre-filter (rough, before tokenisation)
+                continue
+            prompts.append([{"role": "user", "content": message["content"]}])
+            if len(prompts) >= num_samples * 2:
+                break
+    except Exception as e:
+        print(f"Warning: could not load Nemotron: {e}")
+
+    random.seed(42)
+    random.shuffle(prompts)
+
+    print("Applying chat template...")
+    formatted: list[str] = [
+        tokenizer.apply_chat_template(
+            p, tokenize=False, add_generation_prompt=True
+        )
+        for p in prompts
+    ]
+
+    # Filter by token length, keeping prompts that leave room for a completion
+    token_lengths = [
+        len(ids)
+        for ids in tokenizer(formatted, add_special_tokens=False)["input_ids"]
+    ]
+    max_prompt_tokens = int(max_seq_len * 0.66)
+    filtered = [
+        fmt
+        for fmt, tlen in zip(formatted, token_lengths)
+        if tlen <= max_prompt_tokens
+    ][:num_samples]
+
+    print(f"Prompts after filtering: {len(filtered)} / {len(formatted)}")
+    return filtered
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True,
-                        help="Target model path or HF name, e.g. Qwen/Qwen3-8B")
-    parser.add_argument("--dataset", type=str, required=True,
-                        help="Dataset name: gsm8k, math500, humaneval, alpaca, ...")
-    parser.add_argument("--output-dir", type=str, required=True,
-                        help="Directory to write output JSONL files")
-    parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-b", type=int, default=4,
-                        help="Number of top tokens to store per position (used for "
-                             "level-0 tree construction in Stage 2)")
-    parser.add_argument("--tp-size", type=int, default=1,
-                        help="Tensor parallel size for vLLM")
-    parser.add_argument("--enable-thinking", action="store_true")
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Stage 1: generate prompt/response pairs with vLLM."
+    )
+    parser.add_argument(
+        "--model", required=True,
+        help="Target model HF name or local path, e.g. Qwen/Qwen3-8B",
+    )
+    parser.add_argument(
+        "--output-dir", required=True,
+        help="Directory to write output JSONL shard(s)",
+    )
+    parser.add_argument(
+        "--num-samples", type=int, default=800_000,
+        help="Total prompt/response pairs to generate (default: 800 000)",
+    )
+    parser.add_argument(
+        "--max-seq-len", type=int, default=3072,
+        help="Max full-sequence token length; prompts > 66%% of this are dropped "
+             "(default: 3072)",
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=2048,
+        help="Maximum completion tokens per sample (default: 2048)",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.0,
+    )
+    parser.add_argument(
+        "--tp-size", type=int, default=1,
+        help="Tensor parallel size for vLLM (default: 1)",
+    )
+    parser.add_argument(
+        "--enable-thinking", action="store_true",
+        help="Pass enable_thinking=True to apply_chat_template (Qwen3 thinking mode)",
+    )
+    parser.add_argument(
+        "--shard-size", type=int, default=100_000,
+        help="Write a new JSONL shard every N records (default: 100 000)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    output_path = Path(args.output_dir) / f"{args.dataset}.jsonl"
-
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    dataset = load_and_process_dataset(args.dataset)
-    if args.max_samples and len(dataset) > args.max_samples:
-        dataset = dataset.shuffle(seed=0).select(range(args.max_samples))
 
-    prompts = build_prompts(dataset, tokenizer, args.enable_thinking)
+    prompts = load_dflash_prompts(
+        tokenizer,
+        num_samples=args.num_samples,
+        max_seq_len=args.max_seq_len,
+    )
+
+    if args.enable_thinking:
+        # Re-apply template with enable_thinking flag
+        prompts = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            for p in prompts
+        ]
 
     llm = LLM(
         model=args.model,
         dtype="bfloat16",
         tensor_parallel_size=args.tp_size,
-        # Enable prefix caching so Stage 2 tree generation can reuse KV cache
-        # when processing the same sequences again.
         enable_prefix_caching=True,
     )
 
-    # logprobs=top_b: vLLM returns the top-b log probs at each token position.
-    # The chosen token is always included in the top-b (it has the highest prob
-    # under greedy decoding at temperature=0).
     sampling_params = SamplingParams(
         temperature=args.temperature,
         max_tokens=args.max_new_tokens,
-        logprobs=args.top_b,
-        # prompt_logprobs not needed — we only care about completion positions.
     )
 
+    print(f"Generating completions for {len(prompts)} prompts...")
     outputs = llm.generate(prompts, sampling_params)
 
-    written = 0
-    with open(output_path, "w") as f:
-        for output, instance in zip(outputs, dataset):
-            completion = output.outputs[0]
+    shard_idx = 0
+    written_total = 0
+    written_shard = 0
+    fout = open(Path(args.output_dir) / f"shard_{shard_idx:04d}.jsonl", "w")
 
-            if completion.logprobs is None:
-                continue
+    for prompt_text, output in zip(prompts, outputs):
+        completion = output.outputs[0]
+        response_text = completion.text
 
-            prompt_token_ids = list(output.prompt_token_ids)
-            completion_token_ids = list(completion.token_ids)
+        record = {"prompt": prompt_text, "response": response_text}
+        fout.write(json.dumps(record) + "\n")
+        written_total += 1
+        written_shard += 1
 
-            # Per-position top-b token IDs and log probs.
-            # completion.logprobs is a list (length = num_generated_tokens) of
-            # Dict[int, Logprob] sorted by logprob descending.
-            top_token_ids = []
-            top_logprobs = []
-            chosen_logprobs = []
+        if written_shard >= args.shard_size:
+            fout.close()
+            print(f"Shard {shard_idx}: {written_shard} records")
+            shard_idx += 1
+            written_shard = 0
+            fout = open(Path(args.output_dir) / f"shard_{shard_idx:04d}.jsonl", "w")
 
-            for pos_logprobs in completion.logprobs:
-                # vLLM Logprob objects have .logprob (float) and .rank (int).
-                sorted_items = sorted(
-                    pos_logprobs.items(),
-                    key=lambda kv: kv[1].logprob,
-                    reverse=True,
-                )
-                ids = [tok_id for tok_id, _ in sorted_items]
-                lps = [lp.logprob for _, lp in sorted_items]
-                top_token_ids.append(ids)
-                top_logprobs.append(lps)
-                # Chosen token is always the one with the highest rank under
-                # greedy. Under temperature=0 this is ids[0].
-                chosen_logprobs.append(lps[0])
-
-            record = {
-                "prompt_token_ids": prompt_token_ids,
-                "completion_token_ids": completion_token_ids,
-                "chosen_logprobs": chosen_logprobs,
-                "top_token_ids": top_token_ids,
-                "top_logprobs": top_logprobs,
-            }
-            f.write(json.dumps(record) + "\n")
-            written += 1
-
-    print(f"Wrote {written} records to {output_path}")
+    fout.close()
+    print(f"Done. Total records: {written_total}  Shards: {shard_idx + 1}")
 
 
 if __name__ == "__main__":
