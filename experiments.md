@@ -1,5 +1,4 @@
 # Experiments Plan
-> TODO: Tree position encoding
 ## Datasets
 - **Math**: GSM8K, MATH-500, AIME24, AIME25
 - **Code**: HumanEval, MBPP, LiveCodeBench, SWE-Bench
@@ -22,11 +21,24 @@
 |---|---|
 | Tree | Tree v1 |
 | Pruning | None |
-| SD Optimisation | Uniform |
+| SD Optimisation | None |
 | Loss Scaling | CumProds |
 | Sibling Deduplication | None |
+| Tree Position Embeddings | Both |
 
-### Experiment 2: Pruning
+### Experiment 2: Tree Position Embedding
+**Goal:** Are both needed or is one enough
+
+| Component | Choice |
+|---|---|
+| Tree | Tree v1 |
+| Pruning | None |
+| SD Optimisation | None |
+| Loss Scaling | CumProds |
+| Sibling Deduplication | None |
+| Tree Position Embeddings | Initial Bias vs Relational Bias |
+
+### Experiment 3: Pruning
 **Goal:** Find the best pruning method.
 
 | Component | Choice |
@@ -36,17 +48,31 @@
 | SD Optimisation | Pruning_Probs (+ quick check with Uniform) |
 | Loss Scaling | CumProds |
 | Sibling Deduplication | None |
+| Tree Position Embeddings | -- |
 
-### Experiment 3: Sibling Deduplication
+### Experiment 4: Tree Shape
+**Goal:** Find a more suitable tree shape
+
+| Component | Choice |
+|---|---|
+| Tree | Tree v1 vs a tree which moves mass to earlier tokens |
+| Pruning | -- |
+| SD Optimisation | Pruning_Probs |
+| Loss Scaling | CumProds |
+| Sibling Deduplication | None |
+| Tree Position Embeddings | -- |
+
+### Experiment 5: Sibling Deduplication
 **Goal:** Find the best method for maximising diversity across siblings.
 
 | Component | Choice |
 |---|---|
 | Tree | Tree v1 |
-| Pruning | **Best from Exp 2** |
+| Pruning | -- |
 | SD Optimisation | Pruning_Probs |
 | Loss Scaling | CumProds |
 | Sibling Deduplication | Aux Loss (+ run baseline checkpoint with Deduplicated Sampling) |
+| Tree Position Embeddings | -- |
 
 ---
 
@@ -71,6 +97,8 @@ Improves the probability distribution used in rejection sampling (inference-time
 - **Pruning_Probs** — use the pruning head's probability estimates directly.
 
 ### Loss Scaling
+> TODO: We might have to introduce ablation which measures this against the decay used in DFlash
+> Alternatively introduce smoothing parameter?
 - **CumProds** — root node has p=1; each node's loss is scaled by the cumulative product of verifier probabilities along its path from root. Directly extends DFlash's loss scaling to the tree setting and enables lazy evaluation of low-probability branches.
 
 ### Sibling Deduplication
@@ -78,3 +106,13 @@ Prevents siblings from drafting the same token, wasting tree capacity.
 - **None**
 - **Deduplicated Sampling** — sample siblings without replacement to guarantee no repeated tokens.
 - **Aux Loss** — KL divergence penalty to push sibling logit distributions apart.
+
+### Tree Position Embeddings
+- **Initial Bias** - A embedding from vertex_idx which gets added to the noise_embds
+- **Relational Attention Bias** - A head wise attention bias based on the relationship (parent, child-1, sibling, ancestor, ...)
+- **Both** - Use Both
+
+### Loss Masking
+> TODO: Must we ablate this? (Currently Ignore)
+- **Ignore** - We ignore non-generated tokens (low weighting)
+- **Pad Token** - We align to predict mask tokens
