@@ -846,10 +846,15 @@ def generate_trees(
 
 
 def load_tokenized_records(
-    data_dir: Path,
     tokenizer,
     max_len: int | None,
     *,
+    data_dir: Path | None = None,
+    hf_dataset: str | None = None,
+    hf_config: str | None = None,
+    hf_split: str = "train",
+    prompt_column: str = "prompt",
+    response_column: str = "response",
     sort_descending: bool,
     num_proc: int | None = None,
 ) -> Dataset:
@@ -860,18 +865,38 @@ def load_tokenized_records(
             "Stage 2 now requires Hugging Face `datasets` for JSONL loading, tokenization, and filtering."
         ) from exc
 
-    files = sorted(data_dir.glob("*.jsonl"))
-    if not files:
-        raise FileNotFoundError(f"No .jsonl files found in {data_dir}")
-    dataset = load_dataset(
-        "json",
-        data_files=[str(path) for path in files],
-        split="train",
-    )
+    if (data_dir is None) == (hf_dataset is None):
+        raise ValueError("Pass exactly one input source: --data-dir or --hf-dataset.")
+
+    if data_dir is not None:
+        files = sorted(data_dir.glob("*.jsonl"))
+        if not files:
+            raise FileNotFoundError(f"No .jsonl files found in {data_dir}")
+        dataset = load_dataset(
+            "json",
+            data_files=[str(path) for path in files],
+            split="train",
+        )
+    else:
+        dataset = load_dataset(
+            hf_dataset,
+            name=hf_config,
+            split=hf_split,
+        )
+
+    missing_columns = [
+        column for column in (prompt_column, response_column)
+        if column not in dataset.column_names
+    ]
+    if missing_columns:
+        raise ValueError(
+            f"Input dataset is missing required columns {missing_columns}; "
+            f"available columns: {dataset.column_names}"
+        )
 
     def tokenize_batch(batch: dict[str, list[str]]) -> dict[str, list[list[int]] | list[int]]:
-        prompt_ids = tokenizer(batch["prompt"], add_special_tokens=False)["input_ids"]
-        response_ids = tokenizer(batch["response"], add_special_tokens=False)["input_ids"]
+        prompt_ids = tokenizer(batch[prompt_column], add_special_tokens=False)["input_ids"]
+        response_ids = tokenizer(batch[response_column], add_special_tokens=False)["input_ids"]
         total_len = [len(prompt) + len(response) for prompt, response in zip(prompt_ids, response_ids)]
         return {
             "prompt_ids": prompt_ids,
@@ -1173,7 +1198,13 @@ def merge_hdf5_parts(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stage 2 v2: batched subtree generation with KV caching.")
     parser.add_argument("--model", required=True, help="HF model name or local path")
-    parser.add_argument("--data-dir", required=True, help="Directory of stage-1 JSONL shards")
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--data-dir", help="Directory of stage-1 JSONL shards")
+    input_group.add_argument("--hf-dataset", help="HF Hub dataset id containing prompt/response rows")
+    parser.add_argument("--hf-config", default=None, help="Optional HF dataset config name")
+    parser.add_argument("--hf-split", default="train", help="HF dataset split to load")
+    parser.add_argument("--prompt-column", default="prompt", help="Dataset column containing prompt text")
+    parser.add_argument("--response-column", default="response", help="Dataset column containing response text")
     parser.add_argument("--output", required=True, help="Output HDF5 path")
     parser.add_argument(
         "--sub-tree-paths",
@@ -1314,9 +1345,14 @@ def main() -> None:
 
             dataset_prep_start = time.perf_counter()
             records = load_tokenized_records(
-                Path(args.data_dir),
                 tokenizer,
                 args.max_len,
+                data_dir=Path(args.data_dir) if args.data_dir is not None else None,
+                hf_dataset=args.hf_dataset,
+                hf_config=args.hf_config,
+                hf_split=args.hf_split,
+                prompt_column=args.prompt_column,
+                response_column=args.response_column,
                 sort_descending=True,
                 num_proc=args.dataset_num_proc,
             )

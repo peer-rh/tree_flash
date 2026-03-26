@@ -43,7 +43,7 @@ Stage 1 is handled by the existing DFlash stage-1 tooling. It produces a directo
 
 ## Stage 2 — Sub-Tree Generation (`v2/stage2.py`)
 
-For each prompt+response pair from stage 1, stage 2 runs the target model and builds a **sub-tree** at each response token position. The sub-tree encodes the most likely alternative continuations starting from that position.
+For each prompt+response pair from stage 1, or from a Hugging Face Hub dataset with `prompt` and `response` fields, stage 2 runs the target model and builds a **sub-tree** at each response token position. The sub-tree encodes the most likely alternative continuations starting from that position.
 
 ### Sub-tree structure
 
@@ -100,11 +100,24 @@ python v2/stage2.py \
   --attn-implementation sdpa
 ```
 
+HF Hub dataset:
+```bash
+python v2/stage2.py \
+  --model Qwen/Qwen3-8B \
+  --hf-dataset your-org/your-prompt-response-dataset \
+  --hf-split train \
+  --output data/stage2_v2.h5 \
+  --n-subtrees 64 \
+  --batch-size 1 \
+  --attn-implementation sdpa
+```
+
 Multi-GPU data parallel:
 ```bash
 torchrun --standalone --nproc_per_node=4 v2/stage2.py \
   --model Qwen/Qwen3-8B \
-  --data-dir data/stage1/ \
+  --hf-dataset your-org/your-prompt-response-dataset \
+  --hf-split train \
   --output data/stage2_v2.h5 \
   --n-subtrees 64 \
   --batch-size 1 \
