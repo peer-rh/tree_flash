@@ -33,6 +33,7 @@ sys.path.insert(0, str(_ROOT / "v2"))
 from model.dflash import DFlashDraftModel  # noqa: E402
 from model.utils import extract_context_feature  # noqa: E402
 from stage2 import SubTreeInfo, IGNORE_IDX, DEFAULT_SUB_TREE_PATHS  # noqa: E402
+from v2.model import TreeDFlashDraftModel  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -303,11 +304,13 @@ class TreePositionEmbedding(nn.Module):
         st_info: SubTreeInfo,
         use_initial: bool = True,
         use_relational: bool = True,
+        num_draft_layers: int = 1,
     ):
         super().__init__()
         self.use_initial = use_initial
         self.use_relational = use_relational
         self.num_heads = num_heads
+        self.num_draft_layers = num_draft_layers
         self.st_size = st_size
 
         if use_initial:
@@ -315,7 +318,9 @@ class TreePositionEmbedding(nn.Module):
             nn.init.zeros_(self.vertex_embedding.weight)
 
         if use_relational:
-            self.relation_bias = nn.Embedding(NUM_RELATIONS, num_heads)
+            # One bias vector per (layer, head) pair so each draft layer can learn
+            # independent relational preferences.
+            self.relation_bias = nn.Embedding(NUM_RELATIONS, num_draft_layers * num_heads)
             nn.init.zeros_(self.relation_bias.weight)
             rel_matrix = build_relation_matrix(st_info)
             self.register_buffer("relation_matrix", rel_matrix)  # [st_size, st_size]
@@ -326,13 +331,21 @@ class TreePositionEmbedding(nn.Module):
             return None
         return self.vertex_embedding(vertex_ids % self.st_size)
 
-    def get_score_mod(self, block_vertex_ids_captured: torch.Tensor, ctx_len: int, block_len: int):
-        """Returns a score_mod closure for flex_attention."""
+    def get_score_mod(
+        self,
+        block_vertex_ids_captured: torch.Tensor,
+        ctx_len: int,
+        block_len: int,
+        layer_idx: int = 0,
+    ):
+        """Returns a score_mod closure for flex_attention for the given draft layer."""
         if not self.use_relational:
             return None
 
         rel_matrix = self.relation_matrix  # [st_size, st_size]
         relation_bias = self.relation_bias  # nn.Embedding
+        num_heads = self.num_heads
+        head_offset = layer_idx * num_heads
 
         def score_mod(score, b, h, q_idx, kv_idx):
             in_ctx = kv_idx < ctx_len
@@ -340,10 +353,22 @@ class TreePositionEmbedding(nn.Module):
             q_v = block_vertex_ids_captured[b, q_idx] % self.st_size
             k_v = block_vertex_ids_captured[b, blk_idx] % self.st_size
             rel_type = rel_matrix[q_v, k_v]
-            bias = relation_bias(rel_type)[h]
+            bias = relation_bias(rel_type)[head_offset + h]
             return score + torch.where(in_ctx, torch.zeros_like(bias), bias)
 
         return score_mod
+
+    def get_score_mods(
+        self,
+        block_vertex_ids_captured: torch.Tensor,
+        ctx_len: int,
+        block_len: int,
+    ) -> list:
+        """Returns one score_mod per draft layer."""
+        return [
+            self.get_score_mod(block_vertex_ids_captured, ctx_len, block_len, i)
+            for i in range(self.num_draft_layers)
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -457,20 +482,21 @@ def forward_and_loss(
             block_len,
             device,
         )
-        score_mod_fn = tree_pos_emb.get_score_mod(block_vertex_ids, ctx_len, block_len)
+        score_mods_list = tree_pos_emb.get_score_mods(block_vertex_ids, ctx_len, block_len)
     else:
         attn_mask = _build_dense_mask(
             block_anchor_pos, ctx_doc_mask, ctx_valid, block_valid,
             ctx_len, block_len, device
         )
-        score_mod_fn = None
+        score_mods_list = None
 
-    # D: Draft forward
+    # D: Draft forward — pass per-layer score_mods for tree relational bias
     draft_hidden = draft_model(
         position_ids=block_position_ids,
         attention_mask=attn_mask,
         noise_embedding=noise_embeds,
         target_hidden=target_hidden,
+        score_mods=score_mods_list,
     )  # [B, block_len, H]
 
     vocab_size = target_model.config.vocab_size
@@ -607,17 +633,20 @@ def evaluate(
                 ctx_input_ids.shape, block_anchor_pos, ctx_doc_mask,
                 ctx_valid, block_valid, ctx_len, block_len, device,
             )
+            score_mods_list = tree_pos_emb.get_score_mods(block_vertex_ids, ctx_len, block_len)
         else:
             attn_mask = _build_dense_mask(
                 block_anchor_pos, ctx_doc_mask, ctx_valid, block_valid,
                 ctx_len, block_len, device,
             )
+            score_mods_list = None
 
         draft_hidden = draft_model(
             position_ids=block_position_ids,
             attention_mask=attn_mask,
             noise_embedding=noise_embeds,
             target_hidden=target_hidden,
+            score_mods=score_mods_list,
         )
         logits = target_model.lm_head(draft_hidden)  # [B, block_len, V]
         vocab_size = target_model.config.vocab_size
@@ -814,6 +843,8 @@ def main():
         default="flex",
     )
     parser.add_argument("--eval-batches", type=int, default=50)
+    parser.add_argument("--log-every", type=int, default=10,
+                        help="Log train metrics to Wandb every N grad steps")
     parser.add_argument("--seed", type=int, default=42)
 
     # Fabric / DDP
@@ -876,11 +907,13 @@ def main():
     draft_model = DFlashDraftModel.from_pretrained(
         args.draft_model, torch_dtype=load_dtype,
     )
+    draft_model.__class__ = TreeDFlashDraftModel
     draft_model.train()
 
     mask_token_id = draft_model.mask_token_id
     if mask_token_id is None:
         raise ValueError("Draft model config must have mask_token_id in dflash_config")
+    num_draft_layers = draft_model.config.num_hidden_layers
 
     # ---- torch.compile (before Fabric setup) ----
     if args.compile:
@@ -898,7 +931,6 @@ def main():
     use_relational = args.tree_pos_emb in ("relational", "both")
     num_heads = target_model.config.num_attention_heads
 
-    # TODO: Shouldn't this be layer wise
     tree_pos_emb = TreePositionEmbedding(
         st_size=st_size,
         hidden_size=target_model.config.hidden_size,
@@ -906,6 +938,7 @@ def main():
         st_info=st_info,
         use_initial=use_initial,
         use_relational=use_relational,
+        num_draft_layers=num_draft_layers,
     )
 
     # ---- Optimizer ----
@@ -1014,9 +1047,12 @@ def main():
             draft_model.train()
             tree_pos_emb.train()
 
-            # Gradient accumulation: disable sync for non-final micro-steps
+            # Gradient accumulation: suppress DDP sync on non-final micro-steps for
+            # both trainable modules so gradients are only communicated once per
+            # optimizer step (avoids O(grad_accum_steps) all-reduces).
             is_accumulating = (step + 1) % args.grad_accum_steps != 0
-            with fabric.no_backward_sync(draft_model, enabled=is_accumulating):
+            with fabric.no_backward_sync(draft_model, enabled=is_accumulating), \
+                 fabric.no_backward_sync(tree_pos_emb, enabled=is_accumulating):
                 loss = forward_and_loss(
                     batch, target_model, draft_model, tree_pos_emb,
                     ctx_len, use_flex,
@@ -1028,17 +1064,18 @@ def main():
 
             if not is_accumulating:
                 fabric.clip_gradients(draft_model, optimizer, max_norm=1.0)
+                fabric.clip_gradients(tree_pos_emb, optimizer, max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
 
                 avg_loss = accum_loss / args.grad_accum_steps
                 if fabric.is_global_zero:
                     print(f"step={step+1}  loss={avg_loss:.4f}  lr={cur_lr:.2e}", flush=True)
-                    # TODO: Set log interval
-                    _log_wandb({
-                        "train/loss": avg_loss,
-                        "train/lr": cur_lr,
-                    }, step=step + 1)
+                    if (step + 1) % args.log_every == 0:
+                        _log_wandb({
+                            "train/loss": avg_loss,
+                            "train/lr": cur_lr,
+                        }, step=step + 1)
                 accum_loss = 0.0
 
             # Eval

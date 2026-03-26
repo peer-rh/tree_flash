@@ -12,8 +12,7 @@
 - [ ] **Experiment 5** (Sibling Deduplication): Aux Loss vs Deduplicated Sampling
 - [ ] **Correctness test** for `spec_dec.py`: greedy output at temperature=0 must match target-only generation exactly
 - [ ] **Speed benchmark**: tree spec_dec vs linear DFlash `spec_generate` vs target-only on GSM8K
-- [ ] Fix TODO in `stage3.py`: relational attention bias is currently single set of head biases; consider making it per-layer
-- [ ] Fix TODO in `stage3.py`: add configurable Wandb log interval (currently logs every grad step)
+- [x] Wire per-layer `score_mod` into DFlashDraftModel so each layer uses its own relational bias — done via `TreeDFlashDraftModel` subclass in `v2/model.py`
 - [ ] Evaluate whether CumProds decay smoothing is needed (see `experiments.md` note on DFlash comparison)
 - [ ] Add `--prompt-file` batch mode to `spec_dec.py` benchmark output (tokens/sec per prompt)
 - [ ] Stage 2: consider parallelising across GPUs (currently single-GPU)
@@ -116,7 +115,7 @@ Trains the DFlash draft model (`DFlashDraftModel`) plus a new `TreePositionEmbed
 
 2. **`TreePositionEmbedding`** — new module, two optional components:
    - **Initial Bias** (`use_initial=True`): a learned `nn.Embedding(st_size, hidden_size)` indexed by vertex id. Added to the noise embedding before the draft forward so siblings get distinct input representations.
-   - **Relational Attention Bias** (`use_relational=True`): a learned `nn.Embedding(7, num_heads)` (7 relation types: self, parent, child, sibling, ancestor, descendant, other). Applied as a per-head score bias in flex attention via `score_mod`.
+   - **Relational Attention Bias** (`use_relational=True`): a learned `nn.Embedding(NUM_RELATIONS, num_draft_layers * num_heads)` (7 relation types × draft layers × heads). Each draft layer gets its own slice of `num_heads` bias scalars per relation type. Applied as a per-head score bias in flex attention via `score_mod`. `get_score_mod(layer_idx)` returns a closure for a specific layer; `get_score_mods()` returns the full list. `TreeDFlashDraftModel` (in `v2/model.py`) routes each layer's closure via the `score_mods` parameter.
 
 ### Training data format
 
@@ -135,7 +134,7 @@ Trains the DFlash draft model (`DFlashDraftModel`) plus a new `TreePositionEmbed
 
 **Block side** (bidirectional): all tokens within the same anchor's tree block attend to each other fully — equivalent to block-diagonal bidirectional attention per anchor. This is implemented as a flex attention `mask_mod` or a dense 4D additive mask (`--attn-impl dense`).
 
-The relational attention bias is applied via flex attention's `score_mod` on top of the block mask.
+The relational attention bias is applied via flex attention's `score_mod`, passed as `score_mod=` kwarg to the draft forward (active when the draft model uses flex attention; silently ignored for sdpa/eager).
 
 ### Loss
 
@@ -150,8 +149,9 @@ loss = mean over valid nodes of [cumprob(node) × CE(logits[node], label[node])]
 ### Training loop
 
 - **LR schedule**: linear warmup then cosine decay
-- **Gradient accumulation**: `--grad-accum-steps` micro-steps before an optimizer step; uses `fabric.no_backward_sync` to avoid unnecessary DDP syncs
-- **Gradient clipping**: max norm 1.0
+- **Gradient accumulation**: `--grad-accum-steps` micro-steps before an optimizer step; both `draft_model` and `tree_pos_emb` are wrapped in `fabric.no_backward_sync` so DDP all-reduces happen only on the final micro-step — `grad_accum_steps - 1` redundant all-reduces per optimizer step are suppressed for both modules
+- **Gradient clipping**: max norm 1.0, applied to `draft_model` and `tree_pos_emb` independently before each optimizer step
+- **Wandb log interval**: `--log-every N` (default 10) controls how often train metrics are sent to Wandb; the per-step console print is unaffected
 - **Eval** every `--eval-every` steps: computes loss + 5 metrics (see below)
 - **Checkpointing** every `--save-every` steps: saves `fabric_ckpt.pt` (Fabric state dict for resume) and `hf_draft/` + `tree_pos_emb.pt` (HF format for inference)
 
@@ -185,7 +185,8 @@ python v2/stage3.py \
   --precision bf16-mixed \
   --compile \
   --wandb-project tree-flash \
-  --wandb-run-name run1
+  --wandb-run-name run1 \
+  --log-every 10
 ```
 
 Resume:
@@ -250,6 +251,7 @@ python v2/spec_dec.py \
 
 | File | Purpose |
 |---|---|
+| `v2/model.py` | `TreeDFlashDraftModel` subclass: routes per-layer `score_mod` closures from `TreePositionEmbedding` to individual draft layers |
 | `v2/stage2.py` | Sub-tree generation: runs target model on stage-1 data, expands tree of alternatives at low-confidence positions, writes HDF5 |
 | `v2/stage3.py` | Training: CumProds-weighted CE loss, flex attention, Lightning Fabric DDP, Wandb, checkpoint resume |
 | `v2/spec_dec.py` | Inference: tree speculative decoding with KV cache reuse and cleanup |

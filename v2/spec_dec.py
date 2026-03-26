@@ -31,6 +31,7 @@ from model.dflash import DFlashDraftModel  # noqa: E402
 from model.utils import extract_context_feature, load_and_process_dataset, sample  # noqa: E402
 from stage2 import SubTreeInfo, DEFAULT_SUB_TREE_PATHS  # noqa: E402
 from stage3 import TreePositionEmbedding  # noqa: E402
+from v2.model import TreeDFlashDraftModel  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +134,16 @@ def draft_tree(
     tree_pos_ids = (seq_start + pos_offsets).unsqueeze(0)  # [1, tree_size]
     full_pos_ids = torch.cat([ctx_pos_ids, tree_pos_ids], dim=1)  # [1, new_ctx_len + tree_size]
 
-    # DFlashDraftModel.forward: hidden_states starts as noise_embedding,
-    # target_hidden is only used for K/V injection. Output shape = [1, tree_size, H].
+    # Per-layer relational bias via score_mods
+    score_mods = None
+    if tree_pos_emb is not None and tree_pos_emb.use_relational:
+        ctx_len = full_pos_ids.shape[1] - tree_size
+        score_mods = tree_pos_emb.get_score_mods(
+            vertex_ids_flat.unsqueeze(0).expand(1, -1),
+            ctx_len=ctx_len,
+            block_len=tree_size,
+        )
+
     draft_hidden = draft_model(
         target_hidden=target_hidden_new,
         noise_embedding=noise_embeds,
@@ -142,6 +151,7 @@ def draft_tree(
         past_key_values=past_kv_draft,
         use_cache=True,
         is_causal=False,
+        score_mods=score_mods,
     )  # [1, tree_size, H]
 
     # Crop draft KV cache: discard tree block entries, keep only context
@@ -457,7 +467,9 @@ def load_models(args) -> tuple[nn.Module, DFlashDraftModel, TreePositionEmbeddin
     ).to(device).eval()
 
     print(f"Loading draft model: {args.draft_model}")
-    draft = DFlashDraftModel.from_pretrained(args.draft_model, torch_dtype=torch_dtype).to(device).eval()
+    draft = DFlashDraftModel.from_pretrained(args.draft_model, torch_dtype=torch_dtype)
+    draft.__class__ = TreeDFlashDraftModel
+    draft = draft.to(device).eval()
 
     tree_pos_emb = None
     if args.tree_pos_emb_path is not None:
