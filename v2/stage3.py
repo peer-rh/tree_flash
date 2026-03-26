@@ -433,7 +433,6 @@ def forward_and_loss(
     draft_model: DFlashDraftModel,
     tree_pos_emb: TreePositionEmbedding,
     ctx_len: int,
-    use_flex: bool,
 ) -> torch.Tensor:
     # Fabric handles device placement via setup_dataloaders, so tensors are already on device
     ctx_input_ids = batch["ctx_input_ids"]           # [B, ctx_len]
@@ -464,31 +463,25 @@ def forward_and_loss(
         target_hidden = extract_context_feature(
             target_out.hidden_states, draft_model.target_layer_ids
         )
+        del target_out
 
     # B: Noise embeddings + initial tree position bias
     noise_embeds = target_model.model.embed_tokens(block_noise_ids)  # [B, block_len, H]
     if tree_pos_emb.use_initial:
         noise_embeds = noise_embeds + tree_pos_emb.get_initial_bias(block_vertex_ids)
 
-    # C: Attention mask
-    if use_flex:
-        attn_mask = build_flex_mask(
-            ctx_input_ids.shape,
-            block_anchor_pos,
-            ctx_doc_mask,
-            ctx_valid,
-            block_valid,
-            ctx_len,
-            block_len,
-            device,
-        )
-        score_mods_list = tree_pos_emb.get_score_mods(block_vertex_ids, ctx_len, block_len)
-    else:
-        attn_mask = _build_dense_mask(
-            block_anchor_pos, ctx_doc_mask, ctx_valid, block_valid,
-            ctx_len, block_len, device
-        )
-        score_mods_list = None
+    # C: Attention mask (flex attention)
+    attn_mask = build_flex_mask(
+        ctx_input_ids.shape,
+        block_anchor_pos,
+        ctx_doc_mask,
+        ctx_valid,
+        block_valid,
+        ctx_len,
+        block_len,
+        device,
+    )
+    score_mods_list = tree_pos_emb.get_score_mods(block_vertex_ids, ctx_len, block_len)
 
     # D: Draft forward — pass per-layer score_mods for tree relational bias
     draft_hidden = draft_model(
@@ -516,35 +509,6 @@ def forward_and_loss(
     return valid_losses.mean()
 
 
-def _build_dense_mask(
-    block_anchor_pos, ctx_doc_mask, ctx_valid, block_valid,
-    ctx_len, block_len, device
-) -> torch.Tensor:
-    """Dense 4D additive mask [B, 1, block_len, ctx_len+block_len] for debugging."""
-    B = block_anchor_pos.shape[0]
-    full_len = ctx_len + block_len
-
-    ctx_pos = torch.arange(ctx_len, device=device).view(1, 1, ctx_len)
-    q_anchor = block_anchor_pos.unsqueeze(-1)  # [B, block_len, 1]
-
-    # context side
-    same_doc = (
-        ctx_doc_mask.unsqueeze(1) == ctx_doc_mask.gather(1, block_anchor_pos).unsqueeze(-1)
-    )  # [B, block_len, ctx_len]
-    causal = ctx_pos < q_anchor  # [B, block_len, ctx_len]
-    ctx_ok = same_doc & causal & ctx_valid.unsqueeze(1)  # [B, block_len, ctx_len]
-
-    # block side
-    anc_q = block_anchor_pos.unsqueeze(-1)   # [B, block_len, 1]
-    anc_k = block_anchor_pos.unsqueeze(1)    # [B, 1, block_len]
-    tree_ok = (anc_q == anc_k) & block_valid.unsqueeze(1)  # [B, block_len, block_len]
-
-    attend = torch.cat([ctx_ok, tree_ok], dim=-1)  # [B, block_len, full_len]
-    mask4d = torch.zeros(B, 1, block_len, full_len, device=device)
-    mask4d.masked_fill_(~attend.unsqueeze(1), float("-inf"))
-    return mask4d
-
-
 # ---------------------------------------------------------------------------
 # Eval metrics
 # ---------------------------------------------------------------------------
@@ -557,7 +521,6 @@ def evaluate(
     tree_pos_emb: TreePositionEmbedding,
     st_info: SubTreeInfo,
     ctx_len: int,
-    use_flex: bool,
     max_batches: int = 50,
 ) -> dict:
     draft_model.eval()
@@ -622,24 +585,18 @@ def evaluate(
             output_hidden_states=True,
         )
         target_hidden = extract_context_feature(target_out.hidden_states, draft_model.target_layer_ids)
+        del target_out
 
         # Noise embeds
         noise_embeds = target_model.model.embed_tokens(block_noise_ids)
         if tree_pos_emb.use_initial:
             noise_embeds = noise_embeds + tree_pos_emb.get_initial_bias(block_vertex_ids)
 
-        if use_flex:
-            attn_mask = build_flex_mask(
-                ctx_input_ids.shape, block_anchor_pos, ctx_doc_mask,
-                ctx_valid, block_valid, ctx_len, block_len, device,
-            )
-            score_mods_list = tree_pos_emb.get_score_mods(block_vertex_ids, ctx_len, block_len)
-        else:
-            attn_mask = _build_dense_mask(
-                block_anchor_pos, ctx_doc_mask, ctx_valid, block_valid,
-                ctx_len, block_len, device,
-            )
-            score_mods_list = None
+        attn_mask = build_flex_mask(
+            ctx_input_ids.shape, block_anchor_pos, ctx_doc_mask,
+            ctx_valid, block_valid, ctx_len, block_len, device,
+        )
+        score_mods_list = tree_pos_emb.get_score_mods(block_vertex_ids, ctx_len, block_len)
 
         draft_hidden = draft_model(
             position_ids=block_position_ids,
@@ -837,11 +794,6 @@ def main():
         choices=["initial", "relational", "both", "none"],
         default="both",
     )
-    parser.add_argument(
-        "--attn-impl",
-        choices=["flex", "dense"],
-        default="flex",
-    )
     parser.add_argument("--eval-batches", type=int, default=50)
     parser.add_argument("--log-every", type=int, default=10,
                         help="Log train metrics to Wandb every N grad steps")
@@ -994,7 +946,6 @@ def main():
     train_loader = fabric.setup_dataloaders(train_loader)
     eval_loader = fabric.setup_dataloaders(eval_loader)
 
-    use_flex = args.attn_impl == "flex"
     ctx_len = args.max_ctx_len
 
     # ---- Resume from checkpoint ----
@@ -1055,7 +1006,7 @@ def main():
                  fabric.no_backward_sync(tree_pos_emb, enabled=is_accumulating):
                 loss = forward_and_loss(
                     batch, target_model, draft_model, tree_pos_emb,
-                    ctx_len, use_flex,
+                    ctx_len,
                 )
                 scaled_loss = loss / args.grad_accum_steps
                 fabric.backward(scaled_loss)
@@ -1086,7 +1037,7 @@ def main():
                 with torch.no_grad():
                     metrics = evaluate(
                         eval_loader, target_model, draft_model, tree_pos_emb,
-                        st_info, ctx_len, use_flex, args.eval_batches,
+                        st_info, ctx_len, args.eval_batches,
                     )
                 if fabric.is_global_zero:
                     print(

@@ -2,3 +2,4 @@ dflash
 __pycache__
 .venv
 datasets
+.pytest_cache
