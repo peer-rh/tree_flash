@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 
 import argparse
 import json
@@ -111,12 +112,94 @@ class SubTreeInfo:
         self.ancestor_map = anc
 
 
+
+def build_step_attention_mask(
+    *,
+    root_positions: torch.Tensor,           # [B, Q]
+    query_vertex_ids: torch.Tensor,        # [Q]
+    tree_root_positions: torch.Tensor,     # [B, K_tree]
+    tree_vertex_ids: torch.Tensor,         # [B, K_tree]
+    document_mask: torch.Tensor,           # [B, S]
+    valid_tokens: torch.Tensor,            # [B, S]
+    ancestor_map: torch.Tensor,            # [st_size, st_size]
+    ctx_len: int,
+    use_flex: bool,
+):
+    device = root_positions.device
+    B, q_count = root_positions.shape
+    k_count = tree_root_positions.shape[1]
+
+    if use_flex:
+        try:
+            from torch.nn.attention.flex_attention import create_block_mask
+        except ImportError as exc:
+            raise RuntimeError(
+                "Flex attention is not available in this PyTorch build. "
+                "Use a PyTorch version with torch.nn.attention.flex_attention "
+                "or rerun with --attn-implementation sdpa."
+            ) from exc
+        
+
+        # ancestor_map = ancestor_map.T.clone()
+        ancestor_map = torch.eye(ancestor_map.shape[0], dtype=torch.bool, device=device) 
+        print(query_vertex_ids, tree_vertex_ids)
+        def mask_mod(b, h, q_idx, kv_idx):
+            q_root = root_positions[b, q_idx]
+
+            in_ctx = kv_idx < ctx_len
+            ctx_idx = kv_idx.clamp(0, max(ctx_len - 1, 0))
+            same_doc = document_mask[b, ctx_idx] == document_mask[b, q_root]
+            causal_ctx = ctx_idx <= q_root
+            ctx_mask = in_ctx & same_doc & causal_ctx & valid_tokens[b, ctx_idx]
+
+            tree_idx = (kv_idx - ctx_len).clamp(0, max(k_count - 1, 0))
+            same_tree = tree_root_positions[b, tree_idx] == q_root
+            key_vertex = tree_vertex_ids[b, tree_idx]
+            query_vertex = query_vertex_ids[q_idx]
+            tree_mask = (~in_ctx) & same_tree & ancestor_map[query_vertex, key_vertex]
+            # return ctx_mask | tree_mask
+            return ctx_mask | tree_mask
+
+        return create_block_mask(
+            mask_mod,
+            B=B,
+            H=None,
+            Q_LEN=q_count,
+            KV_LEN=ctx_len + k_count,
+            device=device,
+            BLOCK_SIZE=128
+        )
+
+    ctx_pos = torch.arange(ctx_len, device=device).view(1, 1, ctx_len)
+    root_docs = document_mask.gather(1, root_positions)
+    ctx_attend = (
+        (document_mask.unsqueeze(1) == root_docs.unsqueeze(-1))
+        & (ctx_pos <= root_positions.unsqueeze(-1))
+        & valid_tokens.unsqueeze(1)
+    )
+
+    key_vertices = tree_vertex_ids.unsqueeze(1).expand(B, q_count, k_count)
+    query_vertices = query_vertex_ids.view(1, q_count, 1).expand(B, q_count, k_count)
+    same_tree = tree_root_positions.unsqueeze(1) == root_positions.unsqueeze(-1)
+    tree_attend = same_tree & ancestor_map[key_vertices, query_vertices]
+
+    attend = torch.cat([ctx_attend, tree_attend], dim=-1)
+    mask_4d = torch.zeros(
+        (B, 1, q_count, ctx_len + k_count),
+        dtype=torch.float32,
+        device=device,
+    )
+    mask_4d.masked_fill_(~attend.unsqueeze(1), float("-inf"))
+    return mask_4d
+
+
 @torch.inference_mode()
 def generate_trees(batch, model, n_subtrees: int, st_info: SubTreeInfo):
     input_ids = batch["input_ids"]  # [B, S]
     is_response = batch["is_response"]  # [B, S]
     document_mask = batch["document_mask"]  # [B, S], -1 for padding
     B, S = input_ids.shape
+    print(input_ids.shape)
     device = input_ids.device
     valid_tokens = document_mask >= 0
 
@@ -129,17 +212,17 @@ def generate_trees(batch, model, n_subtrees: int, st_info: SubTreeInfo):
     subtree_ar_probs = torch.zeros((B, S, st_info.size), dtype=torch.float32, device=device)
     subtree_ids[:, :, 0] = torch.where(valid_tokens, input_ids, torch.full_like(input_ids, IGNORE_IDX))
 
-    with torch.no_grad():
-        out = model(
-            input_ids=input_ids,
-            attention_mask=valid_tokens.long(),
-            use_cache=True,
-            output_hidden_states=False,
-        )
+    out = model(
+        input_ids=input_ids,
+        attention_mask=valid_tokens.long(),
+        use_cache=True,
+        output_hidden_states=False,
+    )
     logits = out.logits  # [B, S, V]
     kv_cache = out.past_key_values
     vocab_size = logits.shape[-1]
     log_denom = torch.logsumexp(logits, dim=-1)  # [B, S]
+    use_flex = getattr(getattr(model, "config", None), "_attn_implementation", None) == "flex_attention"
 
     token_probs = torch.zeros((B, S), dtype=torch.float32, device=device)
     if S > 0:
@@ -162,6 +245,7 @@ def generate_trees(batch, model, n_subtrees: int, st_info: SubTreeInfo):
     else:
         subtree_anchors = torch.empty((B, 0), dtype=torch.long, device=device)
 
+    print(subtree_ar_probs[0, subtree_anchors[0], 0])
     depth1_slots = st_info.nodes_at_depth.get(1, [])
     if depth1_slots:
         request_k = min(len(depth1_slots) + 1, vocab_size)
@@ -175,7 +259,7 @@ def generate_trees(batch, model, n_subtrees: int, st_info: SubTreeInfo):
                 input_ids[:, 1:],
                 torch.full_like(input_ids[:, 1:], IGNORE_IDX),
             )
-
+        
         for b in range(B):
             for pos in range(S):
                 if not valid_tokens[b, pos]:
@@ -220,34 +304,24 @@ def generate_trees(batch, model, n_subtrees: int, st_info: SubTreeInfo):
             else:
                 all_tree_root_positions = torch.cat([cached_root_positions, root_positions], dim=1)
                 all_tree_vertex_ids = torch.cat([cached_vertex_ids, current_vertex_ids], dim=1)
-
-            ctx_pos = torch.arange(S, device=device).view(1, 1, S)
-            root_docs = document_mask.gather(1, root_positions)
-            ctx_attend = (
-                (document_mask.unsqueeze(1) == root_docs.unsqueeze(-1))
-                & (ctx_pos <= root_positions.unsqueeze(-1))
-                & valid_tokens.unsqueeze(1)
+            attention_mask = build_step_attention_mask(
+                root_positions=root_positions,
+                query_vertex_ids=vertex_ids,
+                tree_root_positions=all_tree_root_positions,
+                tree_vertex_ids=all_tree_vertex_ids,
+                document_mask=document_mask,
+                valid_tokens=valid_tokens,
+                ancestor_map=ancestor_map,
+                ctx_len=S,
+                use_flex=use_flex,
             )
-
-            q_count = root_positions.shape[1]
-            k_count = all_tree_root_positions.shape[1]
-            key_vertices = all_tree_vertex_ids.unsqueeze(1).expand(B, q_count, k_count)
-            query_vertices = vertex_ids.view(1, q_count, 1).expand(B, q_count, k_count)
-            same_tree = all_tree_root_positions.unsqueeze(1) == root_positions.unsqueeze(-1)
-            tree_attend = same_tree & ancestor_map[key_vertices, query_vertices]
-
-            attend = torch.cat([ctx_attend, tree_attend], dim=-1)
-            mask_4d = torch.zeros(
-                (B, 1, q_count, S + k_count),
-                dtype=torch.float32,
-                device=device,
-            )
-            mask_4d.masked_fill_(~attend.unsqueeze(1), float("-inf"))
+            print(attention_mask)
+            print(position_ids.shape, next_input_ids.shape, kv_cache.get_seq_length())
 
             out = model(
                 next_input_ids,
                 position_ids=position_ids,
-                attention_mask=mask_4d,
+                attention_mask=attention_mask,
                 past_key_values=kv_cache,
                 use_cache=True,
             )
@@ -298,16 +372,22 @@ def generate_trees(batch, model, n_subtrees: int, st_info: SubTreeInfo):
     return batch
 
 
-def iter_jsonl_dir(data_dir: Path) -> Iterator[dict]:
+def iter_jsonl_dir(data_dir: Path, max_len: int | None) -> Iterator[dict]:
     files = sorted(data_dir.glob("*.jsonl"))
     if not files:
         raise FileNotFoundError(f"No .jsonl files found in {data_dir}")
+    lines = []
     for path in files:
         with open(path) as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    yield json.loads(line)
+                    data =  json.loads(line)
+                    if max_len is not None and (len(data.get("prompt", "")) + len(data.get("response", ""))) > max_len:
+                        continue
+                    lines.append(data)
+    sorted_lines = sorted(lines, key=lambda x: - len(x.get("prompt", "")) - len(x.get("response", "")))
+    return iter(sorted_lines)
 
 
 def build_batch(
@@ -316,6 +396,7 @@ def build_batch(
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
     max_len = max(len(prompt_ids) + len(response_ids) for prompt_ids, response_ids in examples)
+    max_len = math.ceil(max_len / 128) * 128
     B = len(examples)
 
     input_ids = torch.full((B, max_len), pad_token_id, dtype=torch.long)
@@ -400,10 +481,22 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1, help="Sequences per batch")
     parser.add_argument("--max-sequences", type=int, default=None, help="Optional cap on sequences")
     parser.add_argument(
+        "--attn-implementation",
+        choices=["flex_attention", "sdpa"],
+        default="flex_attention",
+        help="Attention backend for the HF model",
+    )
+    parser.add_argument(
         "--dtype",
         choices=["bfloat16", "float16", "float32"],
         default="bfloat16",
         help="Model load dtype",
+    )
+    parser.add_argument(
+        "--max-len",
+        type=int,
+        default=None,
+        help="Optional max prompt+response length; longer ones are skipped",
     )
     args = parser.parse_args()
 
@@ -433,7 +526,11 @@ def main() -> None:
         else:
             tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch_dtype)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=torch_dtype,
+        attn_implementation=args.attn_implementation,
+    )
     if tokenizer.pad_token_id is not None and getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tokenizer.pad_token_id
     if hasattr(model, "resize_token_embeddings") and len(tokenizer) != model.get_input_embeddings().num_embeddings:
@@ -479,7 +576,7 @@ def main() -> None:
         n_seqs_written = 0
         n_rows_written = 0
 
-        for record in iter_jsonl_dir(Path(args.data_dir)):
+        for record in iter_jsonl_dir(Path(args.data_dir), args.max_len):
             if args.max_sequences is not None and n_seqs_written + len(pending) >= args.max_sequences:
                 break
 
@@ -555,4 +652,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    torch.compiler.reset()
     main()

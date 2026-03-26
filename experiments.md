@@ -40,7 +40,7 @@
 
 ### Experiment 3: Pruning
 **Goal:** Find the best pruning method.
-
+ - Also try to find the best tree size for verification
 | Component | Choice |
 |---|---|
 | Tree | Tree v1 |

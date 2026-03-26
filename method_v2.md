@@ -29,18 +29,20 @@
     - sub_trees_ar_probs: N x [S_R, sub_tree_size]
 
 # Stage 3 - Training
+> We want to do document packing for efficient training
 - Inputs:
     - Target Model
     - Drafter Model (To be trained)
     - num_anchors: int
     - tree_seq_depth: int
-1. Randomly sample valid anchors 
-2. Gather the continuation trees with each anchor being assign sub_trees[anchor:anchor+tree_seq_depth]. This forms a valid tree
-    - The tree has size sub_tree_size * num_anchors
+1. Randomly sample num_anchors many valid anchors 
+    - A valid anchor is in the respose part of the prompt and has 
+2. Let each anchor form a block flatten(sub_trees[anchor:anchor+tree_seq_depth]).
+    - The tree has size sub_tree_size * tree_seq_depth 
 3. Compute the cumulative probability of each token, where we start out with the root node of the full tree (x_anchor) with $p=1$
 4. Run the verifier to get the target_ctx_features
-5. Run the drafter so that it attends causal to target_ctx_featues and fuly inside each tree (bidirectional attention)
+5. Run the drafter so that it attends causal to target_ctx_featues and fully inside each tree (bidirectional attention)
     - More specifically attend to target_ctx_features if $t < anchor$, since $x_anchor$ is part of the block
     - The input noise_embds are the input embedding of the tree root being set to $x_anchor$ and all other tokens are the mask token id
-    - We also have to add a learned tree_position_encoding so that sibling don't generate the same tokens
+    - We also have to add a learned tree_position_encoding so that sibling don't generate the same tokens (this is for the full tree)
 6. Compute the loss and backward
