@@ -15,7 +15,7 @@
 - [x] Wire per-layer `score_mod` into DFlashDraftModel so each layer uses its own relational bias — done via `TreeDFlashDraftModel` subclass in `v2/model.py`
 - [ ] Evaluate whether CumProds decay smoothing is needed (see `experiments.md` note on DFlash comparison)
 - [ ] Add `--prompt-file` batch mode to `spec_dec.py` benchmark output (tokens/sec per prompt)
-- [ ] Stage 2: consider parallelising across GPUs (currently single-GPU)
+- [x] Stage 2: multi-GPU data-parallel generation via `torchrun` with rank-local temp HDF5 shards merged into one final output
 
 ---
 
@@ -82,6 +82,8 @@ sequence_offsets    int64        [N+1]          row ranges into sub_trees
 
 `sub_trees_ar_probs[t, v]` is the autoregressive probability of node `v`'s token given its parent's context — used as CumProds weights during training.
 
+When launched with `torchrun`, Stage 2 runs one worker per GPU. Each rank writes a temporary HDF5 shard under `<output>.parts/`, and rank 0 merges those shards back into one final HDF5 with the same schema shown above. The merged file remains directly compatible with Stage 3 and `viz_tree.py`.
+
 ### Anchor selection
 
 At each sequence, the `n_subtrees` response positions with the **lowest** AR probability for the next token are selected as anchors — these are the positions where the model is least certain, so alternative branches are most valuable.
@@ -90,6 +92,17 @@ At each sequence, the `n_subtrees` response positions with the **lowest** AR pro
 
 ```bash
 python v2/stage2.py \
+  --model Qwen/Qwen3-8B \
+  --data-dir data/stage1/ \
+  --output data/stage2_v2.h5 \
+  --n-subtrees 64 \
+  --batch-size 1 \
+  --attn-implementation sdpa
+```
+
+Multi-GPU data parallel:
+```bash
+torchrun --standalone --nproc_per_node=4 v2/stage2.py \
   --model Qwen/Qwen3-8B \
   --data-dir data/stage1/ \
   --output data/stage2_v2.h5 \
@@ -132,9 +145,9 @@ Trains the DFlash draft model (`DFlashDraftModel`) plus a new `TreePositionEmbed
 
 **Context side** (causal): query token at position `anchor_ctx_pos` attends to all prefix tokens `< anchor_ctx_pos` in the same document.
 
-**Block side** (bidirectional): all tokens within the same anchor's tree block attend to each other fully — equivalent to block-diagonal bidirectional attention per anchor. This is implemented as a flex attention `mask_mod` or a dense 4D additive mask (`--attn-impl dense`).
+**Block side** (bidirectional): all tokens within the same anchor's tree block attend to each other fully — equivalent to block-diagonal bidirectional attention per anchor. Implemented via flex attention `mask_mod`.
 
-The relational attention bias is applied via flex attention's `score_mod`, passed as `score_mod=` kwarg to the draft forward (active when the draft model uses flex attention; silently ignored for sdpa/eager).
+The relational attention bias is applied via flex attention's `score_mod`, passed as `score_mod=` kwarg to the draft forward.
 
 ### Loss
 
@@ -145,6 +158,8 @@ loss = mean over valid nodes of [cumprob(node) × CE(logits[node], label[node])]
 ```
 
 `cumprob(node)` = product of AR probabilities along the path from root to node. This gives high weight to high-probability branches and low weight to unlikely branches, matching the distribution of nodes that will actually be visited at inference time.
+
+Cross-entropy is computed in chunks of 64 tokens to avoid materializing the full `[B, block_len, V]` logits tensor. The `lm_head` is applied per-chunk, and loss is accumulated across chunks. This reduces peak GPU memory by ~200-300MB for large vocabularies (e.g. Qwen3's 152K vocab).
 
 ### Training loop
 
@@ -253,7 +268,7 @@ python v2/spec_dec.py \
 |---|---|
 | `v2/model.py` | `TreeDFlashDraftModel` subclass: routes per-layer `score_mod` closures from `TreePositionEmbedding` to individual draft layers |
 | `v2/stage2.py` | Sub-tree generation: runs target model on stage-1 data, expands tree of alternatives at low-confidence positions, writes HDF5 |
-| `v2/stage3.py` | Training: CumProds-weighted CE loss, flex attention, Lightning Fabric DDP, Wandb, checkpoint resume |
+| `v2/stage3.py` | Training: chunked CumProds-weighted CE loss, flex attention, Lightning Fabric DDP, Wandb, checkpoint resume |
 | `v2/spec_dec.py` | Inference: tree speculative decoding with KV cache reuse and cleanup |
 | `v2/viz_tree.py` | CLI visualiser: renders a single sub-tree from a stage-2 HDF5 file |
 | `v2/summary.md` | This file |

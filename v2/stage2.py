@@ -1,19 +1,27 @@
 from __future__ import annotations
 import math
+import os
+import shutil
 import time
 
 import argparse
-import json
 import random
+from contextlib import ExitStack
 from collections import defaultdict
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence
 
 import h5py
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from datasets import Dataset
+else:
+    Dataset = Any
 
 IGNORE_IDX = -1
 DEFAULT_SUB_TREE_PATHS = ["0-1", "0-2", "0-3", "1-4", "1-5", "2-6", "2-7"]
@@ -127,6 +135,7 @@ class CompiledCallable:
     eager_fn: Callable
     compiled_fn: Callable | None = None
     fallback_reason: str | None = None
+    log_enabled: bool = True
 
     def __call__(self, *args, **kwargs):
         if self.compiled_fn is None:
@@ -136,10 +145,11 @@ class CompiledCallable:
         except Exception as exc:
             self.compiled_fn = None
             self.fallback_reason = f"{type(exc).__name__}: {exc}"
-            print(
-                f"Stage 2 compile fallback for {self.name}: {self.fallback_reason}",
-                flush=True,
-            )
+            if self.log_enabled:
+                print(
+                    f"Stage 2 compile fallback for {self.name}: {self.fallback_reason}",
+                    flush=True,
+                )
             return self.eager_fn(*args, **kwargs)
 
 
@@ -149,6 +159,71 @@ class Stage2Runtime:
     flex_mask_builder: CompiledCallable
     compile_enabled: bool = False
     compile_mode: str | None = None
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    rank: int
+    world_size: int
+    local_rank: int
+    device: torch.device
+    backend: str | None = None
+
+    @property
+    def is_distributed(self) -> bool:
+        return self.world_size > 1
+
+    @property
+    def is_primary(self) -> bool:
+        return self.rank == 0
+
+    def log(self, message: str) -> None:
+        if self.is_primary:
+            print(message, flush=True)
+
+    def barrier(self) -> None:
+        if self.is_distributed and dist.is_initialized():
+            dist.barrier()
+
+    def shutdown(self) -> None:
+        if self.is_distributed and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@dataclass(frozen=True)
+class HDF5MergeEntry:
+    record_idx: int
+    part_path: str
+    seq_idx: int
+    row_start: int
+    row_end: int
+
+
+def init_distributed_context() -> DistributedContext:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if world_size <= 1:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return DistributedContext(rank=0, world_size=1, local_rank=0, device=device, backend=None)
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Multi-GPU Stage 2 requires CUDA when launched with torchrun.")
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is unavailable in this PyTorch build.")
+
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+    device = torch.device("cuda", local_rank)
+    return DistributedContext(
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=device,
+        backend="nccl",
+    )
 
 
 def iter_position_chunks(total_positions: int, chunk_size: int) -> Iterator[slice]:
@@ -303,9 +378,18 @@ def build_stage2_runtime(
     *,
     compile_enabled: bool = False,
     compile_mode: str = "reduce-overhead",
+    log_enabled: bool = True,
 ) -> Stage2Runtime:
-    base_model_forward = CompiledCallable(name="base_model_forward", eager_fn=model.base_model)
-    flex_mask_builder = CompiledCallable(name="flex_block_mask_builder", eager_fn=_build_flex_block_mask)
+    base_model_forward = CompiledCallable(
+        name="base_model_forward",
+        eager_fn=model.base_model,
+        log_enabled=log_enabled,
+    )
+    flex_mask_builder = CompiledCallable(
+        name="flex_block_mask_builder",
+        eager_fn=_build_flex_block_mask,
+        log_enabled=log_enabled,
+    )
     runtime = Stage2Runtime(
         base_model_forward=base_model_forward,
         flex_mask_builder=flex_mask_builder,
@@ -317,14 +401,16 @@ def build_stage2_runtime(
         return runtime
 
     if getattr(getattr(model, "config", None), "_attn_implementation", None) != "flex_attention":
-        print(
-            "Stage 2 compile currently targets flex_attention; continuing without compile.",
-            flush=True,
-        )
+        if log_enabled:
+            print(
+                "Stage 2 compile currently targets flex_attention; continuing without compile.",
+                flush=True,
+            )
         return runtime
 
     if not hasattr(torch, "compile"):
-        print("Stage 2 compile requested, but torch.compile is unavailable; continuing eagerly.", flush=True)
+        if log_enabled:
+            print("Stage 2 compile requested, but torch.compile is unavailable; continuing eagerly.", flush=True)
         return runtime
 
     base_model_forward.compiled_fn = torch.compile(
@@ -339,10 +425,11 @@ def build_stage2_runtime(
     )
     runtime.compile_enabled = True
     runtime.compile_mode = compile_mode
-    print(
-        f"Stage 2 compile enabled for flex_attention (mode={compile_mode}).",
-        flush=True,
-    )
+    if log_enabled:
+        print(
+            f"Stage 2 compile enabled for flex_attention (mode={compile_mode}).",
+            flush=True,
+        )
     return runtime
 
 
@@ -433,7 +520,9 @@ def _select_subtree_anchors(
         torch.full_like(token_probs, float("-inf")),
     )
     n_select = min(n_subtrees, int(response_counts.amin().item()))
-    return score.topk(n_select, dim=1).indices.sort(dim=1).values
+    anchors =  score.topk(n_select, dim=1).indices.sort(dim=1).values
+    anchors = anchors - 1
+    return anchors
 
 
 def _fill_depth1_subtrees(
@@ -756,22 +845,154 @@ def generate_trees(
     return batch
 
 
-def iter_jsonl_dir(data_dir: Path, max_len: int | None) -> Iterator[dict]:
+def load_tokenized_records(
+    data_dir: Path,
+    tokenizer,
+    max_len: int | None,
+    *,
+    sort_descending: bool,
+    num_proc: int | None = None,
+) -> Dataset:
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError(
+            "Stage 2 now requires Hugging Face `datasets` for JSONL loading, tokenization, and filtering."
+        ) from exc
+
     files = sorted(data_dir.glob("*.jsonl"))
     if not files:
         raise FileNotFoundError(f"No .jsonl files found in {data_dir}")
-    lines = []
-    for path in files:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    data =  json.loads(line)
-                    if max_len is not None and (len(data.get("prompt", "")) + len(data.get("response", ""))) > max_len:
-                        continue
-                    lines.append(data)
-    sorted_lines = sorted(lines, key=lambda x: len(x.get("prompt", "")) + len(x.get("response", "")), reverse=True)
-    return iter(sorted_lines)
+    dataset = load_dataset(
+        "json",
+        data_files=[str(path) for path in files],
+        split="train",
+    )
+
+    def tokenize_batch(batch: dict[str, list[str]]) -> dict[str, list[list[int]] | list[int]]:
+        prompt_ids = tokenizer(batch["prompt"], add_special_tokens=False)["input_ids"]
+        response_ids = tokenizer(batch["response"], add_special_tokens=False)["input_ids"]
+        total_len = [len(prompt) + len(response) for prompt, response in zip(prompt_ids, response_ids)]
+        return {
+            "prompt_ids": prompt_ids,
+            "response_ids": response_ids,
+            "total_len": total_len,
+        }
+
+    dataset = dataset.map(
+        tokenize_batch,
+        batched=True,
+        remove_columns=dataset.column_names,
+        num_proc=num_proc,
+        desc="Tokenizing prompt/response pairs",
+    )
+
+    def keep_batch(
+        prompt_ids: list[list[int]],
+        response_ids: list[list[int]],
+        total_len: list[int],
+    ) -> list[bool]:
+        keep = [len(response) > 0 for response in response_ids]
+        if max_len is not None:
+            keep = [flag and length <= max_len for flag, length in zip(keep, total_len)]
+        return keep
+
+    dataset = dataset.filter(
+        keep_batch,
+        batched=True,
+        input_columns=["prompt_ids", "response_ids", "total_len"],
+        num_proc=num_proc,
+        desc="Filtering tokenized prompt/response pairs",
+    )
+
+    return dataset.sort("total_len", reverse=sort_descending)
+
+
+def add_stable_record_idx(records: Dataset) -> Dataset:
+    def assign_record_idx(batch, indices: list[int]) -> dict[str, list[int]]:
+        return {"record_idx": indices}
+
+    return records.map(
+        assign_record_idx,
+        batched=True,
+        with_indices=True,
+        desc="Assigning stable record indices",
+    )
+
+
+def shard_records_for_rank(records: Dataset, ctx: DistributedContext) -> Dataset:
+    if not ctx.is_distributed:
+        return records
+    return records.shard(num_shards=ctx.world_size, index=ctx.rank, contiguous=False)
+
+
+def build_parts_dir(output_path: Path) -> Path:
+    return Path(f"{output_path}.parts")
+
+
+def build_rank_part_path(output_path: Path, rank: int) -> Path:
+    return build_parts_dir(output_path) / f"rank_{rank:05d}.h5"
+
+
+def prepare_parts_dir(parts_dir: Path, ctx: DistributedContext) -> None:
+    if not ctx.is_distributed:
+        if parts_dir.exists():
+            raise FileExistsError(
+                f"Temporary Stage 2 parts directory already exists: {parts_dir}. "
+                "Remove it or choose a different --output path before rerunning."
+            )
+        parts_dir.mkdir(parents=True, exist_ok=False)
+        return
+
+    status = torch.ones(1, device=ctx.device, dtype=torch.int32)
+    if ctx.is_primary:
+        try:
+            if parts_dir.exists():
+                raise FileExistsError(
+                    f"Temporary Stage 2 parts directory already exists: {parts_dir}. "
+                    "Remove it or choose a different --output path before rerunning."
+                )
+            parts_dir.mkdir(parents=True, exist_ok=False)
+        except Exception:
+            status.zero_()
+    dist.broadcast(status, src=0)
+    if int(status.item()) != 1:
+        raise RuntimeError(
+            f"Could not prepare temporary Stage 2 parts directory: {parts_dir}"
+        )
+
+
+def initialize_stage2_hdf5(
+    hf: h5py.File,
+    *,
+    st_info: SubTreeInfo,
+    sub_tree_paths: Sequence[str],
+    include_record_idx: bool,
+) -> None:
+    vlen_int64 = h5py.vlen_dtype(np.int64)
+    if include_record_idx:
+        hf.create_dataset("record_idx", shape=(0,), maxshape=(None,), dtype="int64")
+    hf.create_dataset("prompt_ids", shape=(0,), maxshape=(None,), dtype=vlen_int64)
+    hf.create_dataset("response_ids", shape=(0,), maxshape=(None,), dtype=vlen_int64)
+    hf.create_dataset(
+        "sub_trees",
+        shape=(0, st_info.size),
+        maxshape=(None, st_info.size),
+        dtype="int64",
+        chunks=(512, st_info.size),
+        compression="lzf",
+    )
+    hf.create_dataset(
+        "sub_trees_ar_probs",
+        shape=(0, st_info.size),
+        maxshape=(None, st_info.size),
+        dtype="float32",
+        chunks=(512, st_info.size),
+        compression="lzf",
+    )
+    hf.create_dataset("sequence_offsets", shape=(1,), maxshape=(None,), dtype="int64")
+    hf["sequence_offsets"][0] = 0
+    hf.attrs["sub_tree_paths"] = np.array(sub_tree_paths, dtype=h5py.string_dtype())
 
 
 def build_batch(
@@ -808,12 +1029,14 @@ def flush_hdf5(
     response_buf: list[np.ndarray],
     tree_buf: list[np.ndarray],
     prob_buf: list[np.ndarray],
+    record_idx_buf: list[int] | None,
     n_seqs_written: int,
     n_rows_written: int,
 ) -> tuple[int, int]:
     if not prompt_buf:
         return n_seqs_written, n_rows_written
 
+    ds_record_idx = hf["record_idx"] if record_idx_buf is not None else None
     ds_prompt = hf["prompt_ids"]
     ds_response = hf["response_ids"]
     ds_trees = hf["sub_trees"]
@@ -822,6 +1045,9 @@ def flush_hdf5(
 
     n_new_seqs = len(prompt_buf)
     new_seq_total = n_seqs_written + n_new_seqs
+    if ds_record_idx is not None:
+        ds_record_idx.resize(new_seq_total, axis=0)
+        ds_record_idx[n_seqs_written:new_seq_total] = np.asarray(record_idx_buf, dtype=np.int64)
     ds_prompt.resize(new_seq_total, axis=0)
     ds_response.resize(new_seq_total, axis=0)
     for idx, arr in enumerate(prompt_buf):
@@ -847,7 +1073,101 @@ def flush_hdf5(
     response_buf.clear()
     tree_buf.clear()
     prob_buf.clear()
+    if record_idx_buf is not None:
+        record_idx_buf.clear()
     return new_seq_total, n_rows_written + new_rows
+
+
+def collect_merge_manifest(part_paths: Sequence[Path]) -> list[HDF5MergeEntry]:
+    manifest: list[HDF5MergeEntry] = []
+    for part_path in part_paths:
+        with h5py.File(part_path, "r") as hf:
+            offsets = hf["sequence_offsets"][:]
+            record_idx = hf["record_idx"][:]
+            if offsets.shape[0] != record_idx.shape[0] + 1:
+                raise ValueError(
+                    f"Mismatched sequence_offsets and record_idx lengths in {part_path}: "
+                    f"{offsets.shape[0]} vs {record_idx.shape[0]}"
+                )
+            for seq_idx, seq_record_idx in enumerate(record_idx.tolist()):
+                manifest.append(
+                    HDF5MergeEntry(
+                        record_idx=int(seq_record_idx),
+                        part_path=str(part_path),
+                        seq_idx=seq_idx,
+                        row_start=int(offsets[seq_idx]),
+                        row_end=int(offsets[seq_idx + 1]),
+                    )
+                )
+    manifest.sort(key=lambda entry: entry.record_idx)
+    return manifest
+
+
+def merge_hdf5_parts(
+    *,
+    part_paths: Sequence[Path],
+    output_path: Path,
+    st_info: SubTreeInfo,
+    sub_tree_paths: Sequence[str],
+    log_fn: Callable[[str], None],
+) -> tuple[int, int]:
+    manifest = collect_merge_manifest(part_paths)
+    prompt_buf: list[np.ndarray] = []
+    response_buf: list[np.ndarray] = []
+    tree_buf: list[np.ndarray] = []
+    prob_buf: list[np.ndarray] = []
+    flush_every = 128
+
+    with ExitStack() as stack:
+        part_handles = {
+            str(path): stack.enter_context(h5py.File(path, "r"))
+            for path in part_paths
+        }
+        with h5py.File(output_path, "w") as hf:
+            initialize_stage2_hdf5(
+                hf,
+                st_info=st_info,
+                sub_tree_paths=sub_tree_paths,
+                include_record_idx=False,
+            )
+
+            n_seqs_written = 0
+            n_rows_written = 0
+            for entry in manifest:
+                src = part_handles[entry.part_path]
+                prompt_buf.append(np.asarray(src["prompt_ids"][entry.seq_idx], dtype=np.int64))
+                response_buf.append(np.asarray(src["response_ids"][entry.seq_idx], dtype=np.int64))
+                tree_buf.append(
+                    np.asarray(src["sub_trees"][entry.row_start:entry.row_end], dtype=np.int64)
+                )
+                prob_buf.append(
+                    np.asarray(src["sub_trees_ar_probs"][entry.row_start:entry.row_end], dtype=np.float32)
+                )
+
+                if len(prompt_buf) >= flush_every:
+                    n_seqs_written, n_rows_written = flush_hdf5(
+                        hf,
+                        prompt_buf,
+                        response_buf,
+                        tree_buf,
+                        prob_buf,
+                        record_idx_buf=None,
+                        n_seqs_written=n_seqs_written,
+                        n_rows_written=n_rows_written,
+                    )
+                    log_fn(f"Merged sequences: {n_seqs_written}  Response rows: {n_rows_written}")
+
+            n_seqs_written, n_rows_written = flush_hdf5(
+                hf,
+                prompt_buf,
+                response_buf,
+                tree_buf,
+                prob_buf,
+                record_idx_buf=None,
+                n_seqs_written=n_seqs_written,
+                n_rows_written=n_rows_written,
+            )
+    return n_seqs_written, n_rows_written
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -901,6 +1221,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="Print lightweight timing stats every N processed batches; 0 disables profiling logs.",
     )
+    parser.add_argument(
+        "--dataset-num-proc",
+        type=int,
+        default=None,
+        help="Optional `datasets` worker count for tokenization/filtering.",
+    )
     return parser
 
 
@@ -909,154 +1235,161 @@ def main() -> None:
 
     parser = build_arg_parser()
     args = parser.parse_args()
-
-    if args.batch_size > 1:
-        print(
-            "Note: batch_size > 1 uses padded sequence batches; anchor count is clipped "
-            "to the minimum valid response-token count in the batch.",
-            flush=True,
-        )
-
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
-
-    dtype_map = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }
-    torch_dtype = dtype_map[args.dtype]
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=torch_dtype,
-        attn_implementation=args.attn_implementation,
-    )
-    if tokenizer.pad_token_id is not None and getattr(model.config, "pad_token_id", None) is None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-    if hasattr(model, "resize_token_embeddings") and len(tokenizer) != model.get_input_embeddings().num_embeddings:
-        model.resize_token_embeddings(len(tokenizer))
-    model.to(device)
-    model.eval()
-    runtime = build_stage2_runtime(
-        model,
-        compile_enabled=args.compile,
-        compile_mode=args.compile_mode,
-    )
-
-    st_info = SubTreeInfo(args.sub_tree_paths)
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    vlen_int64 = h5py.vlen_dtype(np.int64)
-    prompt_buf: list[np.ndarray] = []
-    response_buf: list[np.ndarray] = []
-    tree_buf: list[np.ndarray] = []
-    prob_buf: list[np.ndarray] = []
-    pending: list[tuple[list[int], list[int]]] = []
-    FLUSH_EVERY = 128
-    batch_count = 0
-    timings: dict[str, float] = {}
-
-    with h5py.File(output_path, "w") as hf:
-        hf.create_dataset("prompt_ids", shape=(0,), maxshape=(None,), dtype=vlen_int64)
-        hf.create_dataset("response_ids", shape=(0,), maxshape=(None,), dtype=vlen_int64)
-        hf.create_dataset(
-            "sub_trees",
-            shape=(0, st_info.size),
-            maxshape=(None, st_info.size),
-            dtype="int64",
-            chunks=(512, st_info.size),
-            compression="lzf",
-        )
-        hf.create_dataset(
-            "sub_trees_ar_probs",
-            shape=(0, st_info.size),
-            maxshape=(None, st_info.size),
-            dtype="float32",
-            chunks=(512, st_info.size),
-            compression="lzf",
-        )
-        hf.create_dataset("sequence_offsets", shape=(1,), maxshape=(None,), dtype="int64")
-        hf["sequence_offsets"][0] = 0
-        hf.attrs["sub_tree_paths"] = np.array(args.sub_tree_paths, dtype=h5py.string_dtype())
-
-        n_seqs_written = 0
-        n_rows_written = 0
-
-        for record in iter_jsonl_dir(Path(args.data_dir), args.max_len):
-            if args.max_sequences is not None and n_seqs_written + len(pending) >= args.max_sequences:
-                break
-
-            tokenize_start = time.perf_counter()
-            prompt_ids = tokenizer.encode(record["prompt"], add_special_tokens=False)
-            response_ids = tokenizer.encode(record["response"], add_special_tokens=False)
-            _accumulate_profile(timings, "tokenize_s", tokenize_start)
-            if not response_ids:
-                continue
-
-            pending.append((prompt_ids, response_ids))
-            if len(pending) < args.batch_size:
-                continue
-
-            build_batch_start = time.perf_counter()
-            batch = build_batch(pending, tokenizer.pad_token_id, device)
-            _accumulate_profile(timings, "build_batch_s", build_batch_start)
-            batch = generate_trees(
-                batch,
-                model,
-                args.n_subtrees,
-                st_info,
-                logit_chunk_size=args.logit_chunk_size,
-                runtime=runtime,
-                profile=timings,
+    ctx = init_distributed_context()
+    try:
+        if args.batch_size > 1:
+            ctx.log(
+                "Note: batch_size > 1 uses padded sequence batches; anchor count is clipped "
+                "to the minimum valid response-token count in the batch."
             )
-            batch_count += 1
 
-            for row, (prompt_ids_row, response_ids_row) in enumerate(pending):
-                prompt_len = len(prompt_ids_row)
-                response_len = len(response_ids_row)
-                seq_slice = slice(prompt_len, prompt_len + response_len)
-                subtrees = batch["subtree_ids"][row, seq_slice].detach().cpu().numpy().astype(np.int64, copy=False)
-                subtree_probs = (
-                    batch["subtree_ar_probs"][row, seq_slice].detach().cpu().numpy().astype(np.float32, copy=False)
+        random.seed(42)
+        np.random.seed(42)
+        torch.manual_seed(42)
+
+        dtype_map = {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }
+        torch_dtype = dtype_map[args.dtype]
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        if tokenizer.pad_token_id is None:
+            if tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch_dtype,
+            attn_implementation=args.attn_implementation,
+        )
+        if tokenizer.pad_token_id is not None and getattr(model.config, "pad_token_id", None) is None:
+            model.config.pad_token_id = tokenizer.pad_token_id
+        if hasattr(model, "resize_token_embeddings") and len(tokenizer) != model.get_input_embeddings().num_embeddings:
+            model.resize_token_embeddings(len(tokenizer))
+        model.to(ctx.device)
+        model.eval()
+        runtime = build_stage2_runtime(
+            model,
+            compile_enabled=args.compile,
+            compile_mode=args.compile_mode,
+            log_enabled=ctx.is_primary,
+        )
+
+        st_info = SubTreeInfo(args.sub_tree_paths)
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        part_path = output_path
+        include_record_idx = False
+        if ctx.is_distributed:
+            parts_dir = build_parts_dir(output_path)
+            prepare_parts_dir(parts_dir, ctx)
+            part_path = build_rank_part_path(output_path, ctx.rank)
+            include_record_idx = True
+
+        prompt_buf: list[np.ndarray] = []
+        response_buf: list[np.ndarray] = []
+        tree_buf: list[np.ndarray] = []
+        prob_buf: list[np.ndarray] = []
+        record_idx_buf: list[int] | None = [] if include_record_idx else None
+        pending: list[tuple[int, list[int], list[int]]] = []
+        flush_every = 128
+        batch_count = 0
+        timings: dict[str, float] = {}
+
+        with h5py.File(part_path, "w") as hf:
+            initialize_stage2_hdf5(
+                hf,
+                st_info=st_info,
+                sub_tree_paths=args.sub_tree_paths,
+                include_record_idx=include_record_idx,
+            )
+
+            n_seqs_written = 0
+            n_rows_written = 0
+
+            dataset_prep_start = time.perf_counter()
+            records = load_tokenized_records(
+                Path(args.data_dir),
+                tokenizer,
+                args.max_len,
+                sort_descending=True,
+                num_proc=args.dataset_num_proc,
+            )
+            if args.max_sequences is not None:
+                records = records.select(range(min(args.max_sequences, len(records))))
+            records = add_stable_record_idx(records)
+            records = shard_records_for_rank(records, ctx)
+            _accumulate_profile(timings, "dataset_prep_s", dataset_prep_start)
+
+            for record in records:
+                record_idx = int(record["record_idx"])
+                prompt_ids = record["prompt_ids"]
+                response_ids = record["response_ids"]
+
+                pending.append((record_idx, prompt_ids, response_ids))
+                if len(pending) < args.batch_size:
+                    continue
+
+                build_batch_start = time.perf_counter()
+                batch = build_batch(
+                    [(prompt_ids_row, response_ids_row) for _, prompt_ids_row, response_ids_row in pending],
+                    tokenizer.pad_token_id,
+                    ctx.device,
                 )
-
-                prompt_buf.append(np.asarray(prompt_ids_row, dtype=np.int64))
-                response_buf.append(np.asarray(response_ids_row, dtype=np.int64))
-                tree_buf.append(subtrees)
-                prob_buf.append(subtree_probs)
-
-            pending.clear()
-
-            if len(prompt_buf) >= FLUSH_EVERY:
-                flush_start = time.perf_counter()
-                n_seqs_written, n_rows_written = flush_hdf5(
-                    hf,
-                    prompt_buf,
-                    response_buf,
-                    tree_buf,
-                    prob_buf,
-                    n_seqs_written,
-                    n_rows_written,
+                _accumulate_profile(timings, "build_batch_s", build_batch_start)
+                batch = generate_trees(
+                    batch,
+                    model,
+                    args.n_subtrees,
+                    st_info,
+                    logit_chunk_size=args.logit_chunk_size,
+                    runtime=runtime,
+                    profile=timings,
                 )
-                _accumulate_profile(timings, "flush_s", flush_start)
-                print(f"Sequences: {n_seqs_written}  Response rows: {n_rows_written}", flush=True)
+                batch_count += 1
 
-            if args.profile_every > 0 and batch_count % args.profile_every == 0:
-                print(
-                    (
+                for row, (record_idx_row, prompt_ids_row, response_ids_row) in enumerate(pending):
+                    prompt_len = len(prompt_ids_row)
+                    response_len = len(response_ids_row)
+                    seq_slice = slice(prompt_len, prompt_len + response_len)
+                    subtrees = batch["subtree_ids"][row, seq_slice].detach().cpu().numpy().astype(np.int64, copy=False)
+                    subtree_probs = (
+                        batch["subtree_ar_probs"][row, seq_slice].detach().cpu().numpy().astype(np.float32, copy=False)
+                    )
+
+                    if record_idx_buf is not None:
+                        record_idx_buf.append(record_idx_row)
+                    prompt_buf.append(np.asarray(prompt_ids_row, dtype=np.int64))
+                    response_buf.append(np.asarray(response_ids_row, dtype=np.int64))
+                    tree_buf.append(subtrees)
+                    prob_buf.append(subtree_probs)
+
+                pending.clear()
+
+                if len(prompt_buf) >= flush_every:
+                    flush_start = time.perf_counter()
+                    n_seqs_written, n_rows_written = flush_hdf5(
+                        hf,
+                        prompt_buf,
+                        response_buf,
+                        tree_buf,
+                        prob_buf,
+                        record_idx_buf=record_idx_buf,
+                        n_seqs_written=n_seqs_written,
+                        n_rows_written=n_rows_written,
+                    )
+                    _accumulate_profile(timings, "flush_s", flush_start)
+                    ctx.log(f"Sequences: {n_seqs_written}  Response rows: {n_rows_written}")
+
+                if args.profile_every > 0 and batch_count % args.profile_every == 0 and ctx.is_primary:
+                    ctx.log(
                         f"[profile] batches={batch_count} "
-                        f"tokenize={timings.get('tokenize_s', 0.0):.3f}s "
+                        f"dataset_prep={timings.get('dataset_prep_s', 0.0):.3f}s "
                         f"build_batch={timings.get('build_batch_s', 0.0):.3f}s "
                         f"initial_forward={timings.get('initial_forward_s', 0.0):.3f}s "
                         f"initial_summary={timings.get('initial_summary_s', 0.0):.3f}s "
@@ -1064,50 +1397,72 @@ def main() -> None:
                         f"tree_forward={timings.get('tree_forward_s', 0.0):.3f}s "
                         f"tree_writeback={timings.get('tree_writeback_s', 0.0):.3f}s "
                         f"flush={timings.get('flush_s', 0.0):.3f}s"
-                    ),
-                    flush=True,
-                )
-                timings.clear()
+                    )
+                    timings.clear()
 
-        if pending:
-            build_batch_start = time.perf_counter()
-            batch = build_batch(pending, tokenizer.pad_token_id, device)
-            _accumulate_profile(timings, "build_batch_s", build_batch_start)
-            batch = generate_trees(
-                batch,
-                model,
-                args.n_subtrees,
-                st_info,
-                logit_chunk_size=args.logit_chunk_size,
-                runtime=runtime,
-                profile=timings,
+            if pending:
+                build_batch_start = time.perf_counter()
+                batch = build_batch(
+                    [(prompt_ids_row, response_ids_row) for _, prompt_ids_row, response_ids_row in pending],
+                    tokenizer.pad_token_id,
+                    ctx.device,
+                )
+                _accumulate_profile(timings, "build_batch_s", build_batch_start)
+                batch = generate_trees(
+                    batch,
+                    model,
+                    args.n_subtrees,
+                    st_info,
+                    logit_chunk_size=args.logit_chunk_size,
+                    runtime=runtime,
+                    profile=timings,
+                )
+
+                for row, (record_idx_row, prompt_ids_row, response_ids_row) in enumerate(pending):
+                    prompt_len = len(prompt_ids_row)
+                    response_len = len(response_ids_row)
+                    seq_slice = slice(prompt_len, prompt_len + response_len)
+                    subtrees = batch["subtree_ids"][row, seq_slice].detach().cpu().numpy().astype(np.int64, copy=False)
+                    subtree_probs = (
+                        batch["subtree_ar_probs"][row, seq_slice].detach().cpu().numpy().astype(np.float32, copy=False)
+                    )
+
+                    if record_idx_buf is not None:
+                        record_idx_buf.append(record_idx_row)
+                    prompt_buf.append(np.asarray(prompt_ids_row, dtype=np.int64))
+                    response_buf.append(np.asarray(response_ids_row, dtype=np.int64))
+                    tree_buf.append(subtrees)
+                    prob_buf.append(subtree_probs)
+
+            n_seqs_written, n_rows_written = flush_hdf5(
+                hf,
+                prompt_buf,
+                response_buf,
+                tree_buf,
+                prob_buf,
+                record_idx_buf=record_idx_buf,
+                n_seqs_written=n_seqs_written,
+                n_rows_written=n_rows_written,
             )
 
-            for row, (prompt_ids_row, response_ids_row) in enumerate(pending):
-                prompt_len = len(prompt_ids_row)
-                response_len = len(response_ids_row)
-                seq_slice = slice(prompt_len, prompt_len + response_len)
-                subtrees = batch["subtree_ids"][row, seq_slice].detach().cpu().numpy().astype(np.int64, copy=False)
-                subtree_probs = (
-                    batch["subtree_ar_probs"][row, seq_slice].detach().cpu().numpy().astype(np.float32, copy=False)
+        if ctx.is_distributed:
+            ctx.barrier()
+            if ctx.is_primary:
+                part_paths = [build_rank_part_path(output_path, rank) for rank in range(ctx.world_size)]
+                ctx.log(f"Merging {len(part_paths)} Stage 2 rank shards into {output_path}")
+                final_seqs_written, final_rows_written = merge_hdf5_parts(
+                    part_paths=part_paths,
+                    output_path=output_path,
+                    st_info=st_info,
+                    sub_tree_paths=args.sub_tree_paths,
+                    log_fn=ctx.log,
                 )
-
-                prompt_buf.append(np.asarray(prompt_ids_row, dtype=np.int64))
-                response_buf.append(np.asarray(response_ids_row, dtype=np.int64))
-                tree_buf.append(subtrees)
-                prob_buf.append(subtree_probs)
-
-        n_seqs_written, n_rows_written = flush_hdf5(
-            hf,
-            prompt_buf,
-            response_buf,
-            tree_buf,
-            prob_buf,
-            n_seqs_written,
-            n_rows_written,
-        )
-
-    print(f"Done. Sequences: {n_seqs_written}  Response rows: {n_rows_written}")
+                shutil.rmtree(build_parts_dir(output_path))
+                ctx.log(f"Done. Sequences: {final_seqs_written}  Response rows: {final_rows_written}")
+        else:
+            ctx.log(f"Done. Sequences: {n_seqs_written}  Response rows: {n_rows_written}")
+    finally:
+        ctx.shutdown()
 
 
 if __name__ == "__main__":
