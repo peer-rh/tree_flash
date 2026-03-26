@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Tree-structured speculative decoding extending DFlash"
 requires-python = ">=3.11"
 dependencies = [
-    "torch>=2.5.0",
+    "torch>=2.9.0",
     "transformers>=4.45.0",
     "lightning>=2.4.0",
     "h5py>=3.10.0",
@@ -13,12 +13,16 @@ dependencies = [
     "rich>=13.0.0",
     "packaging",
     "ninja",
+    "matplotlib>=3.10.8",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "ipython",
+]
+gpu = [
+    "vllm>=0.18.0",
 ]
 
 [build-system]

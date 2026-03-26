@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+import time
 
 import argparse
 import json
@@ -7,7 +8,7 @@ import random
 from collections import defaultdict
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 import h5py
 import numpy as np
@@ -120,6 +121,36 @@ class LMHeadChunkOutputs:
     top_probs: torch.Tensor | None = None
 
 
+@dataclass
+class CompiledCallable:
+    name: str
+    eager_fn: Callable
+    compiled_fn: Callable | None = None
+    fallback_reason: str | None = None
+
+    def __call__(self, *args, **kwargs):
+        if self.compiled_fn is None:
+            return self.eager_fn(*args, **kwargs)
+        try:
+            return self.compiled_fn(*args, **kwargs)
+        except Exception as exc:
+            self.compiled_fn = None
+            self.fallback_reason = f"{type(exc).__name__}: {exc}"
+            print(
+                f"Stage 2 compile fallback for {self.name}: {self.fallback_reason}",
+                flush=True,
+            )
+            return self.eager_fn(*args, **kwargs)
+
+
+@dataclass
+class Stage2Runtime:
+    base_model_forward: CompiledCallable
+    flex_mask_builder: CompiledCallable
+    compile_enabled: bool = False
+    compile_mode: str | None = None
+
+
 def iter_position_chunks(total_positions: int, chunk_size: int) -> Iterator[slice]:
     if total_positions <= 0:
         return
@@ -171,62 +202,78 @@ def _extract_hidden_and_cache(model_outputs) -> tuple[torch.Tensor, object | Non
     raise TypeError(f"Unsupported base model output type: {type(model_outputs)!r}")
 
 
+def _accumulate_profile(profile: dict[str, float] | None, key: str, start_time: float) -> None:
+    if profile is not None:
+        profile[key] = profile.get(key, 0.0) + (time.perf_counter() - start_time)
 
-def build_step_attention_mask(
+
+def _build_flex_block_mask(
     *,
-    root_positions: torch.Tensor,           # [B, Q]
-    query_vertex_ids: torch.Tensor,        # [Q]
-    tree_root_positions: torch.Tensor,     # [B, K_tree]
-    tree_vertex_ids: torch.Tensor,         # [B, K_tree]
-    document_mask: torch.Tensor,           # [B, S]
-    valid_tokens: torch.Tensor,            # [B, S]
-    ancestor_map: torch.Tensor,            # [st_size, st_size]
+    root_positions: torch.Tensor,
+    query_vertex_ids: torch.Tensor,
+    tree_root_positions: torch.Tensor,
+    tree_vertex_ids: torch.Tensor,
+    document_mask: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    ancestor_map: torch.Tensor,
     ctx_len: int,
-    use_flex: bool,
+):
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+    except ImportError as exc:
+        raise RuntimeError(
+            "Flex attention is not available in this PyTorch build. "
+            "Use a PyTorch version with torch.nn.attention.flex_attention "
+            "or rerun with --attn-implementation sdpa."
+        ) from exc
+
+    device = root_positions.device
+    bsz, q_count = root_positions.shape
+    k_count = tree_root_positions.shape[1]
+    ctx_clamp_max = max(ctx_len - 1, 0)
+    tree_clamp_max = max(k_count - 1, 0)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        q_root = root_positions[b, q_idx]
+
+        in_ctx = kv_idx < ctx_len
+        ctx_idx = kv_idx.clamp(0, ctx_clamp_max)
+        same_doc = document_mask[b, ctx_idx] == document_mask[b, q_root]
+        causal_ctx = ctx_idx <= q_root
+        ctx_mask = in_ctx & same_doc & causal_ctx & valid_tokens[b, ctx_idx]
+
+        tree_idx = (kv_idx - ctx_len).clamp(0, tree_clamp_max)
+        same_tree = tree_root_positions[b, tree_idx] == q_root
+        key_vertex = tree_vertex_ids[b, tree_idx]
+        query_vertex = query_vertex_ids[q_idx]
+        tree_mask = (~in_ctx) & same_tree & ancestor_map[key_vertex, query_vertex]
+        return ctx_mask | tree_mask
+
+    return create_block_mask(
+        mask_mod,
+        B=bsz,
+        H=None,
+        Q_LEN=q_count,
+        KV_LEN=ctx_len + k_count,
+        device=device,
+        BLOCK_SIZE=128,
+    )
+
+
+def _build_dense_step_attention_mask(
+    *,
+    root_positions: torch.Tensor,
+    query_vertex_ids: torch.Tensor,
+    tree_root_positions: torch.Tensor,
+    tree_vertex_ids: torch.Tensor,
+    document_mask: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    ancestor_map: torch.Tensor,
+    ctx_len: int,
 ):
     device = root_positions.device
-    B, q_count = root_positions.shape
+    bsz, q_count = root_positions.shape
     k_count = tree_root_positions.shape[1]
-
-    if use_flex:
-        try:
-            from torch.nn.attention.flex_attention import create_block_mask
-        except ImportError as exc:
-            raise RuntimeError(
-                "Flex attention is not available in this PyTorch build. "
-                "Use a PyTorch version with torch.nn.attention.flex_attention "
-                "or rerun with --attn-implementation sdpa."
-            ) from exc
-        
-        ctx_clamp_max = max(ctx_len - 1, 0)
-        tree_clamp_max = max(k_count - 1, 0)
-        
-
-        def mask_mod(b, h, q_idx, kv_idx):
-            q_root = root_positions[b, q_idx]
-
-            in_ctx = kv_idx < ctx_len
-            ctx_idx = kv_idx.clamp(0, ctx_clamp_max)
-            same_doc = document_mask[b, ctx_idx] == document_mask[b, q_root]
-            causal_ctx = ctx_idx <= q_root
-            ctx_mask = in_ctx & same_doc & causal_ctx & valid_tokens[b, ctx_idx]
-
-            tree_idx = (kv_idx - ctx_len).clamp(0, tree_clamp_max)
-            same_tree = tree_root_positions[b, tree_idx] == q_root
-            key_vertex = tree_vertex_ids[b, tree_idx]
-            query_vertex = query_vertex_ids[q_idx]
-            tree_mask = (~in_ctx) & same_tree & ancestor_map[key_vertex, query_vertex]
-            return ctx_mask | tree_mask
-
-        return create_block_mask(
-            mask_mod,
-            B=B,
-            H=None,
-            Q_LEN=q_count,
-            KV_LEN=ctx_len + k_count,
-            device=device,
-            BLOCK_SIZE=128
-        )
 
     ctx_pos = torch.arange(ctx_len, device=device).view(1, 1, ctx_len)
     root_docs = document_mask.gather(1, root_positions)
@@ -236,14 +283,14 @@ def build_step_attention_mask(
         & valid_tokens.unsqueeze(1)
     )
 
-    key_vertices = tree_vertex_ids.unsqueeze(1).expand(B, q_count, k_count)
-    query_vertices = query_vertex_ids.view(1, q_count, 1).expand(B, q_count, k_count)
+    key_vertices = tree_vertex_ids.unsqueeze(1).expand(bsz, q_count, k_count)
+    query_vertices = query_vertex_ids.view(1, q_count, 1).expand(bsz, q_count, k_count)
     same_tree = tree_root_positions.unsqueeze(1) == root_positions.unsqueeze(-1)
     tree_attend = same_tree & ancestor_map[key_vertices, query_vertices]
 
     attend = torch.cat([ctx_attend, tree_attend], dim=-1)
     mask_4d = torch.zeros(
-        (B, 1, q_count, ctx_len + k_count),
+        (bsz, 1, q_count, ctx_len + k_count),
         dtype=torch.float32,
         device=device,
     )
@@ -251,61 +298,101 @@ def build_step_attention_mask(
     return mask_4d
 
 
-@torch.inference_mode()
-def generate_trees(batch, model, n_subtrees: int, st_info: SubTreeInfo, logit_chunk_size: int = 128):
-    input_ids = batch["input_ids"]  # [B, S]
-    is_response = batch["is_response"]  # [B, S]
-    document_mask = batch["document_mask"]  # [B, S], -1 for padding
-    B, S = input_ids.shape
+def build_stage2_runtime(
+    model,
+    *,
+    compile_enabled: bool = False,
+    compile_mode: str = "reduce-overhead",
+) -> Stage2Runtime:
+    base_model_forward = CompiledCallable(name="base_model_forward", eager_fn=model.base_model)
+    flex_mask_builder = CompiledCallable(name="flex_block_mask_builder", eager_fn=_build_flex_block_mask)
+    runtime = Stage2Runtime(
+        base_model_forward=base_model_forward,
+        flex_mask_builder=flex_mask_builder,
+        compile_enabled=False,
+        compile_mode=None,
+    )
+
+    if not compile_enabled:
+        return runtime
+
+    if getattr(getattr(model, "config", None), "_attn_implementation", None) != "flex_attention":
+        print(
+            "Stage 2 compile currently targets flex_attention; continuing without compile.",
+            flush=True,
+        )
+        return runtime
+
+    if not hasattr(torch, "compile"):
+        print("Stage 2 compile requested, but torch.compile is unavailable; continuing eagerly.", flush=True)
+        return runtime
+
+    base_model_forward.compiled_fn = torch.compile(
+        model.base_model,
+        dynamic=True,
+        mode=compile_mode,
+    )
+    flex_mask_builder.compiled_fn = torch.compile(
+        _build_flex_block_mask,
+        dynamic=True,
+        mode=compile_mode,
+    )
+    runtime.compile_enabled = True
+    runtime.compile_mode = compile_mode
+    print(
+        f"Stage 2 compile enabled for flex_attention (mode={compile_mode}).",
+        flush=True,
+    )
+    return runtime
+
+
+def _run_base_model_forward(
+    forward_fn: Callable,
+    *,
+    profile: dict[str, float] | None,
+    profile_key: str,
+    **kwargs,
+):
+    start_time = time.perf_counter()
+    outputs = forward_fn(**kwargs)
+    _accumulate_profile(profile, profile_key, start_time)
+    return outputs
+
+
+def _summarize_initial_pass(
+    *,
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    lm_head: torch.nn.Module,
+    vocab_size: int,
+    logit_chunk_size: int,
+    profile: dict[str, float] | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    bsz, seq_len = input_ids.shape
     device = input_ids.device
-    valid_tokens = document_mask >= 0
-    lm_head = model.get_output_embeddings()
-    if lm_head is None:
-        raise ValueError("Model must expose output embeddings via get_output_embeddings()")
-
-    subtree_ids = torch.full(
-        (B, S, st_info.size),
-        fill_value=IGNORE_IDX,
-        dtype=torch.long,
-        device=device,
-    )
-    subtree_ar_probs = torch.zeros((B, S, st_info.size), dtype=torch.float32, device=device)
-    subtree_ids[:, :, 0] = torch.where(valid_tokens, input_ids, torch.full_like(input_ids, IGNORE_IDX))
-
-    base_out = model.base_model(
-        input_ids=input_ids,
-        attention_mask=valid_tokens.long(),
-        use_cache=True,
-    )
-    hidden_states, kv_cache = _extract_hidden_and_cache(base_out)
-    vocab_size = getattr(model.config, "vocab_size", None)
-    if vocab_size is None:
-        if not hasattr(lm_head, "weight"):
-            raise ValueError("Could not infer vocab size from model config or LM head weights")
-        vocab_size = lm_head.weight.shape[0]
     proj_dtype = lm_head.weight.dtype if hasattr(lm_head, "weight") else hidden_states.dtype
-    log_denom = torch.empty((B, S), dtype=proj_dtype, device=device)
-    use_flex = getattr(getattr(model, "config", None), "_attn_implementation", None) == "flex_attention"
-
-    token_probs = torch.zeros((B, S), dtype=torch.float32, device=device)
-    if S > 0:
+    log_denom = torch.empty((bsz, seq_len), dtype=proj_dtype, device=device)
+    token_probs = torch.zeros((bsz, seq_len), dtype=torch.float32, device=device)
+    if seq_len > 0:
         token_probs[:, 0] = 1.0
-    depth1_slots = st_info.nodes_at_depth.get(1, [])
-    request_k = min(len(depth1_slots) + 1, vocab_size) if depth1_slots else 0
+
+    request_k = vocab_size
     cand_vals = None
     cand_ids = None
     if request_k > 0:
-        cand_vals = torch.empty((B, S, request_k), dtype=proj_dtype, device=device)
-        cand_ids = torch.empty((B, S, request_k), dtype=torch.long, device=device)
+        cand_vals = torch.empty((bsz, seq_len, request_k), dtype=proj_dtype, device=device)
+        cand_ids = torch.empty((bsz, seq_len, request_k), dtype=torch.long, device=device)
 
-    for pos_chunk in iter_position_chunks(S, logit_chunk_size):
+    summary_start = time.perf_counter()
+    for pos_chunk in iter_position_chunks(seq_len, logit_chunk_size):
         start = pos_chunk.start
         stop = pos_chunk.stop
         chunk_len = stop - start
         gather_token_ids = None
-        next_len = max(0, min(stop, S - 1) - start)
+        next_len = max(0, min(stop, seq_len - 1) - start)
         if next_len > 0:
-            gather_token_ids = torch.zeros((B, chunk_len), dtype=input_ids.dtype, device=device)
+            gather_token_ids = torch.zeros((bsz, chunk_len), dtype=input_ids.dtype, device=device)
             gather_token_ids[:, :next_len] = input_ids[:, start + 1 : start + 1 + next_len]
 
         chunk_outputs = summarize_lm_head_chunk(
@@ -325,52 +412,263 @@ def generate_trees(batch, model, n_subtrees: int, st_info: SubTreeInfo, logit_ch
             cand_vals[:, pos_chunk, :] = chunk_outputs.top_vals
             cand_ids[:, pos_chunk, :] = chunk_outputs.top_ids
 
+    _accumulate_profile(profile, "initial_summary_s", summary_start)
+    return log_denom, token_probs, cand_vals, cand_ids
+
+
+def _select_subtree_anchors(
+    *,
+    valid_response: torch.Tensor,
+    token_probs: torch.Tensor,
+    n_subtrees: int,
+) -> torch.Tensor:
+    device = token_probs.device
+    response_counts = valid_response.sum(dim=1)
+    if int(response_counts.amin().item()) <= 0:
+        return torch.empty((token_probs.shape[0], 0), dtype=torch.long, device=device)
+
+    score = torch.where(
+        valid_response,
+        1.0 - token_probs,
+        torch.full_like(token_probs, float("-inf")),
+    )
+    n_select = min(n_subtrees, int(response_counts.amin().item()))
+    return score.topk(n_select, dim=1).indices.sort(dim=1).values
+
+
+def _fill_depth1_subtrees(
+    *,
+    subtree_ids: torch.Tensor,
+    subtree_ar_probs: torch.Tensor,
+    cand_vals: torch.Tensor | None,
+    cand_ids: torch.Tensor | None,
+    log_denom: torch.Tensor,
+    input_ids: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    depth1_slots: Sequence[int],
+) -> None:
+    if not depth1_slots or cand_vals is None or cand_ids is None:
+        return
+
+    bsz, seq_len = input_ids.shape
+    device = input_ids.device
+    has_next = torch.zeros((bsz, seq_len), dtype=torch.bool, device=device)
+    excluded_token = torch.full((bsz, seq_len), IGNORE_IDX, dtype=torch.long, device=device)
+    if seq_len > 1:
+        has_next[:, :-1] = valid_tokens[:, 1:]
+        excluded_token[:, :-1] = torch.where(
+            valid_tokens[:, 1:],
+            input_ids[:, 1:],
+            torch.full_like(input_ids[:, 1:], IGNORE_IDX),
+        )
+
+    valid_candidates = valid_tokens.unsqueeze(-1)
+    valid_candidates = valid_candidates & (
+        (~has_next.unsqueeze(-1)) | cand_ids.ne(excluded_token.unsqueeze(-1))
+    )
+    candidate_ranks = valid_candidates.to(torch.int64).cumsum(dim=-1)
+
+    for rank_idx, slot in enumerate(depth1_slots, start=1):
+        slot_match = valid_candidates & candidate_ranks.eq(rank_idx)
+        has_match = slot_match.any(dim=-1)
+        match_idx = slot_match.to(torch.int64).argmax(dim=-1)
+        chosen_ids = cand_ids.gather(-1, match_idx.unsqueeze(-1)).squeeze(-1)
+        chosen_vals = cand_vals.gather(-1, match_idx.unsqueeze(-1)).squeeze(-1)
+        chosen_probs = (chosen_vals - log_denom).exp().to(torch.float32)
+
+        subtree_ids[:, :, slot] = torch.where(has_match, chosen_ids, subtree_ids[:, :, slot])
+        subtree_ar_probs[:, :, slot] = torch.where(
+            has_match,
+            chosen_probs,
+            subtree_ar_probs[:, :, slot],
+        )
+
+
+def _write_children_and_build_frontier(
+    *,
+    new_hidden_states: torch.Tensor,
+    root_positions: torch.Tensor,
+    vertex_ids: torch.Tensor,
+    lm_head: torch.nn.Module,
+    st_info: SubTreeInfo,
+    current_depth: int,
+    logit_chunk_size: int,
+    subtree_ids: torch.Tensor,
+    subtree_ar_probs: torch.Tensor,
+    device: torch.device,
+    profile: dict[str, float] | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    batch_size = root_positions.shape[0]
+    batch_rows_cache: dict[int, torch.Tensor] = {}
+    next_tokens: list[torch.Tensor] = []
+    next_roots: list[torch.Tensor] = []
+    next_vertices: list[torch.Tensor] = []
+    next_non_leaf = set(st_info.non_leaf_at_depth.get(current_depth + 1, []))
+    write_start = time.perf_counter()
+
+    for parent_vertex in st_info.non_leaf_at_depth.get(current_depth, []):
+        children = st_info.children_map.get(parent_vertex, [])
+        if not children:
+            continue
+
+        parent_cols = torch.nonzero(vertex_ids == parent_vertex, as_tuple=False).flatten()
+        if parent_cols.numel() == 0:
+            continue
+
+        parent_hidden_states = new_hidden_states.index_select(1, parent_cols)
+        parent_roots = root_positions.index_select(1, parent_cols)
+        child_k = len(children)
+
+        for col_chunk in iter_position_chunks(parent_cols.numel(), logit_chunk_size):
+            chunk_outputs = summarize_lm_head_chunk(
+                parent_hidden_states[:, col_chunk, :],
+                lm_head,
+                topk=child_k,
+                compute_top_probs=True,
+            )
+            chunk_roots = parent_roots[:, col_chunk]
+            chunk_width = chunk_roots.shape[1]
+            batch_rows = batch_rows_cache.get(chunk_width)
+            if batch_rows is None:
+                batch_rows = torch.arange(batch_size, device=device).unsqueeze(-1).expand(batch_size, chunk_width)
+                batch_rows_cache[chunk_width] = batch_rows
+
+            for child_rank, child_vertex in enumerate(children):
+                child_ids = chunk_outputs.top_ids[:, :, child_rank]
+                child_probs = chunk_outputs.top_probs[:, :, child_rank]
+                subtree_ids[batch_rows, chunk_roots, child_vertex] = child_ids
+                subtree_ar_probs[batch_rows, chunk_roots, child_vertex] = child_probs
+                if child_vertex in next_non_leaf:
+                    next_tokens.append(child_ids)
+                    next_roots.append(chunk_roots)
+                    next_vertices.append(
+                        torch.full((chunk_width,), child_vertex, dtype=torch.long, device=device)
+                    )
+
+    _accumulate_profile(profile, "tree_writeback_s", write_start)
+    if not next_tokens:
+        return None, None, None
+
+    return (
+        torch.cat(next_tokens, dim=1),
+        torch.cat(next_roots, dim=1),
+        torch.cat(next_vertices, dim=0),
+    )
+
+
+
+def build_step_attention_mask(
+    *,
+    root_positions: torch.Tensor,           # [B, Q]
+    query_vertex_ids: torch.Tensor,        # [Q]
+    tree_root_positions: torch.Tensor,     # [B, K_tree]
+    tree_vertex_ids: torch.Tensor,         # [B, K_tree]
+    document_mask: torch.Tensor,           # [B, S]
+    valid_tokens: torch.Tensor,            # [B, S]
+    ancestor_map: torch.Tensor,            # [st_size, st_size]
+    ctx_len: int,
+    use_flex: bool,
+    flex_mask_builder: Callable | None = None,
+):
+    if use_flex:
+        builder = flex_mask_builder or _build_flex_block_mask
+        return builder(
+            root_positions=root_positions,
+            query_vertex_ids=query_vertex_ids,
+            tree_root_positions=tree_root_positions,
+            tree_vertex_ids=tree_vertex_ids,
+            document_mask=document_mask,
+            valid_tokens=valid_tokens,
+            ancestor_map=ancestor_map,
+            ctx_len=ctx_len,
+        )
+    return _build_dense_step_attention_mask(
+        root_positions=root_positions,
+        query_vertex_ids=query_vertex_ids,
+        tree_root_positions=tree_root_positions,
+        tree_vertex_ids=tree_vertex_ids,
+        document_mask=document_mask,
+        valid_tokens=valid_tokens,
+        ancestor_map=ancestor_map,
+        ctx_len=ctx_len,
+    )
+
+
+@torch.inference_mode()
+def generate_trees(
+    batch,
+    model,
+    n_subtrees: int,
+    st_info: SubTreeInfo,
+    logit_chunk_size: int = 128,
+    runtime: Stage2Runtime | None = None,
+    profile: dict[str, float] | None = None,
+):
+    input_ids = batch["input_ids"]  # [B, S]
+    is_response = batch["is_response"]  # [B, S]
+    document_mask = batch["document_mask"]  # [B, S], -1 for padding
+    B, S = input_ids.shape
+    device = input_ids.device
+    valid_tokens = document_mask >= 0
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        raise ValueError("Model must expose output embeddings via get_output_embeddings()")
+
+    subtree_ids = torch.full(
+        (B, S, st_info.size),
+        fill_value=IGNORE_IDX,
+        dtype=torch.long,
+        device=device,
+    )
+    subtree_ar_probs = torch.zeros((B, S, st_info.size), dtype=torch.float32, device=device)
+    subtree_ids[:, :, 0] = torch.where(valid_tokens, input_ids, torch.full_like(input_ids, IGNORE_IDX))
+
+    base_model_forward = runtime.base_model_forward if runtime is not None else model.base_model
+    base_out = _run_base_model_forward(
+        base_model_forward,
+        profile=profile,
+        profile_key="initial_forward_s",
+        input_ids=input_ids,
+        attention_mask=valid_tokens.long(),
+        use_cache=True,
+    )
+    hidden_states, kv_cache = _extract_hidden_and_cache(base_out)
+    vocab_size = getattr(model.config, "vocab_size", None)
+    if vocab_size is None:
+        if not hasattr(lm_head, "weight"):
+            raise ValueError("Could not infer vocab size from model config or LM head weights")
+        vocab_size = lm_head.weight.shape[0]
+    use_flex = getattr(getattr(model, "config", None), "_attn_implementation", None) == "flex_attention"
+    depth1_slots = st_info.nodes_at_depth.get(1, [])
+    request_k = min(len(depth1_slots) + 1, vocab_size) if depth1_slots else 0
+    log_denom, token_probs, cand_vals, cand_ids = _summarize_initial_pass(
+        hidden_states=hidden_states,
+        input_ids=input_ids,
+        valid_tokens=valid_tokens,
+        lm_head=lm_head,
+        vocab_size=request_k,
+        logit_chunk_size=logit_chunk_size,
+        profile=profile,
+    )
+
     subtree_ar_probs[:, :, 0] = torch.where(valid_tokens, token_probs, torch.zeros_like(token_probs))
 
     valid_response = is_response & valid_tokens
-    response_counts = valid_response.sum(dim=1)
-    if int(response_counts.min().item()) > 0:
-        score = torch.where(
-            valid_response,
-            1.0 - token_probs,
-            torch.full_like(token_probs, float("-inf")),
-        )
-        n_select = min(n_subtrees, int(response_counts.min().item()))
-        subtree_anchors = score.topk(n_select, dim=1).indices.sort(dim=1).values
-    else:
-        subtree_anchors = torch.empty((B, 0), dtype=torch.long, device=device)
-
-    if depth1_slots and cand_vals is not None and cand_ids is not None:
-        has_next = torch.zeros((B, S), dtype=torch.bool, device=device)
-        excluded_token = torch.full((B, S), IGNORE_IDX, dtype=torch.long, device=device)
-        if S > 1:
-            has_next[:, :-1] = valid_tokens[:, 1:]
-            excluded_token[:, :-1] = torch.where(
-                valid_tokens[:, 1:],
-                input_ids[:, 1:],
-                torch.full_like(input_ids[:, 1:], IGNORE_IDX),
-            )
-
-        for b in range(B):
-            for pos in range(S):
-                if not valid_tokens[b, pos]:
-                    continue
-
-                filled = 0
-                banned = int(excluded_token[b, pos].item()) if has_next[b, pos] else None
-                for cand_idx in range(request_k):
-                    tok = int(cand_ids[b, pos, cand_idx].item())
-                    if banned is not None and tok == banned:
-                        continue
-
-                    slot = depth1_slots[filled]
-                    subtree_ids[b, pos, slot] = tok
-                    subtree_ar_probs[b, pos, slot] = float(
-                        torch.exp(cand_vals[b, pos, cand_idx] - log_denom[b, pos]).item()
-                    )
-                    filled += 1
-                    if filled >= len(depth1_slots):
-                        break
+    subtree_anchors = _select_subtree_anchors(
+        valid_response=valid_response,
+        token_probs=token_probs,
+        n_subtrees=n_subtrees,
+    )
+    _fill_depth1_subtrees(
+        subtree_ids=subtree_ids,
+        subtree_ar_probs=subtree_ar_probs,
+        cand_vals=cand_vals,
+        cand_ids=cand_ids,
+        log_denom=log_denom,
+        input_ids=input_ids,
+        valid_tokens=valid_tokens,
+        depth1_slots=depth1_slots,
+    )
 
     ancestor_map = st_info.ancestor_map.to(device)
     current_depth = 1
@@ -395,6 +693,7 @@ def generate_trees(batch, model, n_subtrees: int, st_info: SubTreeInfo, logit_ch
             else:
                 all_tree_root_positions = torch.cat([cached_root_positions, root_positions], dim=1)
                 all_tree_vertex_ids = torch.cat([cached_vertex_ids, current_vertex_ids], dim=1)
+            mask_start = time.perf_counter()
             attention_mask = build_step_attention_mask(
                 root_positions=root_positions,
                 query_vertex_ids=vertex_ids,
@@ -405,9 +704,14 @@ def generate_trees(batch, model, n_subtrees: int, st_info: SubTreeInfo, logit_ch
                 ancestor_map=ancestor_map,
                 ctx_len=S,
                 use_flex=use_flex,
+                flex_mask_builder=runtime.flex_mask_builder if runtime is not None else None,
             )
+            _accumulate_profile(profile, "mask_build_s", mask_start)
 
-            base_out = model.base_model(
+            base_out = _run_base_model_forward(
+                base_model_forward,
+                profile=profile,
+                profile_key="tree_forward_s",
                 input_ids=next_input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
@@ -426,55 +730,23 @@ def generate_trees(batch, model, n_subtrees: int, st_info: SubTreeInfo, logit_ch
             cached_root_positions = all_tree_root_positions
             cached_vertex_ids = all_tree_vertex_ids
 
-            next_tokens: list[torch.Tensor] = []
-            next_roots: list[torch.Tensor] = []
-            next_vertices: list[int] = []
-            next_non_leaf = set(st_info.non_leaf_at_depth.get(current_depth + 1, []))
-            batch_rows = torch.arange(B, device=device)
-
-            vertex_list = vertex_ids.tolist()
-            for col_chunk in iter_position_chunks(len(vertex_list), logit_chunk_size):
-                chunk_vertices = vertex_list[col_chunk]
-                chunk_max_child_k = max(
-                    (len(st_info.children_map.get(parent_vertex, [])) for parent_vertex in chunk_vertices),
-                    default=0,
-                )
-                if chunk_max_child_k <= 0:
-                    continue
-
-                chunk_outputs = summarize_lm_head_chunk(
-                    new_hidden_states[:, col_chunk, :],
-                    lm_head,
-                    topk=chunk_max_child_k,
-                    compute_top_probs=True,
-                )
-
-                for local_col, parent_vertex in enumerate(chunk_vertices):
-                    children = st_info.children_map.get(parent_vertex, [])
-                    if not children:
-                        continue
-
-                    child_k = len(children)
-                    child_ids = chunk_outputs.top_ids[:, local_col, :child_k]
-                    child_probs = chunk_outputs.top_probs[:, local_col, :child_k]
-
-                    for child_rank, child_vertex in enumerate(children):
-                        global_col = col_chunk.start + local_col
-                        anchor_pos = root_positions[:, global_col]
-                        subtree_ids[batch_rows, anchor_pos, child_vertex] = child_ids[:, child_rank]
-                        subtree_ar_probs[batch_rows, anchor_pos, child_vertex] = child_probs[:, child_rank]
-                        if child_vertex in next_non_leaf:
-                            next_tokens.append(child_ids[:, child_rank])
-                            next_roots.append(anchor_pos)
-                            next_vertices.append(child_vertex)
-
-            if not next_tokens:
+            next_input_ids, root_positions, vertex_ids = _write_children_and_build_frontier(
+                new_hidden_states=new_hidden_states,
+                root_positions=root_positions,
+                vertex_ids=vertex_ids,
+                lm_head=lm_head,
+                st_info=st_info,
+                current_depth=current_depth,
+                logit_chunk_size=logit_chunk_size,
+                subtree_ids=subtree_ids,
+                subtree_ar_probs=subtree_ar_probs,
+                device=device,
+                profile=profile,
+            )
+            if next_input_ids is None or root_positions is None or vertex_ids is None:
                 break
 
             current_depth += 1
-            next_input_ids = torch.stack(next_tokens, dim=1)
-            root_positions = torch.stack(next_roots, dim=1)
-            vertex_ids = torch.tensor(next_vertices, dtype=torch.long, device=device)
             position_ids = root_positions + current_depth
 
     subtree_ids = subtree_ids.masked_fill(~valid_tokens.unsqueeze(-1), IGNORE_IDX)
@@ -616,6 +888,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=128,
         help="Project at most this many positions through the LM head at once; <= 0 disables chunking.",
     )
+    parser.add_argument("--compile", action="store_true", help="Compile supported Stage 2 flex-attention helpers.")
+    parser.add_argument(
+        "--compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        default="reduce-overhead",
+        help="torch.compile mode for supported Stage 2 helpers.",
+    )
+    parser.add_argument(
+        "--profile-every",
+        type=int,
+        default=0,
+        help="Print lightweight timing stats every N processed batches; 0 disables profiling logs.",
+    )
     return parser
 
 
@@ -662,7 +947,11 @@ def main() -> None:
         model.resize_token_embeddings(len(tokenizer))
     model.to(device)
     model.eval()
-    # model = torch.compile(model, mode='max-autotune')
+    runtime = build_stage2_runtime(
+        model,
+        compile_enabled=args.compile,
+        compile_mode=args.compile_mode,
+    )
 
     st_info = SubTreeInfo(args.sub_tree_paths)
     output_path = Path(args.output)
@@ -675,6 +964,8 @@ def main() -> None:
     prob_buf: list[np.ndarray] = []
     pending: list[tuple[list[int], list[int]]] = []
     FLUSH_EVERY = 128
+    batch_count = 0
+    timings: dict[str, float] = {}
 
     with h5py.File(output_path, "w") as hf:
         hf.create_dataset("prompt_ids", shape=(0,), maxshape=(None,), dtype=vlen_int64)
@@ -706,8 +997,10 @@ def main() -> None:
             if args.max_sequences is not None and n_seqs_written + len(pending) >= args.max_sequences:
                 break
 
+            tokenize_start = time.perf_counter()
             prompt_ids = tokenizer.encode(record["prompt"], add_special_tokens=False)
             response_ids = tokenizer.encode(record["response"], add_special_tokens=False)
+            _accumulate_profile(timings, "tokenize_s", tokenize_start)
             if not response_ids:
                 continue
 
@@ -715,14 +1008,19 @@ def main() -> None:
             if len(pending) < args.batch_size:
                 continue
 
+            build_batch_start = time.perf_counter()
             batch = build_batch(pending, tokenizer.pad_token_id, device)
+            _accumulate_profile(timings, "build_batch_s", build_batch_start)
             batch = generate_trees(
                 batch,
                 model,
                 args.n_subtrees,
                 st_info,
                 logit_chunk_size=args.logit_chunk_size,
+                runtime=runtime,
+                profile=timings,
             )
+            batch_count += 1
 
             for row, (prompt_ids_row, response_ids_row) in enumerate(pending):
                 prompt_len = len(prompt_ids_row)
@@ -741,6 +1039,7 @@ def main() -> None:
             pending.clear()
 
             if len(prompt_buf) >= FLUSH_EVERY:
+                flush_start = time.perf_counter()
                 n_seqs_written, n_rows_written = flush_hdf5(
                     hf,
                     prompt_buf,
@@ -750,16 +1049,38 @@ def main() -> None:
                     n_seqs_written,
                     n_rows_written,
                 )
+                _accumulate_profile(timings, "flush_s", flush_start)
                 print(f"Sequences: {n_seqs_written}  Response rows: {n_rows_written}", flush=True)
 
+            if args.profile_every > 0 and batch_count % args.profile_every == 0:
+                print(
+                    (
+                        f"[profile] batches={batch_count} "
+                        f"tokenize={timings.get('tokenize_s', 0.0):.3f}s "
+                        f"build_batch={timings.get('build_batch_s', 0.0):.3f}s "
+                        f"initial_forward={timings.get('initial_forward_s', 0.0):.3f}s "
+                        f"initial_summary={timings.get('initial_summary_s', 0.0):.3f}s "
+                        f"mask_build={timings.get('mask_build_s', 0.0):.3f}s "
+                        f"tree_forward={timings.get('tree_forward_s', 0.0):.3f}s "
+                        f"tree_writeback={timings.get('tree_writeback_s', 0.0):.3f}s "
+                        f"flush={timings.get('flush_s', 0.0):.3f}s"
+                    ),
+                    flush=True,
+                )
+                timings.clear()
+
         if pending:
+            build_batch_start = time.perf_counter()
             batch = build_batch(pending, tokenizer.pad_token_id, device)
+            _accumulate_profile(timings, "build_batch_s", build_batch_start)
             batch = generate_trees(
                 batch,
                 model,
                 args.n_subtrees,
                 st_info,
                 logit_chunk_size=args.logit_chunk_size,
+                runtime=runtime,
+                profile=timings,
             )
 
             for row, (prompt_ids_row, response_ids_row) in enumerate(pending):
