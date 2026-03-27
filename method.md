@@ -1,450 +1,784 @@
-# Tree-Flash: Method
-
-Tree-Flash extends DFlash speculative decoding by replacing its linear block draft with a tree-structured draft. Instead of verifying one candidate sequence per step, the target model verifies an entire tree of candidates in a single forward pass, accepting the longest valid path and increasing expected tokens generated per step.
-
----
-
-## 1. Background: DFlash
-
-DFlash (Chen, Liang, Liu 2026) is a speculative decoding method that drafts an entire block of `block_size` tokens in one parallel forward pass using a bidirectional (non-causal) diffusion model.
-
-**Key properties:**
-- The draft model denoises a fully-masked block conditioned on hidden states extracted from the target model.
-- KV injection: each draft attention layer's keys and values are the concatenation of projected target hidden states and the current draft hidden states, giving the draft model direct access to the target's representations without causal constraints.
-- At decode time the accepted tokens advance the sequence and the draft model runs again from the new position.
-- DFlash achieves ~6× wall-clock speedup on Qwen3-8B and ~2.5× over EAGLE-3.
-
-**Limitation addressed here:** DFlash accepts tokens linearly — one path through the block. If the draft diverges from the target at position *k*, all tokens at positions *k+1, …* are discarded. Tree drafting recovers some of this waste by exploring multiple continuations simultaneously.
-
----
-
-## 2. Draft Model Architecture
-
-The draft model is `TreeDraftModel` (extending `DFlashDraftModel`), a 5-layer transformer with bidirectional (non-causal) self-attention over the draft tokens. The layers are split into a **shared backbone** (layers 0..N-2) and two independent **heads** (diffusion head and AR head) that both operate on the shared backbone output.
-
-### 2.1 Feature extraction
-
-At each forward pass the target model runs on the context and returns hidden states from all its layers. A fixed subset of `n_feature_layers` target layers (uniformly spaced) are concatenated along the feature dimension and projected down to the draft model's hidden size:
-
-```
-raw_target_hidden : [B, ctx_len, n_feature_layers × H_target]
-    → fc (Linear, no bias)
-    → hidden_norm (RMSNorm)
-    → target_hidden_proj : [B, ctx_len, H]
-```
-
-### 2.2 KV injection
-
-Each draft attention layer concatenates the projected target hidden states with the current draft hidden states to form its keys and values:
-
-```
-k = cat([k_proj(target_hidden_proj),  k_proj(noise_embedding)],  dim=seq)
-v = cat([v_proj(target_hidden_proj),  v_proj(noise_embedding)],  dim=seq)
-q = q_proj(noise_embedding)
-```
-
-The query attends over the full `ctx_len + tree_size` sequence, giving every draft position access to the complete context. Rotary position embeddings are applied to both the context and tree token positions using a unified position ID vector that spans the full range.
-
-### 2.3 Bidirectional attention over the tree
-
-Unlike standard causal LMs, the draft model applies **no causal mask** — all tree nodes attend to all other tree nodes and to all context tokens. This means the draft model has a global view of every tree node it is denoising simultaneously, which is appropriate because all positions start masked and are denoised in one pass.
-
-### 2.4 Shared backbone + split heads
-
-`TreeDraftModel.forward()` is split into two steps:
-
-```
-layers[0..N-2]  →  shared_hs          [B, tree_size, H]  (shared backbone output)
-
-shared_hs  →  layers[N-1, diffusion]  →  norm  →  lm_head  →  draft_logits
-shared_hs  →  ar_layer  (in ARHead)   →  norm  →  lm_head  →  ar_logits
-```
-
-Exposed methods on `TreeDraftModel`:
-- `shared_forward(position_ids, noise_embedding, target_hidden)` → `(shared_hs, target_hidden_proj, position_embeddings)`
-- `diffusion_head(shared_hs, target_hidden_proj, position_embeddings)` → `backbone_hs` (normed, ready for lm_head)
-
-Sharing all-but-last layers between diffusion and AR paths maximises parameter efficiency while allowing each head to specialise its final transformer block.
-
-### 2.5 Output
-
-Draft token logits are obtained by applying the **shared** target LM head to the diffusion head output:
-
-```
-backbone_hs  = diffusion_head(shared_hs, ...)       # [B, tree_size, H]
-draft_logits = lm_head(backbone_hs)                 # [B, tree_size, V]
-```
-
-Sharing the LM head keeps the draft and target models in the same vocabulary space without adding parameters.
-
----
-
-## 3. AR Pruning Head
-
-The AR head (`ARHead`) is the **only tree-topology-aware component** in the draft model. It takes the **shared backbone output** and injects the **embedding of each node's parent token** before running a dedicated final transformer block, making its predictions conditional on the particular path taken to reach each node.
-
-```
-ar_input = shared_hs + parent_proj(parent_embeds)   [B, tree_size, H]
-ar_hs    = ar_layer(ar_input, target_hidden_proj, position_embeddings)
-ar_logits = lm_head(norm(ar_hs))                    [B, tree_size, V]
-```
-
-Components:
-- `parent_proj`: `Linear(H → H, bias=False)` — projects parent token embedding into the hidden space
-- `ar_layer`: `Qwen3DFlashDecoderLayer` with `layer_idx = num_draft_layers` — a full transformer block with KV injection, distinct from the diffusion head's final layer
-- `norm`: `RMSNorm(H)` — independent from the diffusion head's norm
-- `lm_head`: shared with the target model (same as draft's lm_head)
-
-The AR head uses the same shared `lm_head` as the draft model. During training it is supervised with the same CumProd-weighted cross-entropy as the draft, scaled by `ar_loss_weight` (λ = 0.1).
-
-During inference the AR head provides **q-values** for pruning: given the sampled draft tokens as parent embeddings (not teacher-forced), it estimates how likely each subtree path is to be accepted, enabling the model to discard low-probability branches before sending the tree to the target for verification (Experiment 2+).
-
----
-
-## 4. Tree Structure
-
-### 4.1 Tree v1 parameterisation
-
-The verification tree is defined by two parameters:
-
-- **`n_subtrees`** (training-time): the number of primary-path nodes used in each training item and during inference. The primary path is assembled directly from the response at dataset-load time — it is not stored in stage 2.
-- **`sub_tree_paths`** (stage-2 and training): a list of `"X-Y"` edge strings defining an arbitrary rooted subtree, where `X` is the parent node index and `Y` is the child node index (0 = attachment root). These are the **diverging alternatives** generated in stage 2.
-
-The full tree is constructed by:
-1. Building a primary path of `n_subtrees` nodes: `0 → 1 → 2 → … → n_subtrees-1` — taken from `response[t : t + n_subtrees]`.
-2. Attaching one copy of the subtree at **every** primary-path node. Subtree node 0 is the primary-path node itself (the attachment point); subtree nodes 1, 2, … become its additional children, with tokens diverging from the response.
-
-This gives:
-```
-tree_size = n_subtrees + n_subtrees × subtree_size
-```
-where `subtree_size` is the number of non-root subtree nodes.
-
-**Default tree:** `n_subtrees=8`, `sub_tree_paths=["0-1","0-2","0-3","1-4","1-5","2-6","2-7"]`
-
-The subtree has root (attachment point) with 3 children (1, 2, 3); node 1 has children (4, 5); node 2 has children (6, 7); node 3 is a leaf. `subtree_size=7`, `tree_size = 8 + 8×7 = 64`.
-
-```
-anchor
-  └─ primary node 0  [response[t]]
-       ├─ primary node 1  [response[t+1]]
-       │    ├─ primary node 2  …  (primary path continues for n_subtrees nodes)
-       │    ├─ alt A  (subtree depth-1, diverges from response[t+2])
-       │    │    ├─ alt A1  (subtree depth-2)
-       │    │    └─ alt A2
-       │    └─ alt B
-       │         ├─ alt B1
-       │         └─ alt B2
-       │    └─ alt C  (leaf)
-       ├─ alt A  (subtree copy at primary node 0, diverges from response[t+1])
-       │    ├─ alt A1
-       │    └─ alt A2
-       └─ alt B  …
-```
-
-Each primary path node has an identical subtree copy attached (same structure, independently filled tokens). The depth-1 nodes of each subtree always diverge from the next response token; deeper nodes are sampled freely.
-
-### 4.2 Derived quantities (TreeSpec)
-
-`TreeSpec.__post_init__` pre-computes all derived quantities needed throughout training and inference:
-
-| Tensor | Shape | Description |
-|---|---|---|
-| `parent_ids` | `[T]` | Parent node index; −1 for root |
-| `depths` | `[T]` | Depth of each node (root = 0) |
-| `ancestor_matrix` | `[T, T]` bool | `[k, q]` = True iff k is ancestor-or-self of q |
-| `adjusted_parent_ids` | `[T]` | Index into `[anchor, tree_token_0, …]`; root → 0 (anchor slot) |
-| `position_ids` | `[T]` | Depth-based relative position IDs; add `ctx_len` for absolute positions |
-| `sibling_pairs` | `[n_pairs, 2]` | All (i, j) pairs sharing the same parent, i < j |
-
-### 4.3 Attention mask for verification
-
-During the tree verification pass, each tree token is allowed to attend to:
-- **All context tokens** (which are held in the target's KV cache).
-- **Its own ancestors and itself** in the tree (not siblings or descendants).
-
-This is exactly the `ancestor_matrix` transposed. Two mask formats are supported:
-- `build_tree_attn_mask`: dense `[B, 1, T, ctx_len + T]` additive float mask (0 / −∞) for HuggingFace SDPA.
-- `build_flex_block_mask`: sparse `BlockMask` for `torch.nn.attention.flex_attention` (preferred at scale).
-
----
-
-## 5. Data Pipeline
-
-### Stage 1 — Response generation (`stage1_generate.py`)
-
-Stage 1 generates the raw training corpus using the target model via vLLM.
-
-**Input:** Nemotron V2 (chat, math, code, STEM splits) + CodeAlpaca 20k, up to 800 k prompts after filtering. Prompts are formatted with the target model's chat template and filtered to ≤ 66% of `max_seq_len` tokens to leave headroom for the generated response.
-
-**Process:** vLLM runs the target model (temperature = 1.0) to generate completions.
-
-**Output:** sharded JSONL files, each line:
-```json
-{"prompt": "<formatted prompt string>", "response": "<generated completion>"}
-```
-
-### Stage 2 — Continuation tree generation (`stage2_trees.py`)
-
-Stage 2 runs the target model on each (prompt, response) pair to generate the ground-truth continuation trees used for training.
-
-**Input:** directory of Stage 1 JSONL shards. Both `prompt` and `response` are encoded with `add_special_tokens=False` (the chat template already inserts all special tokens).
-
-**Output:** A single HDF5 file with the following datasets:
-
-| Dataset | Shape | Dtype | Description |
-|---|---|---|---|
-| `prompt_ids` | `[N]` vlen | int64 | Tokenised prompt per sequence |
-| `response_ids` | `[N]` vlen | int64 | Tokenised response per sequence |
-| `response_probs` | `[T]` flat | float32 | `p(response[t] \| context[:t])` for every response position; all sequences concatenated |
-| `continuation_trees` | `[T, subtree_size]` | int64 | Subtree tokens at each position; −1 = IGNORE_IDX for non-selected positions |
-| `continuation_trees_probs` | `[T, subtree_size]` | float32 | Individual AR probability of each subtree token; 0.0 = IGNORE_IDX |
-| `selected_positions` | `[N]` vlen | int64 | Response-relative indices of selected subtree positions per sequence |
-| `sequence_offsets` | `[N+1]` | int64 | Row-pointer index: sequence n occupies `[offsets[n]:offsets[n+1]]` |
-
-`T = Σ S_R_n` (sum of all response lengths). Row `offsets[n] + t` corresponds to response position `t` of sequence `n`.
-
-**What stage 2 stores at position t:**
-
-Stage 2 stores only the **diverging alternatives** — not the primary path, which is just `response[t : t + n_subtrees]` and is assembled at training time directly from `response_ids`.
-
-The subtree at position t:
-- **Depth-1 nodes**: the top-k most-likely tokens from `logits_after(response[t])`, **excluding** `response[t+1]` (which is already on the primary path). Extracted from the base forward pass.
-- **Depth-2 nodes**: for each depth-1 parent with token X, the context `[prompt + response[0..t]] + [X]` is run through the target model; the final-position logits provide the depth-2 children. No exclusion needed at depth ≥ 2.
-
-**Position selection:**
-
-One forward pass over `prompt + response` gives `response_probs[t]` for all positions. The *uncertainty score* is:
-
-```
-score(t) = 1 − response_probs[t]
-```
-
-Positions where the response token was hard to predict are most valuable — a subtree there covers more probability mass. The top `num_trees_per_seq` positions (by descending score) are selected; the rest have IGNORE_IDX / 0.0 in `continuation_trees` / `continuation_trees_probs`. `response_probs` is always populated for all positions.
-
-Valid positions for selection: `0 ≤ t < S_R` (any response position). The constraint `t + n_subtrees ≤ S_R` is enforced at training time, not at stage-2 time, because `n_subtrees` is a training-time parameter independent of stage 2.
-
-**Probabilities:**
-
-`continuation_trees_probs[t][node]` stores the individual AR probability of each subtree token:
-```
-p_target(token | context + ancestor path to node)
-```
-These are **individual** per-node probabilities, not cumulative products. The training loss computes cumprods on the fly. `response_probs` similarly stores individual (not cumulative) per-position probs for the primary path nodes.
-
----
-
-## 6. Training
-
-### 6.1 Loss function
-
-Training minimises a **CumProd-weighted cross-entropy** over all tree nodes jointly for both the draft model and the AR head:
-
-```
-L = L_draft + λ · L_ar
-```
-
-CumProd weights are computed on-the-fly from the individual probabilities stored in the dataset:
-
-```
-log_cumprod[b, q] = Σ_{k: ancestor_matrix[k,q]=True}  log(tree_probs[b, k])
-cumprod_weight[b, q] = exp(log_cumprod[b, q])
-```
-
-This is one `[B, T] × [T, T]` matrix multiply using the `ancestor_matrix` from `TreeSpec`.
-
-```
-         Σ_{b,i}  w[b,i] · CE(draft_logits[b,i], tree_tokens[b,i])
-L_draft = ─────────────────────────────────────────────────────────
-                         Σ_{b,i}  w[b,i]
-
-         Σ_{b,i}  w[b,i] · CE(ar_logits[b,i], tree_tokens[b,i])
-L_ar    = ─────────────────────────────────────────────────────────
-                         Σ_{b,i}  w[b,i]
-```
-
-Positions with `tree_tokens == −1` (IGNORE_IDX) are excluded via `ignore_index=−1` in `F.cross_entropy` and naturally receive zero weight (their `tree_probs = 0.0 → cumprod = 0.0`).
-
-**Motivation:** Nodes on high-probability paths — those that will actually be reached and verified at test time — receive proportionally higher loss weight, concentrating capacity on the paths that matter.
-
-### 6.2 Training forward pass
-
-The `Stage2Dataset` explodes the per-sequence HDF5 data into individual `(context_ids, tree_tokens, tree_probs)` training examples. For each selected `(sequence n, anchor t)` pair where `t + n_subtrees ≤ S_R`:
-
-```
-context_ids = (prompt_ids[n] + response_ids[n][:t])[-ctx_len:]      [ctx_len]
-
-# Full tree assembled on the fly:
-base = offsets[n]
-tree_tokens[:n_subtrees]                  = response_ids[n][t : t+n_subtrees]    (primary path)
-tree_tokens[n_subtrees + i*ss : ... ]     = continuation_trees[base+t+i]         (subtree at node i)
-
-tree_probs[:n_subtrees]                   = response_probs[base+t : base+t+n_subtrees]
-tree_probs[n_subtrees + i*ss : ... ]      = continuation_trees_probs[base+t+i]
-```
-
-where `ss = subtree_size`. Subtree slots are IGNORE_IDX / 0.0 for primary-path nodes `t+i` that were not selected in stage 2; these receive near-zero cumprod weight and are effectively ignored by the loss.
-
-Each training step:
-
-1. **Target model** (frozen, `torch.no_grad()`): forward pass on `context_ids` with `output_hidden_states=True`. Extract `raw_target_hidden [B, ctx_len, n_feat × H]` by concatenating the `n_feature_layers` uniformly-sampled hidden states.
-
-2. **DraftWrapper.forward** (trainable):
-   - Embed `noise_ids` (all mask tokens) → `noise_embedding [B, tree_size, H]`.
-   - **Shared backbone**: `shared_hs, target_hidden_proj, pos_emb = draft.shared_forward(...)`.
-   - **Diffusion head**: `backbone_hs = draft.diffusion_head(shared_hs, ...)`. Draft logits: `lm_head(backbone_hs)`.
-   - **AR head**: construct parent embeddings by embedding `[anchor_id, tree_tokens_0, …]` indexed with `adjusted_parent_ids`. AR logits: `ar_head(shared_hs, parent_embeds, target_hidden_proj, pos_emb)`.
-
-3. **Loss**: `compute_loss(draft_logits, ar_logits, tree_tokens, tree_probs, λ, ancestor_matrix)`.
-
-Teacher forcing is used for the AR head at train time — parent embeddings come from the ground-truth `tree_tokens`, not from the draft's own predictions. At inference the AR head uses sampled draft tokens as parent embeddings.
-
-### 6.3 Infrastructure
-
-**Lightning Fabric** manages data-parallel training across 8 GPUs (DDP strategy, bf16-mixed precision):
-
-- The **target model** is placed on the device with `.to()` and is never passed to `fabric.setup()`. DDP does not touch its parameters — it has no gradients.
-- The **DraftWrapper** (draft + AR head) is wrapped with `fabric.setup(model, optimizer)`. Only `draft` and `ar_head` parameters have `requires_grad=True`; `lm_head` and `embed_tokens` are frozen references inside the wrapper so DDP skips their gradient synchronisation.
-- The **`ancestor_matrix`** `[tree_size, tree_size]` is placed on device once at setup time; passed to `compute_loss` each step.
-- **`torch.compile`** is applied to `DraftWrapper.forward()`, which has static shapes (fixed `batch_size`, `ctx_len`, `tree_size`) enabling full graph compilation.
-
-**Optimiser:** AdamW (fused), cosine LR schedule with warmup.
-
-**Gradient accumulation:** configurable via `grad_accum`; `fabric.no_backward_sync` suppresses DDP all-reduce on accumulation micro-steps.
-
-### 6.4 Validation
-
-Two validation modes run periodically during training:
-
-**`validate_loss`** (every `val_loss_every` steps): runs the same training forward pass on held-out data; reports `val_loss`, `val_draft_loss`, `val_ar_loss`. Fast.
-
-**`validate_spec`** (every `val_spec_every` steps): measures actual speculative decoding quality on held-out contexts. For each batch:
-1. Prefill target with `use_cache=True` → `target_kv`.
-2. Draft pass (`infer_forward`, no teacher forcing, no AR head).
-3. Verification pass (`use_cache=False`, tree attention mask).
-4. Acceptance and metric accumulation (see Section 7.2 for acceptance details).
-
-Metrics reported: average acceptance length, equality heatmap, sibling equality rate, final-node histogram, % of steps where the accepted path lies on the primary (left-most) path.
-
----
-
-## 7. Speculative Decoding
-
-### 7.1 Overview
-
-At inference, tree-flash runs in a loop:
-
-```
-prefill → repeat {
-    draft tree  →  verify tree  →  accept path  →  extend output
-}
-```
-
-The key advantage over sequential speculative decoding is that a single target forward pass verifies the entire tree (all `tree_size` nodes), and the longest valid path from root to any accepted node is taken, including any node in any branch — not just the primary path.
-
-### 7.2 Acceptance logic
-
-Acceptance in a tree differs from the linear case because the target model's output at position `i` predicts the **token after** node `i` — that is, the distribution for node `i`'s child, not for node `i` itself. To decide whether to accept node `i`, we use the **parent's** output:
-
-- **Root** (node 0): accepted if `draft_tokens[0] == target_logits[last_context_position].argmax()`.
-- **Node `i` (i > 0)**: accepted if `draft_tokens[i] == verify_logits[parent_ids[i]].argmax()`.
-
-`adjusted_parent_ids` encodes these indices into a single concatenated tensor `[anchor_logits, verify_logits_0, …, verify_logits_{T-1}]`, so acceptance reduces to one gather and one argmax:
+## 1. System Roles
 
 ```python
-extended_logits = cat([anchor_logits.unsqueeze(1), verify_logits], dim=1)  # [B, 1+T, V]
-parent_preds    = extended_logits[:, adjusted_parent_ids, :].argmax(dim=-1) # [B, T]
-accepted        = (draft_tokens == parent_preds)                            # [B, T]
+class FrozenTargetModel:
+    """
+    Large language model used as teacher and verifier.
+
+    Responsibilities:
+    - read the true packed sequence,
+    - provide hidden-state features from selected layers,
+    - provide next-token probabilities used as supervision,
+    - verify drafted tree candidates during speculative decoding.
+
+    Important:
+    - this model is not optimized by the trainer,
+    - its LM head is also reused as the vocabulary projection for the drafter.
+    """
+
+
+class DrafterModel:
+    """
+    Smaller model that learns to propose future tokens in tree form.
+
+    Inputs:
+    - a root token plus masked future tree slots,
+    - compressed context features extracted from the frozen target.
+
+    Outputs:
+    - one hidden state per tree node,
+    - optional confidence estimates (q-head),
+    - optional autoregressive refinement scores (AR head).
+
+    Important:
+    - this is the model that is trained.
+    """
+
+
+class TreeProcessor:
+    """
+    Defines the tree shape and the meaning of each tree node.
+
+    It answers questions such as:
+    - which node is the parent of which other node,
+    - which nodes lie on the same root-to-node path,
+    - which absolute sequence position each node corresponds to,
+    - which token should be used as the teacher label for each node.
+    """
 ```
 
-For temperature > 0, standard rejection sampling is used:
-```
-accept node i with probability min(1, p_target(draft_tokens[i]) / p_draft(draft_tokens[i]))
-```
+---
 
-**Path acceptance** (vectorised): a node's full path from the root must be accepted. This uses a single matrix multiply instead of a sequential BFS loop:
+## 2. What Is Actually Trained
 
 ```python
-rejected_count = (~accepted).float() @ ancestor_matrix.float()   # [B, T] × [T, T] → [B, T]
-path_accepted  = rejected_count < 0.5                            # [B, T]
+def training_contract():
+    """
+    Optimized:
+    - drafter transformer layers,
+    - context projection into drafter space,
+    - optional tree-position embeddings,
+    - optional relation-based attention bias,
+    - optional q-head,
+    - optional AR head.
+
+    Frozen:
+    - target model,
+    - target hidden-state extractor,
+    - target LM head used for vocabulary logits.
+
+    Supervision source:
+    - tree labels and probabilities come from the frozen target,
+      or from precomputed offline tree labels that were generated from it earlier.
+    """
 ```
-
-`rejected_count[b, q]` counts rejected ancestors of node `q` in sample `b`; a node is path-accepted iff this count is zero.
-
-**Final node selection**: the deepest path-accepted node across all branches.
-
-**Bonus token**: sampled from `verify_logits[final_node]` — the target's prediction for the position immediately after the accepted path.
-
-### 7.3 KV cache management (SelectiveCache)
-
-Efficient multi-step decoding reuses target model KV cache across steps. The key challenge with trees is that verifying all `T` nodes with `use_cache=True` pollutes the cache with non-accepted tokens. We solve this with `SelectiveCache`:
-
-1. **Prefill** target on the context → `target_kv` (context K,V cached, `ctx_len` entries).
-2. **Draft** pass: draft model runs over all `T` tree positions with growing `raw_target_hidden`.
-3. **Verify** with `use_cache=True`: all `T` tree tokens' K,V are appended to `target_kv`.
-4. **Trim** `target_kv.keep_positions([0…ctx_len−1] + [ctx_len + i for i in accepted_path])`: one index-select per layer, discarding non-accepted K,V in place. The accepted path nodes were encoded with depth-based position IDs (`ctx_len + depth[i]`), which are sequential along any root-to-node path, so the trimmed cache remains causally consistent.
-5. **Bonus token** (`1` token): run target causally to append its K,V and obtain the next step's `anchor_logits`.
-6. **Update `raw_target_hidden`**: accepted path hidden states are extracted from `verify_out.hidden_states` at path node indices; bonus hidden states come from the bonus forward pass. Both are concatenated to `raw_target_hidden` for the next draft step.
-
-Net cost per step: 1 full tree verification pass + 1 single-token forward pass.
-
-### 7.4 Draft position IDs
-
-The draft model's rotary embeddings must cover both the context K-vectors and the tree K-vectors. At step `s` with accumulated context length `n_ctx`, the full position ID vector is:
-
-```
-[0, 1, …, n_ctx−1,   n_ctx + depth[0], n_ctx + depth[1], …, n_ctx + depth[T−1]]
- └─────────────────────┘   └──────────────────────────────────────────────────────┘
-    context positions                    tree token positions
-```
-
-This ensures all K,V vectors in the draft attention get correct rotary encoding, matching the pattern used in DFlash's own `spec_generate`.
 
 ---
 
-## 8. Experiment Plan
+## 3. Logical Batch Format
 
-See [experiments.md](experiments.md) for the full ablation plan. In brief:
+```python
+class PackedBatch:
+    """
+    A batch row is not necessarily a single original sample.
 
-| Exp | Question | Variable |
-|---|---|---|
-| 1 | Does tree drafting improve acceptance length over linear? | Tree v1, no pruning |
-| 2 | Which pruning method is best? | Q_Logit vs AR_Head head |
-| 3 | How to maximise sibling diversity? | Aux KL loss vs deduplicated sampling |
+    Multiple prompt/response pairs can be packed into one fixed-length row.
+    This increases utilization, but it creates a new problem:
+    tokens from different packed documents must never attend to each other.
+    """
 
-**Metrics:** average acceptance length, sibling equality rate, equality heatmap, final-node histogram, % of accepted paths on the primary path.
+    input_ids
+    """
+    Packed token ids.
+
+    Meaning:
+    - contains one or more prompt/response pairs,
+    - padding fills any unused space.
+    """
+
+    position_ids
+    """
+    Per-document positions, restarted from zero inside each packed document.
+
+    Meaning:
+    - position 0 is the first token of a packed document,
+    - position numbers do not continue across document boundaries.
+    """
+
+    document_mask
+    """
+    Document identity for each packed token.
+
+    Meaning:
+    - same positive value => same packed document,
+    - different value => different packed document,
+    - zero is effectively padding / unused area.
+    """
+
+    anchors
+    """
+    Chosen response positions that act as tree roots.
+
+    Meaning:
+    - every anchor marks a place where the trainer asks:
+      'if we are currently at this token, what future tree should be drafted next?'
+    - anchors are sampled only from response regions,
+      never from prompts,
+      and only where enough future tokens remain.
+    """
+
+    sub_trees
+    """
+    Each response token has a sub tree associated to it.
+
+    Meaning:
+    - The sub tree shape has been defined before and it is a alternative continuation tree rooted at this node
+    - Each response token has one associated
+    - Note that this tree also includes the token from the response as it's root node
+    """
+
+    sub_tree_probabilities
+    """
+    The probability that a token get's sampled by the verifier
+
+    Meaning:
+    - Each node in the sub tree has the prob. that a node get's sampled from it
+    - The root node of each subtree also get's the probability assigned that it get's sampled by the LLM given the previous tokens in the LLM  
+    """
+```
+
+```python
+def pack_dataset(prompt, response):
+    """
+    Conceptual packing logic.
+
+    1. Tokenize prompt and response separately.
+    2. Concatenate prompt + response to form one logical document.
+    3. Pack several documents into one fixed-length training row.
+    4. Record which packed positions belong to which document.
+    5. Record the response interval of each document.
+    6. Later, sample anchor positions only from valid response spans.
+    7. Also pack the sub trees and their associated probabilities
+
+    Why this matters:
+    - training gets better hardware utilization,
+    - document boundaries are still preserved through document_mask.
+    """
+```
 
 ---
 
-## 9. File Map
+## 4. Shared Tree Meaning
 
+```python
+class TreeInfo:
+    """
+    Common logical structure shared by all tree processors.
+    """
+
+    tree_mask
+    """
+    tree_mask[i, j] is True exactly when node j is on the path
+    from the root to node i, including node i itself.
+
+    Meaning:
+    - row i = the accepted prefix needed to reach node i,
+    - this is the ancestor-or-self relation.
+    """
+
+    parent_idx
+    """
+    Direct parent of each node.
+
+    Meaning:
+    - root has parent -1,
+    - every other node points one step upward in the tree.
+    """
+
+    depth
+    """
+    Distance from the root.
+
+    Meaning:
+    - root depth = 0,
+    - children of the root have depth 1,
+    - deeper nodes represent later sequence positions.
+    """
+
+    relation_map
+    """
+    Encodes relations such as:
+    - self,
+    - parent-[1-k],
+    - child-[1-k],
+    - ancestor,
+    - descendant,
+    - sibling-[1-k]-[1-k].
+
+    Meaning:
+    - used to optionally bias attention with structural information,
+      without changing the labels themselves.
+    - [1-k] here means the top-k output
+        - i.e if node j is the top-4 response from node i then j has relation ship 'child-4' to i
+    """
+
+    tree_position_ids
+    """
+    Stable identifier of each node inside the tree layout.
+
+    Meaning:
+    - can be used for tree-position embeddings,
+    - distinct from absolute sequence position.
+    """
 ```
-config.py                       Training hyperparameters (TrainConfig)
-train.py                        CLI entry point
 
-tree/
-  spec.py                       TreeSpec: tree structure + all derived tensors
-  mask.py                       Tree attention masks (dense + Flex Attention)
+```python
+def root_semantics():
+    """
+    The root node is not a future prediction.
 
-model/
-  draft_model.py                TreeDraftModel: shared backbone + split heads
-  ar_head.py                    AR pruning head (transformer block + shared lm_head)
-  draft_wrapper.py              DraftWrapper: joint forward for training + infer helpers
+    It represents the current token at the anchor frontier:
+    - in training: the token already present at the chosen anchor,
+    - in inference: the last accepted token in the running output.
 
-trainer/
-  loss.py                       CumProd-weighted CE (cumprods computed on-the-fly)
-  metrics.py                    TreeMetrics, validate_loss, validate_spec, tree_accept
-  spec_decode.py                Full multi-step tree speculative decoding (SelectiveCache)
-  trainer.py                    FabricTrainer: DDP training loop
+    Therefore:
+    - the root probability is treated as 1,
+    - the main prediction loss is applied only to non-root nodes.
+    """
+```
 
-data/
-  dataset.py                    Stage2Dataset: HDF5-backed dataset, assembles full tree (primary path + subtrees) at load time
+---
 
-data_pipeline/
-  stage1_generate.py            vLLM response generation from Nemotron + CodeAlpaca
-  stage2_trees.py               Per-position subtree generation (diverging alternatives + response_probs)
+## 5. Tree Processor Variants
 
-dflash/                         DFlash source (read-only reference)
-  model/dflash.py               DFlashDraftModel architecture
-  model/utils.py                extract_context_feature, sampling utilities
+```python
+def tree_processor_variants():
+    """
+    BlockTree:
+    - a simple linear chain,
+    - each node is just the next token after the previous one.
+
+    BranchOffTree:
+    - We receive a 2d list of vertex idxs
+    - The first index i means that we include sub_tree of anchor_pos + i
+    - The second index means which nodes get included from this sub_tree
+    - This then constitutes on big tree where all the roots of each sub_tree are connected sequentially
+    """
+```
+
+---
+
+## 6. How Teacher Labels Are Built
+
+```python
+def build_training_extras(batch, tree_processor, frozen_target):
+    """
+    Produce everything the drafter needs for one training step.
+
+    Outputs:
+    - tree_labels:
+      the teacher token attached to each tree node.
+    - tree_ar_prob:
+      the target model's probability for that chosen token at that node.
+    - tree_cum_prob:
+      probability of the whole path from root to that node.
+    - noise_embds:
+      input embeddings given to the drafter tree.
+    - sequence_position_ids:
+      absolute sequence positions represented by each node.
+    - target_hidden_states:
+      selected hidden-state features from the frozen target context.
+    - tree_info:
+      the structural meaning of the tree.
+    """
+```
+
+```python
+def path_probability_meaning(node):
+    """
+    tree_ar_prob[node]:
+        'If the verifier is standing at the parent of this node,
+         how much probability does it assign to this node's token?'
+
+    tree_cum_prob[node]:
+        'How likely is the verifier to walk from the root
+         all the way to this node by following this path?'
+
+    Why cumulative probability matters:
+    - it says how much real verifier mass reaches a branch,
+    - low-mass branches can be down-weighted in the loss.
+    """
+```
+
+---
+
+## 7. What the Drafter Actually Sees
+
+```python
+def build_drafter_inputs(anchor, tree_info, frozen_target_features):
+    """
+    The drafter does not receive the true future tokens as input.
+
+    It receives:
+    - the root token embedding at the anchor,
+    - mask-token embeddings for all future tree nodes,
+    - projected target context features for the already-known prefix.
+
+    This makes the drafter solve:
+    'Given the verified past and the current token, fill in the tree.'
+    """
+```
+
+```python
+class DrafterForwardMeaning:
+    """
+    Step 1:
+    compress selected target hidden states into the drafter hidden size and use them as KV cache
+
+    Step 2:
+    let every tree node read that context representation.
+
+    Step 3:
+    output one hidden state per node. Note that the backbone hidden states are the second to last layer hidden states 
+
+    Step 4:
+    project hidden states through the frozen target LM head
+    so the drafter is trained in the target's vocabulary space.
+    """
+```
+
+```python
+class DrafterFlags:
+    """
+    - use_tree_pos_embds which is a embedding of the tree_position_id and is added to the hidden states right at the beginning
+    - use_relative_tree_bias which is a head-wise attention bias based on the relationship map
+    """
+```
+
+```python
+class ArDrafterForwardMeaning:
+    """
+    - This is essentially just a single layer from the drafter with a causal mask
+    Step 1:
+    compress input_embds and backbone_hidden_states to hidden size
+
+    Step 3:
+    output one hidden state per node. 
+
+    Step 4:
+    project hidden states through the frozen target LM head
+    so the ar drafter is trained in the target's vocabulary space.
+    """
+```
+
+---
+
+## 8. Mask Semantics
+
+This is the most important section for understanding the code.
+
+```python
+def prefill_mask(query_token, key_token):
+    """
+    Used when the frozen target reads the packed real sequence.
+
+    Rule:
+    allow attention iff
+    - query and key belong to the same packed document, and
+    - key is not in the future of the query.
+
+    Meaning:
+    - each packed document behaves like its own causal sequence,
+    - packed neighbors are invisible to each other.
+    """
+```
+
+```python
+def drafter_attention_mask(tree_query, candidate_key):
+    """
+    Used when the drafter processes training trees.
+
+    Rule for context keys:
+    allow attention iff
+    - the context token belongs to the same packed document as the anchor, and
+    - the context token lies strictly before the anchor position.
+
+    Rule for tree keys:
+    allow attention iff
+    - the key belongs to the same tree block as the query.
+
+    Important current behavior:
+    - this mask isolates documents and isolates tree blocks,
+    - but it does NOT enforce ancestor-only visibility within a tree.
+
+    In other words:
+    - tree node A can see other nodes from the same drafted tree block,
+    - strict path legality is not enforced here.
+    """
+```
+```python
+def drafter_ar_attention_mask(tree_query, candidate_key):
+    """
+    Used when the ar_drafter processes training trees.
+
+    Rule for context keys:
+    allow attention iff
+    - the context token belongs to the same packed document as the anchor, and
+    - the context token lies strictly before the anchor position.
+
+    Rule for tree keys:
+    allow attention iff
+    - the key belongs to the same tree block as the query.
+    - and the key is either a ancestor or self
+
+    Important current behavior:
+    - it enforces ancestor-only visibility within a tree.
+    """
+```
+
+```python
+def verifier_tree_mask(candidate_query, candidate_key):
+    """
+    Used when the frozen target verifies candidate tree tokens.
+
+    Rule:
+    allow attention iff
+    - the key is in the already-accepted prefix, or
+    - the key is an ancestor of the query inside the candidate tree.
+
+    Meaning:
+    - the verifier scores each candidate token only under the path that leads to it,
+    - siblings and unrelated branches do not leak information into each other.
+    """
+```
+
+```python
+def document_mask_meaning():
+    """
+    document_mask is not a padding mask in the usual language-model sense.
+
+    It is a segment identity map.
+
+    Practical meaning:
+    - same id  => same packed training document,
+    - different id => hard attention boundary,
+    - no packed document is allowed to explain another one's targets.
+    """
+```
+
+---
+
+## 9. Main Training Logic
+
+```python
+def training_step(batch):
+    """
+    High-level meaning of one optimization step.
+    """
+
+    # 1. Build teacher labels and structural metadata from the frozen target.
+    tree_extras = tree_processor.construct_training_extras(batch, frozen_target)
+
+    # 2. Extract selected hidden-state features from the frozen target context.
+    target_ctx_features = drafter.extract_ctx_features(tree_extras.target_hidden_states)
+
+    # 3. Build the drafter's attention mask.
+    #    This isolates documents and tree blocks.
+    drafter_mask = build_drafter_mask(batch.anchors, batch.document_mask, tree_extras)
+
+    # 4. Ask the drafter to fill all masked future tree nodes at once.
+    diffusion_hidden_states, backbone_hidden_states = drafter(
+        root_plus_masked_tree_embeddings,
+        projected_target_context,
+        drafter_mask,
+        tree_info,
+    )
+
+    # 5. Ignore the root, because the root is already known.
+    predicted_nodes = all_non_root_nodes(diffusion_hidden_states)
+    teacher_nodes   = all_non_root_labels(tree_extras.tree_labels)
+
+    # 6. Score the drafter in the frozen target vocabulary space.
+    logits = frozen_target_lm_head(predicted_nodes)
+
+    # 7. Compute losses.
+    lm_loss = cross_entropy(logits, teacher_nodes)
+    optional_losses = sibling_loss + q_loss 
+
+    if use_ar:
+        drafter_ar_mask = build_drafter_mask(batch.anchors, batch.document_mask, tree_extras)
+        ar_hidden_states = ar_module(
+            backbone_hidden_states,
+            embeddings_of_parents_of_tree_parents,
+            projected_target_context,
+            drafter_ar_mask,
+            tree_info,
+        )
+        ar_predicted_nodes = all_non_root_nodes(ar_hidden_states)
+        ar_logits = frozen_target_lm_head(ar_predicted_nodes)
+        ar_lm_loss = cross_entropy(ar_logits, teacher_nodes)
+        lm_loss += lambda * ar_lm_loss
+
+
+    # 8. Backpropagate only through the drafter-side parameters.
+    optimize(drafter_only)
+```
+
+---
+
+## 10. Losses and Their Meaning
+
+```python
+def language_model_loss(node_logits, tree_labels, tree_cum_prob=None):
+    """
+    Primary objective.
+
+    Meaning:
+    - teach every non-root node to predict its assigned teacher token.
+
+    Optional weighting:
+    - paths with larger verifier mass can receive more weight,
+      because they matter more during real generation.
+    """
+```
+
+```python
+def sibling_overlap_loss(top_predictions_for_siblings):
+    """
+    Optional diversity regularizer.
+
+    Meaning:
+    - sibling branches should not all spend tree capacity
+      on the same high-probability token.
+
+    It does not teach correctness directly.
+    It teaches branch diversity.
+    """
+```
+
+```python
+def q_head_loss(q_logits, drafter_argmax, teacher_labels):
+    """
+    Optional confidence objective.
+
+    Target meaning:
+    - 1 if the drafter's own top prediction matches the teacher token,
+    - 0 otherwise.
+
+    Why this exists:
+    - later, these scores can help prune the tree down
+      to the most promising candidate nodes.
+    """
+```
+
+---
+
+## 11. What "Accepted Length" Means During Training
+
+```python
+def training_acceptance_proxy(drafter_predictions, teacher_tree, tree_mask):
+    """
+    This is a deterministic proxy metric, not the full stochastic rejection rule.
+
+    A node counts as accepted iff:
+    - the drafter prediction matches the teacher token for that node, and
+    - every ancestor token on the path also matches.
+
+    Therefore:
+    - deeper exact-match paths imply larger speculative usefulness,
+    - but this metric is stricter and simpler than real inference-time rejection sampling.
+    """
+```
+
+---
+
+## 12. Inference / Speculative Decoding Logic
+
+```python
+def speculative_generate(prompt):
+    """
+    Repeat until EOS or length limit:
+    1. verify the known prefix with the frozen target,
+    2. build a tree rooted at the latest accepted token,
+    3. let the drafter propose all tree tokens at once,
+    4. optionally prune the tree, 
+    5. let the frozen target verify the surviving candidate tree,
+    6. accept the deepest valid path,
+    7. append one extra verifier token beyond the accepted path.
+    """
+```
+
+```python
+def prefill_inference(prompt):
+    """
+    The frozen target first reads the true prompt and fills its cache.
+
+    This produces:
+    - verifier state for the known prefix,
+    - context features that condition the drafter,
+    - the first sampled continuation token.
+    """
+```
+
+```python
+def draft_current_tree(last_accepted_token, target_context_features):
+    """
+    Build a fresh tree:
+    - root embedding = last accepted token,
+    - all future nodes start as mask tokens,
+    - the drafter predicts one token per tree node.
+
+    Root convention:
+    - the root token is overwritten to equal the already accepted frontier token,
+    - root probability is treated as 1.
+
+    Important current behavior:
+    - the main drafter path does not use the verifier's strict ancestor-only mask,
+    - structural legality is enforced later by verifier-side tree masking
+      and, when enabled, by the AR-head layer.
+    """
+```
+
+```python
+def optional_tree_pruning(candidate_tree, q_values_or_ar_probs):
+    """
+    If pruning is enabled:
+    - score each node by the product of scores along its ancestor path,
+    - keep only the top candidate nodes,
+    - remap parents and masks into the pruned tree.
+
+    Meaning:
+    - the verifier spends compute on the most promising paths,
+      not on the full raw draft tree.
+    """
+```
+
+```python
+def verifier_step(candidate_tree):
+    """
+    The frozen target scores candidate tokens under tree-causal legality.
+
+    Each candidate token is evaluated with access to:
+    - the accepted prefix,
+    - exactly the ancestors needed to reach that candidate.
+
+    This is the critical step that restores exact target-model semantics.
+    """
+```
+
+```python
+def rejection_sampling_for_each_candidate(candidate_token, p_draft, p_target):
+    """
+    Acceptance probability:
+        min(1, p_target / p_draft)
+
+    Meaning:
+    - if the drafter underestimates a token, the token is always safe to keep,
+    - if the drafter overestimates a token, it is rejected with the needed probability,
+    - this preserves the verifier's distribution exactly.
+    """
+```
+
+```python
+def choose_best_accepted_path(token_accepted, tree_mask, depth):
+    """
+    A path is valid only if every token on that path is accepted.
+
+    Therefore:
+    - the accepted node set is path-closed,
+    - the final chosen node is the deepest node whose full ancestor chain survived.
+
+    The generated output then commits:
+    - all drafted tokens along that accepted path,
+    - plus one extra fresh token sampled by the verifier at the frontier.
+    """
+```
+
+---
+
+## 13. Cache Meaning During Inference
+
+```python
+def verifier_cache_update_after_acceptance():
+    """
+    After verification, only the accepted path should remain part of the live future.
+
+    So the verifier cache is logically trimmed to:
+    - the already accepted prefix,
+    - the positions belonging to the newly accepted path.
+
+    Meaning:
+    - rejected branches do not pollute later steps,
+    - the next draft starts from the verified frontier only.
+    """
+```
+
+```python
+def drafter_cache_update_after_acceptance():
+    """
+    After drafting we remove all drafted tokens from the cache as we will receive the target hidden states later
+
+    So the verifier cache is logically trimmed to:
+    - the already accepted prefix,
+    - the positions belonging to the newly accepted path.
+
+    Meaning:
+    - rejected branches do not pollute later steps,
+    - the next draft starts from the verified frontier only.
+    """
+```
+
+---
+
+## 14. End-to-End Summary
+
+```python
+def end_to_end_summary():
+    """
+    Training:
+    - pack many documents into one row,
+    - isolate them with document-aware masking,
+    - pick response anchors,
+    - let the frozen target define the future tree labels,
+    - train the drafter to predict those tree labels from
+      masked future nodes plus target context features.
+
+    Inference:
+    - use the drafter to propose a tree of future tokens,
+    - use the frozen target to verify only legal root-to-node paths,
+    - accept the deepest path that survives rejection sampling,
+    - continue from the new verified frontier.
+
+    Core idea:
+    - the drafter learns to cheaply guess many futures at once,
+    - the verifier decides which guessed future is actually valid.
+    """
+```
+
+---
+
+# Implementation Details
+- Use the following:
+    - Fabric Lightning
+    - Flex Attention
+    - Wandb
+    - JsonArgparse
+    - Huggingface Datasets
+- Employ the following trick to save on peak memory usage:
+    - Chunked Cross Entropy and Logits
+    - Support Chunking the Anchors into multiple forward backward passes while caching the target_ctx_features
+- Support DP Training
+
+
+```python
+def reading_notes():
+    """
+    If you only want the most important meanings, remember these five facts:
+
+    1. The target model is the teacher and verifier; it is frozen.
+    2. The drafter is the only model being optimized.
+    3. document_mask prevents packed documents from leaking into each other.
+    4. tree_mask means 'ancestor-or-self path membership'.
+    5. the verifier, not the drafter, enforces strict path legality during candidate verification.
+    """
 ```
