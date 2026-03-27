@@ -16,7 +16,7 @@ from data_pipeline.stage2 import IGNORE_IDX
 
 from .data import DataModuleConfig, PackedBatch, build_dataloaders
 from .models import DFlashDraftModel
-from .trees import BlockTreeProcessor, TreeInfo
+from .trees import BlockTreeProcessor, BranchOffTreeProcessor
 
 
 @dataclass
@@ -152,7 +152,7 @@ def get_lr(
 
 
 class Trainer:
-    tree_processor: BlockTreeProcessor
+    tree_processor: Any
 
     def __init__(
         self,
@@ -183,14 +183,21 @@ class Trainer:
         self.fabric.launch()
         self.fabric.seed_everything(config.seed)
 
-        if tree_type not in {"fixed", "block"}:
-            raise NotImplementedError(
-                f"tree_type={tree_type!r} is not implemented. Use 'block' or 'fixed'."
+        if tree_type in {"fixed", "block"}:
+            self.tree_processor = BlockTreeProcessor(
+                tree_seq_depth=data.tree_seq_depth,
+                sub_tree_paths=self.tree_args.get("sub_tree_paths"),
             )
-        self.tree_processor = BlockTreeProcessor(
-            tree_seq_depth=data.tree_seq_depth,
-            sub_tree_paths=self.tree_args.get("sub_tree_paths"),
-        )
+        elif tree_type == "branch_off":
+            self.tree_processor = BranchOffTreeProcessor(
+                tree_seq_depth=data.tree_seq_depth,
+                sub_tree_paths=self.tree_args.get("sub_tree_paths"),
+                branching_pattern=self.tree_args.get("branching_pattern"),
+            )
+        else:
+            raise NotImplementedError(
+                f"tree_type={tree_type!r} is not implemented. Use 'block', 'fixed', or 'branch_off'."
+            )
 
         self.output_dir = Path(config.checkpoint_path)
         if self.fabric.is_global_zero:
@@ -645,7 +652,7 @@ def build_parser() -> ArgumentParser:
         "--tree_type",
         type=str,
         default="block",
-        choices=["fixed", "block", "prunable", "every_branch", "loaded"],
+        choices=["fixed", "block", "branch_off", "prunable", "every_branch", "loaded"],
     )
     parser.add_argument("--tree_args", type=dict, default=None)
     return parser

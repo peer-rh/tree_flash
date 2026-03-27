@@ -8,7 +8,7 @@ torch = pytest.importorskip("torch")
 h5py = pytest.importorskip("h5py")
 
 from src.data import PackedBatchCollator, Stage2Dataset
-from src.trees import BlockTreeProcessor
+from src.trees import BlockTreeProcessor, BranchOffTreeProcessor
 
 
 SUB_TREE_PATHS = ["0-1", "0-2", "1-3"]
@@ -143,3 +143,49 @@ def test_block_tree_processor_builds_expected_metadata() -> None:
     info = tree_processor.build_tree_info(batch_size=2, num_blocks=3, device=torch.device("cpu"))
     assert info.relation_map.shape == (2, 3, 8, 8)
     assert info.tree_position_ids.shape == (2, 3, 8)
+
+
+def test_branch_off_tree_processor_selects_sparse_layout() -> None:
+    tree_processor = BranchOffTreeProcessor(
+        tree_seq_depth=3,
+        sub_tree_paths=SUB_TREE_PATHS,
+        branching_pattern=[[0, 2], [0, 3], [0]],
+    )
+
+    assert tree_processor.branching_pattern == ((0, 2), (0, 1, 3), (0,))
+    assert tree_processor.layout == [(0, 0), (0, 2), (1, 0), (1, 1), (1, 3), (2, 0)]
+    assert tree_processor.parent_idx.tolist() == [-1, 0, 0, 2, 3, 2]
+    assert tree_processor.primary_path_indices.tolist() == [0, 2, 5]
+    assert tree_processor.non_root_mask.tolist() == [False, True, False, True, True, False]
+
+    response_subtrees = torch.tensor(
+        [
+            [21, 31, 32, 33],
+            [22, 41, 42, 43],
+            [23, 51, 52, 53],
+        ],
+        dtype=torch.long,
+    )
+    response_probs = torch.tensor(
+        [
+            [0.8, 0.5, 0.25, 0.2],
+            [0.6, 0.4, 0.3, 0.1],
+            [0.5, 0.3, 0.2, 0.1],
+        ],
+        dtype=torch.float32,
+    )
+    tensors = tree_processor.build_anchor_tensors(
+        response_subtrees=response_subtrees,
+        response_probs=response_probs,
+        anchor_local_positions=[0],
+        anchor_positions=[10],
+        mask_token_id=99,
+    )
+
+    assert tensors["tree_labels"][0].tolist() == [21, 32, 22, 41, 43, 23]
+    assert tensors["tree_noise_ids"][0].tolist() == [21, 99, 22, 99, 99, 23]
+    assert tensors["tree_position_ids"][0].tolist() == [10, 11, 11, 12, 13, 12]
+    assert tensors["tree_cum_probs"][0].tolist() == pytest.approx(
+        [0.8, 0.2, 0.48, 0.192, 0.0192, 0.24],
+        rel=1e-5,
+    )

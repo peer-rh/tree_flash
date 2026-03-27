@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import random
-from typing import Any, Sequence
+from typing import Any, Protocol
 
 import h5py
 import torch
@@ -11,7 +11,32 @@ from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from data_pipeline.stage2 import IGNORE_IDX
 
-from .trees import BlockTreeProcessor
+from .trees import TreeInfo
+
+
+class TreeProcessorProtocol(Protocol):
+    tree_seq_depth: int
+    block_size: int
+    sub_tree_paths: tuple[str, ...]
+
+    def build_anchor_tensors(
+        self,
+        *,
+        response_subtrees: torch.Tensor,
+        response_probs: torch.Tensor,
+        anchor_local_positions: list[int],
+        anchor_positions: list[int],
+        mask_token_id: int,
+    ) -> dict[str, torch.Tensor]:
+        ...
+
+    def build_tree_info(
+        self,
+        batch_size: int,
+        num_blocks: int,
+        device: torch.device,
+    ) -> TreeInfo:
+        ...
 
 
 @dataclass
@@ -121,7 +146,7 @@ class PackedBatchCollator:
     def __init__(
         self,
         *,
-        tree_processor: BlockTreeProcessor,
+        tree_processor: TreeProcessorProtocol,
         pack_length: int,
         num_anchors: int,
         mask_token_id: int,
@@ -337,7 +362,7 @@ def _maybe_limit_dataset(dataset: Dataset, max_items: int | None) -> Dataset:
 def build_dataloaders(
     *,
     config: DataModuleConfig,
-    tree_processor: BlockTreeProcessor,
+    tree_processor: TreeProcessorProtocol,
     mask_token_id: int,
     pad_token_id: int,
 ) -> tuple[DataLoader, DataLoader]:
