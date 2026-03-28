@@ -4,7 +4,7 @@ from typing import Sequence
 
 import torch
 
-from data_pipeline.stage2 import DEFAULT_SUB_TREE_PATHS, IGNORE_IDX, SubTreeInfo
+from data_pipeline.stage2 import DEFAULT_SUB_TREE_PATHS, SubTreeInfo
 
 from .blocked import (
     REL_ANCESTOR,
@@ -15,6 +15,8 @@ from .blocked import (
     REL_SELF,
     REL_SIBLING,
     TreeInfo,
+    _build_layout_vectorization_tensors,
+    _build_vectorized_anchor_tensors,
 )
 
 
@@ -44,6 +46,13 @@ class BranchOffTreeProcessor:
             self.primary_path_indices,
             self.flat_to_depth_vertex,
         ) = self._build_templates()
+        (
+            self.flat_depth_indices,
+            self.flat_vertex_indices,
+            self.flat_depth_offsets,
+            self.flat_path_indices,
+            self.flat_path_mask,
+        ) = _build_layout_vectorization_tensors(self.subtree, self.flat_to_depth_vertex)
 
     def _normalize_branching_pattern(
         self,
@@ -181,53 +190,17 @@ class BranchOffTreeProcessor:
         anchor_positions: Sequence[int],
         mask_token_id: int,
     ) -> dict[str, torch.Tensor]:
-        n_anchors = len(anchor_local_positions)
-        if n_anchors == 0:
-            empty_tokens = torch.empty((0, self.block_size), dtype=torch.long)
-            return {
-                "tree_labels": empty_tokens,
-                "tree_noise_ids": empty_tokens.clone(),
-                "tree_position_ids": empty_tokens.clone(),
-                "tree_cum_probs": torch.empty((0, self.block_size), dtype=torch.float32),
-                "tree_valid_mask": torch.empty((0, self.block_size), dtype=torch.bool),
-            }
-
-        tree_labels = torch.full((n_anchors, self.block_size), IGNORE_IDX, dtype=torch.long)
-        tree_noise_ids = torch.full((n_anchors, self.block_size), mask_token_id, dtype=torch.long)
-        tree_position_ids = torch.zeros((n_anchors, self.block_size), dtype=torch.long)
-        tree_cum_probs = torch.zeros((n_anchors, self.block_size), dtype=torch.float32)
-        tree_valid_mask = torch.zeros((n_anchors, self.block_size), dtype=torch.bool)
-
-        for anchor_idx, (anchor_local, anchor_position) in enumerate(zip(anchor_local_positions, anchor_positions)):
-            primary_cumprob = 1.0
-            for flat_idx, (depth_idx, vertex_idx) in enumerate(self.layout):
-                subtree_row = anchor_local + depth_idx
-                token = int(response_subtrees[subtree_row, vertex_idx].item())
-                prob = float(response_probs[subtree_row, vertex_idx].item())
-                if vertex_idx == 0:
-                    primary_cumprob *= prob
-                    path_cumprob = primary_cumprob
-                else:
-                    path_cumprob = primary_cumprob
-                    cur = vertex_idx
-                    local_path: list[int] = []
-                    while cur != 0:
-                        local_path.append(cur)
-                        cur = self.subtree.parent_map[cur]
-                    for node_idx in reversed(local_path):
-                        path_cumprob *= float(response_probs[subtree_row, node_idx].item())
-
-                tree_labels[anchor_idx, flat_idx] = token
-                tree_position_ids[anchor_idx, flat_idx] = anchor_position + depth_idx + self.subtree.depth_of[vertex_idx]
-                tree_cum_probs[anchor_idx, flat_idx] = path_cumprob
-                tree_valid_mask[anchor_idx, flat_idx] = token != IGNORE_IDX
-                if flat_idx == 0 and token != IGNORE_IDX:
-                    tree_noise_ids[anchor_idx, flat_idx] = token
-
-        return {
-            "tree_labels": tree_labels,
-            "tree_noise_ids": tree_noise_ids,
-            "tree_position_ids": tree_position_ids,
-            "tree_cum_probs": tree_cum_probs,
-            "tree_valid_mask": tree_valid_mask,
-        }
+        return _build_vectorized_anchor_tensors(
+            response_subtrees=response_subtrees,
+            response_probs=response_probs,
+            anchor_local_positions=anchor_local_positions,
+            anchor_positions=anchor_positions,
+            mask_token_id=mask_token_id,
+            tree_seq_depth=self.tree_seq_depth,
+            block_size=self.block_size,
+            flat_depth_indices=self.flat_depth_indices,
+            flat_vertex_indices=self.flat_vertex_indices,
+            flat_depth_offsets=self.flat_depth_offsets,
+            flat_path_indices=self.flat_path_indices,
+            flat_path_mask=self.flat_path_mask,
+        )

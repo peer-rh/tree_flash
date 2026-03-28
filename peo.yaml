@@ -1,0 +1,9 @@
+experiments_dir: experiments
+readme_name: README.md
+run_script: run.sh
+outputs_dir: outputs
+git:
+  auto_commit: true
+  commit_prefix: "[peo]"
+wandb:
+  prompt_on_run: true

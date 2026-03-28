@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 import math
+import json
 
 from jsonargparse import ArgumentParser, namespace_to_dict
 from lightning.fabric import Fabric
@@ -16,7 +17,7 @@ from data_pipeline.stage2 import IGNORE_IDX
 
 from .data import DataModuleConfig, PackedBatch, build_dataloaders
 from .models import DFlashDraftModel
-from .trees import BlockTreeProcessor, BranchOffTreeProcessor
+from .trees import BlockTreeProcessor, BranchOffTreeProcessor, PrunableTreeProcessor
 
 
 @dataclass
@@ -38,6 +39,7 @@ class TrainerConfig:
     devices: int = 1
     anchor_chunk_size: int | None = None
     ce_chunk_size: int | None = None
+    q_loss_lambda: float = 1.0
     ar_loss_lambda: float = 0.1
     weight_decay: float = 0.01
     grad_clip_norm: float = 1.0
@@ -160,7 +162,7 @@ class Trainer:
         target: str,
         data: DataModuleConfig,
         drafter: dict[str, Any] | str,
-        tree_type: Literal["fixed", "prunable", "block", "every_branch", "loaded"] = "fixed",
+        tree_type: Literal["fixed", "prunable", "block", "branch_off", "every_branch", "loaded"] = "fixed",
         tree_args: dict[str, Any] | None = None,
     ):
         self.config = config
@@ -183,21 +185,11 @@ class Trainer:
         self.fabric.launch()
         self.fabric.seed_everything(config.seed)
 
-        if tree_type in {"fixed", "block"}:
-            self.tree_processor = BlockTreeProcessor(
-                tree_seq_depth=data.tree_seq_depth,
-                sub_tree_paths=self.tree_args.get("sub_tree_paths"),
-            )
-        elif tree_type == "branch_off":
-            self.tree_processor = BranchOffTreeProcessor(
-                tree_seq_depth=data.tree_seq_depth,
-                sub_tree_paths=self.tree_args.get("sub_tree_paths"),
-                branching_pattern=self.tree_args.get("branching_pattern"),
-            )
-        else:
-            raise NotImplementedError(
-                f"tree_type={tree_type!r} is not implemented. Use 'block', 'fixed', or 'branch_off'."
-            )
+        self.tree_processor = self._build_tree_processor(
+            tree_type=tree_type,
+            tree_seq_depth=data.tree_seq_depth,
+            tree_args=self.tree_args,
+        )
 
         self.output_dir = Path(config.checkpoint_path)
         if self.fabric.is_global_zero:
@@ -242,6 +234,8 @@ class Trainer:
         self.mask_token_id = self.raw_drafter.mask_token_id
         if self.mask_token_id is None:
             raise ValueError("The drafter config must define dflash_config.mask_token_id.")
+        if tree_type == "prunable" and getattr(self.raw_drafter, "q_head", None) is None:
+            raise ValueError("tree_type='prunable' requires a drafter checkpoint/config with use_q_head=True.")
 
         if config.compile and hasattr(torch, "compile"):
             self.target_model = torch.compile(self.target_model)
@@ -277,6 +271,36 @@ class Trainer:
             self.load_checkpoint(config.resume_from)
         if self.fabric.is_global_zero:
             self._init_wandb()
+
+    def _build_tree_processor(
+        self,
+        *,
+        tree_type: str,
+        tree_seq_depth: int,
+        tree_args: dict[str, Any],
+    ):
+        if tree_type in {"fixed", "block"}:
+            return BlockTreeProcessor(
+                tree_seq_depth=tree_seq_depth,
+                sub_tree_paths=tree_args.get("sub_tree_paths"),
+            )
+        if tree_type == "branch_off":
+            return BranchOffTreeProcessor(
+                tree_seq_depth=tree_seq_depth,
+                sub_tree_paths=tree_args.get("sub_tree_paths"),
+                branching_pattern=tree_args.get("branching_pattern"),
+            )
+        if tree_type == "prunable":
+            return PrunableTreeProcessor(
+                tree_seq_depth=tree_seq_depth,
+                base_tree_type=tree_args.get("base_tree_type", "block"),
+                prune_topk=int(tree_args.get("prune_topk", 0)),
+                sub_tree_paths=tree_args.get("sub_tree_paths"),
+                branching_pattern=tree_args.get("branching_pattern"),
+            )
+        raise NotImplementedError(
+            f"tree_type={tree_type!r} is not implemented. Use 'block', 'branch_off', or 'prunable'."
+        )
 
     def _init_wandb(self) -> None:
         if self.config.no_wandb:
@@ -314,6 +338,7 @@ class Trainer:
         if not anchor_valid_mask.any():
             return {
                 "loss_sum": target_ctx_features.new_zeros(()),
+                "q_loss_sum": target_ctx_features.new_zeros(()),
                 "valid_count": 0,
                 "predictions": None,
             }
@@ -334,7 +359,7 @@ class Trainer:
             tree_valid_mask=tree_valid_mask,
             block_size=block_size,
         )
-        draft_hidden_states, _ = self.drafter_model(
+        draft_hidden_states, backbone_hidden = self.drafter_model(
             hidden_states=noise_embeddings,
             position_ids=tree_position_ids.reshape(batch_size, num_blocks * block_size),
             tree_info=tree_info,
@@ -346,17 +371,30 @@ class Trainer:
             & tree_info.non_root_mask.view(1, 1, -1)
             & anchor_valid_mask.unsqueeze(-1)
         )
+        flat_valid_mask = valid_mask.reshape(batch_size, num_blocks * block_size)
         loss_sum, valid_count, predictions = self._chunked_loss_and_predictions(
             hidden_states=draft_hidden_states,
             labels=tree_labels.reshape(batch_size, num_blocks * block_size),
             weights=tree_cum_probs.reshape(batch_size, num_blocks * block_size),
-            valid_mask=valid_mask.reshape(batch_size, num_blocks * block_size),
+            valid_mask=flat_valid_mask,
             compute_predictions=compute_predictions,
         )
+        q_loss_sum = draft_hidden_states.new_zeros(())
+        q_head = getattr(self.raw_drafter, "q_head", None)
+        if q_head is not None and flat_valid_mask.any():
+            q_logits = q_head(backbone_hidden).squeeze(-1)
+            q_targets = tree_cum_probs.reshape(batch_size, num_blocks * block_size).to(torch.float32)
+            q_loss = F.binary_cross_entropy_with_logits(
+                q_logits.float(),
+                q_targets,
+                reduction="none",
+            )
+            q_loss_sum = q_loss[flat_valid_mask].sum().to(draft_hidden_states.dtype)
         if predictions is not None:
             predictions = predictions.view(batch_size, num_blocks, block_size)
         return {
             "loss_sum": loss_sum,
+            "q_loss_sum": q_loss_sum,
             "valid_count": valid_count,
             "predictions": predictions,
         }
@@ -406,22 +444,24 @@ class Trainer:
             predictions = predictions.view(batch_size, total_tokens)
         return total_loss, valid_count, predictions
 
-    def _run_batch(
+    def _count_valid_targets(
         self,
         batch: PackedBatch,
-        *,
-        compute_metrics: bool,
-    ) -> dict[str, Any]:
-        batch = batch.to(self.fabric.device)
-        if not batch.context_valid_mask.any() or batch.num_anchors == 0:
-            zero = torch.zeros((), device=self.fabric.device)
-            return {
-                "loss": zero,
-                "valid_count": 0,
-                "acceptance_total": 0.0,
-                "acceptance_count": 0,
-            }
+    ) -> int:
+        if batch.num_anchors == 0 or batch.tree_valid_mask.numel() == 0:
+            return 0
+        non_root_mask = self.tree_processor.non_root_mask.to(batch.tree_valid_mask.device).view(1, 1, -1)
+        valid_mask = (
+            batch.tree_valid_mask
+            & non_root_mask
+            & batch.anchor_valid_mask.unsqueeze(-1)
+        )
+        return int(valid_mask.sum().item())
 
+    def _prefill_target_context(
+        self,
+        batch: PackedBatch,
+    ) -> torch.Tensor:
         with torch.no_grad():
             prefill_mask = build_prefill_attention_mask(batch.document_mask, batch.context_valid_mask)
             target_out = self.target_model(
@@ -431,10 +471,104 @@ class Trainer:
                 output_hidden_states=True,
                 use_cache=False,
             )
-            target_ctx_features = self.raw_drafter.extract_ctx_features(target_out.hidden_states)
+            return self.raw_drafter.extract_ctx_features(target_out.hidden_states)
 
+    def _train_batch(
+        self,
+        batch: PackedBatch,
+    ) -> dict[str, Any]:
+        batch = batch.to(self.fabric.device)
+        if not batch.context_valid_mask.any() or batch.num_anchors == 0:
+            zero = torch.zeros((), device=self.fabric.device)
+            return {
+                "loss": zero,
+                "ce_loss": zero,
+                "q_loss": zero,
+                "valid_count": 0,
+                "acceptance_total": 0.0,
+                "acceptance_count": 0,
+            }
+
+        total_valid_count = self._count_valid_targets(batch)
+        if total_valid_count == 0:
+            zero = torch.zeros((), device=self.fabric.device)
+            return {
+                "loss": zero,
+                "ce_loss": zero,
+                "q_loss": zero,
+                "valid_count": 0,
+                "acceptance_total": 0.0,
+                "acceptance_count": 0,
+            }
+
+        target_ctx_features = self._prefill_target_context(batch)
         total_loss_sum = torch.zeros((), device=self.fabric.device)
-        total_valid_count = 0
+        total_q_loss_sum = torch.zeros((), device=self.fabric.device)
+        anchor_chunk = self.config.anchor_chunk_size or batch.num_anchors
+
+        for start in range(0, batch.num_anchors, anchor_chunk):
+            end = min(start + anchor_chunk, batch.num_anchors)
+            chunk_result = self._forward_anchor_chunk(
+                batch,
+                target_ctx_features,
+                slice(start, end),
+                compute_predictions=False,
+            )
+            if chunk_result["valid_count"] == 0:
+                continue
+            chunk_loss_sum = chunk_result["loss_sum"]
+            chunk_q_loss_sum = chunk_result["q_loss_sum"]
+            scaled_chunk_loss = (
+                chunk_loss_sum + self.config.q_loss_lambda * chunk_q_loss_sum
+            ) / total_valid_count / max(self.config.grad_accum_steps, 1)
+            self.fabric.backward(scaled_chunk_loss)
+            total_loss_sum = total_loss_sum + chunk_loss_sum.detach()
+            total_q_loss_sum = total_q_loss_sum + chunk_q_loss_sum.detach()
+
+        ce_loss = total_loss_sum / total_valid_count
+        q_loss = total_q_loss_sum / total_valid_count
+        loss = ce_loss + self.config.q_loss_lambda * q_loss
+        return {
+            "loss": loss,
+            "ce_loss": ce_loss,
+            "q_loss": q_loss,
+            "valid_count": total_valid_count,
+            "acceptance_total": 0.0,
+            "acceptance_count": 0,
+        }
+
+    @torch.no_grad()
+    def _eval_batch(
+        self,
+        batch: PackedBatch,
+    ) -> dict[str, Any]:
+        batch = batch.to(self.fabric.device)
+        if not batch.context_valid_mask.any() or batch.num_anchors == 0:
+            zero = torch.zeros((), device=self.fabric.device)
+            return {
+                "loss": zero,
+                "ce_loss": zero,
+                "q_loss": zero,
+                "valid_count": 0,
+                "acceptance_total": 0.0,
+                "acceptance_count": 0,
+            }
+
+        total_valid_count = self._count_valid_targets(batch)
+        if total_valid_count == 0:
+            zero = torch.zeros((), device=self.fabric.device)
+            return {
+                "loss": zero,
+                "ce_loss": zero,
+                "q_loss": zero,
+                "valid_count": 0,
+                "acceptance_total": 0.0,
+                "acceptance_count": 0,
+            }
+
+        target_ctx_features = self._prefill_target_context(batch)
+        total_loss_sum = torch.zeros((), device=self.fabric.device)
+        total_q_loss_sum = torch.zeros((), device=self.fabric.device)
         acceptance_total = 0.0
         acceptance_count = 0
         anchor_chunk = self.config.anchor_chunk_size or batch.num_anchors
@@ -445,25 +579,26 @@ class Trainer:
                 batch,
                 target_ctx_features,
                 slice(start, end),
-                compute_predictions=compute_metrics,
+                compute_predictions=True,
             )
             total_loss_sum = total_loss_sum + chunk_result["loss_sum"]
-            total_valid_count += chunk_result["valid_count"]
-            if compute_metrics and chunk_result["predictions"] is not None:
+            total_q_loss_sum = total_q_loss_sum + chunk_result["q_loss_sum"]
+            if chunk_result["predictions"] is not None:
                 acceptance_chunk_total, acceptance_chunk_count = self._acceptance_proxy(
                     predictions=chunk_result["predictions"],
-                    labels=batch.tree_labels[:, start:end].to(self.fabric.device),
-                    anchor_valid_mask=batch.anchor_valid_mask[:, start:end].to(self.fabric.device),
+                    labels=batch.tree_labels[:, start:end],
+                    anchor_valid_mask=batch.anchor_valid_mask[:, start:end],
                 )
                 acceptance_total += acceptance_chunk_total
                 acceptance_count += acceptance_chunk_count
 
-        if total_valid_count == 0:
-            loss = torch.zeros((), device=self.fabric.device)
-        else:
-            loss = total_loss_sum / total_valid_count
+        ce_loss = total_loss_sum / total_valid_count
+        q_loss = total_q_loss_sum / total_valid_count
+        loss = ce_loss + self.config.q_loss_lambda * q_loss
         return {
             "loss": loss,
+            "ce_loss": ce_loss,
+            "q_loss": q_loss,
             "valid_count": total_valid_count,
             "acceptance_total": acceptance_total,
             "acceptance_count": acceptance_count,
@@ -487,6 +622,7 @@ class Trainer:
 
         total = 0.0
         count = 0
+        # TODO: Vectorize
         for batch_idx in range(pred_primary.shape[0]):
             for anchor_idx in range(pred_primary.shape[1]):
                 if not bool(anchor_valid_mask[batch_idx, anchor_idx].item()):
@@ -507,6 +643,7 @@ class Trainer:
         )
         optimizer_step = self.global_step
         accumulated_loss = 0.0
+        accumulated_q_loss = 0.0
         micro_step = 0
 
         for epoch_idx in range(self.config.num_epochs):
@@ -519,11 +656,10 @@ class Trainer:
                     enabled=not is_final_micro,
                 )
                 with sync_context:
-                    batch_result = self._run_batch(batch, compute_metrics=False)
+                    batch_result = self._train_batch(batch)
                     loss = batch_result["loss"]
-                    scaled_loss = loss / max(self.config.grad_accum_steps, 1)
-                    self.fabric.backward(scaled_loss)
                 accumulated_loss += float(loss.detach().item())
+                accumulated_q_loss += float(batch_result["q_loss"].detach().item())
 
                 if not is_final_micro:
                     if self.config.dev_run:
@@ -546,7 +682,9 @@ class Trainer:
                 self.global_step = optimizer_step
 
                 avg_loss = accumulated_loss / max(self.config.grad_accum_steps, 1)
+                avg_q_loss = accumulated_q_loss / max(self.config.grad_accum_steps, 1)
                 accumulated_loss = 0.0
+                accumulated_q_loss = 0.0
                 if self.fabric.is_global_zero and (
                     self.config.verbose or self.global_step % self.config.log_every == 0
                 ):
@@ -555,7 +693,14 @@ class Trainer:
                         flush=True,
                     )
                 if self.global_step % self.config.log_every == 0:
-                    self._log({"train/loss": avg_loss, "train/lr": lr}, self.global_step)
+                    self._log(
+                        {
+                            "train/loss": avg_loss,
+                            "train/q_loss": avg_q_loss,
+                            "train/lr": lr,
+                        },
+                        self.global_step,
+                    )
 
                 if self.config.eval_every > 0 and self.global_step % self.config.eval_every == 0:
                     metrics = self.validate()
@@ -615,6 +760,7 @@ class Trainer:
     def validate(self):
         self.drafter_model.eval()
         total_loss = 0.0
+        total_q_loss = 0.0
         total_valid = 0
         total_acceptance = 0.0
         total_acceptance_count = 0
@@ -622,8 +768,9 @@ class Trainer:
         for batch_idx, batch in enumerate(self.eval_loader):
             if batch_idx >= self.config.eval_batches:
                 break
-            batch_result = self._run_batch(batch, compute_metrics=True)
+            batch_result = self._eval_batch(batch)
             total_loss += float(batch_result["loss"].item()) * max(batch_result["valid_count"], 1)
+            total_q_loss += float(batch_result["q_loss"].item()) * max(batch_result["valid_count"], 1)
             total_valid += batch_result["valid_count"]
             total_acceptance += batch_result["acceptance_total"]
             total_acceptance_count += batch_result["acceptance_count"]
@@ -633,11 +780,14 @@ class Trainer:
         self.drafter_model.train()
         if total_valid == 0:
             eval_loss = 0.0
+            eval_q_loss = 0.0
         else:
             eval_loss = total_loss / total_valid
+            eval_q_loss = total_q_loss / total_valid
         mean_acceptance = total_acceptance / max(total_acceptance_count, 1)
         return {
             "eval/loss": eval_loss,
+            "eval/q_loss": eval_q_loss,
             "eval/mean_acceptance_length": mean_acceptance,
         }
 
@@ -652,7 +802,7 @@ def build_parser() -> ArgumentParser:
         "--tree_type",
         type=str,
         default="block",
-        choices=["fixed", "block", "branch_off", "prunable", "every_branch", "loaded"],
+        choices=["block", "branch_off", "prunable"],
     )
     parser.add_argument("--tree_args", type=dict, default=None)
     return parser
@@ -663,11 +813,16 @@ def main() -> None:
     cfg = parser.parse_args()
     trainer_cfg = TrainerConfig(**namespace_to_dict(cfg.trainer))
     data_cfg = DataModuleConfig(**namespace_to_dict(cfg.data))
+    drafter = cfg.drafter
+    try:
+        drafter = json.loads(drafter)
+    except json.JSONDecodeError:
+        pass
     trainer = Trainer(
         config=trainer_cfg,
         target=cfg.target,
         data=data_cfg,
-        drafter=cfg.drafter,
+        drafter=drafter,
         tree_type=cfg.tree_type,
         tree_args=cfg.tree_args,
     )

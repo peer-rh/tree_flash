@@ -8,7 +8,7 @@ torch = pytest.importorskip("torch")
 h5py = pytest.importorskip("h5py")
 
 from src.data import PackedBatchCollator, Stage2Dataset
-from src.trees import BlockTreeProcessor, BranchOffTreeProcessor
+from src.trees import BlockTreeProcessor, BranchOffTreeProcessor, PrunableTreeProcessor, subset_tree_info
 
 
 SUB_TREE_PATHS = ["0-1", "0-2", "1-3"]
@@ -145,6 +145,60 @@ def test_block_tree_processor_builds_expected_metadata() -> None:
     assert info.tree_position_ids.shape == (2, 3, 8)
 
 
+def test_block_tree_processor_builds_multi_anchor_tensors() -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2, sub_tree_paths=SUB_TREE_PATHS)
+
+    response_subtrees = torch.tensor(
+        [
+            [21, 31, 32, 33],
+            [22, 41, 42, 43],
+            [23, 51, 52, 53],
+            [24, -1, -1, -1],
+        ],
+        dtype=torch.long,
+    )
+    response_probs = torch.tensor(
+        [
+            [0.8, 0.5, 0.25, 0.2],
+            [0.6, 0.4, 0.3, 0.1],
+            [0.5, 0.3, 0.2, 0.1],
+            [0.4, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    tensors = tree_processor.build_anchor_tensors(
+        response_subtrees=response_subtrees,
+        response_probs=response_probs,
+        anchor_local_positions=[0, 2],
+        anchor_positions=[10, 20],
+        mask_token_id=99,
+    )
+
+    assert tensors["tree_labels"].tolist() == [
+        [21, 31, 32, 33, 22, 41, 42, 43],
+        [23, 51, 52, 53, 24, -1, -1, -1],
+    ]
+    assert tensors["tree_noise_ids"].tolist() == [
+        [21, 99, 99, 99, 99, 99, 99, 99],
+        [23, 99, 99, 99, 99, 99, 99, 99],
+    ]
+    assert tensors["tree_position_ids"].tolist() == [
+        [10, 11, 11, 12, 11, 12, 12, 13],
+        [20, 21, 21, 22, 21, 22, 22, 23],
+    ]
+    assert tensors["tree_cum_probs"].tolist() == pytest.approx(
+        [
+            [0.8, 0.4, 0.2, 0.08, 0.48, 0.192, 0.144, 0.0192],
+            [0.5, 0.15, 0.1, 0.015, 0.2, 0.0, 0.0, 0.0],
+        ],
+        rel=1e-5,
+    )
+    assert tensors["tree_valid_mask"].tolist() == [
+        [True, True, True, True, True, True, True, True],
+        [True, True, True, True, True, False, False, False],
+    ]
+
+
 def test_branch_off_tree_processor_selects_sparse_layout() -> None:
     tree_processor = BranchOffTreeProcessor(
         tree_seq_depth=3,
@@ -189,3 +243,90 @@ def test_branch_off_tree_processor_selects_sparse_layout() -> None:
         [0.8, 0.2, 0.48, 0.192, 0.0192, 0.24],
         rel=1e-5,
     )
+
+
+def test_branch_off_tree_processor_builds_multi_anchor_tensors() -> None:
+    tree_processor = BranchOffTreeProcessor(
+        tree_seq_depth=2,
+        sub_tree_paths=SUB_TREE_PATHS,
+        branching_pattern=[[0, 2], [0, 3]],
+    )
+
+    response_subtrees = torch.tensor(
+        [
+            [21, 31, 32, 33],
+            [22, 41, 42, 43],
+            [23, 51, 52, 53],
+            [24, -1, -1, -1],
+        ],
+        dtype=torch.long,
+    )
+    response_probs = torch.tensor(
+        [
+            [0.8, 0.5, 0.25, 0.2],
+            [0.6, 0.4, 0.3, 0.1],
+            [0.5, 0.3, 0.2, 0.1],
+            [0.4, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    tensors = tree_processor.build_anchor_tensors(
+        response_subtrees=response_subtrees,
+        response_probs=response_probs,
+        anchor_local_positions=[0, 2],
+        anchor_positions=[10, 20],
+        mask_token_id=99,
+    )
+
+    assert tensors["tree_labels"].tolist() == [
+        [21, 32, 22, 41, 43],
+        [23, 52, 24, -1, -1],
+    ]
+    assert tensors["tree_noise_ids"].tolist() == [
+        [21, 99, 99, 99, 99],
+        [23, 99, 99, 99, 99],
+    ]
+    assert tensors["tree_position_ids"].tolist() == [
+        [10, 11, 11, 12, 13],
+        [20, 21, 21, 22, 23],
+    ]
+    assert tensors["tree_cum_probs"].tolist() == pytest.approx(
+        [
+            [0.8, 0.2, 0.48, 0.192, 0.0192],
+            [0.5, 0.1, 0.2, 0.0, 0.0],
+        ],
+        rel=1e-5,
+    )
+    assert tensors["tree_valid_mask"].tolist() == [
+        [True, True, True, True, True],
+        [True, True, True, False, False],
+    ]
+
+
+def test_subset_tree_info_rebuilds_parent_and_relations() -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2, sub_tree_paths=SUB_TREE_PATHS)
+    tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
+
+    subset = subset_tree_info(tree_info, [0, 4, 5, 7])
+
+    assert subset.parent_idx.tolist() == [-1, 0, 1, 2]
+    assert subset.depth.tolist() == [0, 1, 2, 3]
+    assert subset.tree_position_ids.tolist() == [[[0, 4, 5, 7]]]
+    assert subset.non_root_mask.tolist() == [False, True, True, True]
+    assert subset.primary_path_indices.tolist() == [0, 1, 2, 3]
+    assert subset.tree_mask[3].tolist() == [True, True, True, True]
+
+
+def test_prunable_tree_processor_wraps_branch_off_base_tree() -> None:
+    tree_processor = PrunableTreeProcessor(
+        tree_seq_depth=3,
+        base_tree_type="branch_off",
+        prune_topk=2,
+        sub_tree_paths=SUB_TREE_PATHS,
+        branching_pattern=[[0, 2], [0, 3], [0]],
+    )
+
+    assert tree_processor.prune_topk == 2
+    assert tree_processor.base_tree_type == "branch_off"
+    assert tree_processor.block_size == 6
+    assert tree_processor.primary_path_indices.tolist() == [0, 2, 5]

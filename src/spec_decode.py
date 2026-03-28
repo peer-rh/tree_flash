@@ -11,7 +11,13 @@ from transformers.cache_utils import DynamicCache
 
 from .models import DFlashDraftModel
 from .trainer import unwrap_model
-from .trees import BlockTreeProcessor, BranchOffTreeProcessor, TreeInfo
+from .trees import (
+    BlockTreeProcessor,
+    BranchOffTreeProcessor,
+    PrunableTreeProcessor,
+    TreeInfo,
+    subset_tree_info,
+)
 
 
 @dataclass
@@ -58,6 +64,14 @@ def build_tree_processor(
     if tree_type == "branch_off":
         return BranchOffTreeProcessor(
             tree_seq_depth=tree_seq_depth,
+            sub_tree_paths=sub_tree_paths or tree_args.get("sub_tree_paths"),
+            branching_pattern=tree_args.get("branching_pattern"),
+        )
+    if tree_type == "prunable":
+        return PrunableTreeProcessor(
+            tree_seq_depth=tree_seq_depth,
+            base_tree_type=tree_args.get("base_tree_type", "block"),
+            prune_topk=int(tree_args.get("prune_topk", 0)),
             sub_tree_paths=sub_tree_paths or tree_args.get("sub_tree_paths"),
             branching_pattern=tree_args.get("branching_pattern"),
         )
@@ -161,6 +175,53 @@ def gather_path_indices(
     return list(reversed(path))
 
 
+def select_pruned_keep_indices(
+    *,
+    tree_info: TreeInfo,
+    q_scores: torch.Tensor,
+    prune_topk: int,
+) -> list[int]:
+    if prune_topk < 0:
+        raise ValueError(f"prune_topk must be >= 0, got {prune_topk}.")
+    if prune_topk == 0 or tree_info.block_size <= 1:
+        return [0]
+
+    num_candidates = tree_info.block_size - 1
+    topk = min(prune_topk, num_candidates)
+    ranked = torch.topk(q_scores[1:], k=topk).indices + 1
+    kept = {0}
+    for node_idx in ranked.tolist():
+        kept.update(gather_path_indices(int(node_idx), tree_info))
+    return sorted(kept)
+
+
+def prune_drafted_tree(
+    *,
+    tree_token_ids: torch.Tensor,
+    draft_logits: torch.Tensor,
+    draft_token_probs: torch.Tensor,
+    tree_info: TreeInfo,
+    q_scores: torch.Tensor,
+    prune_topk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TreeInfo]:
+    keep_indices = select_pruned_keep_indices(
+        tree_info=tree_info,
+        q_scores=q_scores,
+        prune_topk=prune_topk,
+    )
+    if len(keep_indices) == tree_info.block_size:
+        return tree_token_ids, draft_logits, draft_token_probs, tree_info
+
+    keep = torch.tensor(keep_indices, dtype=torch.long, device=tree_token_ids.device)
+    pruned_tree_info = subset_tree_info(tree_info, keep)
+    return (
+        tree_token_ids.index_select(0, keep),
+        draft_logits.index_select(0, keep),
+        draft_token_probs.index_select(0, keep),
+        pruned_tree_info,
+    )
+
+
 def draft_tree(
     *,
     drafter_model,
@@ -173,7 +234,7 @@ def draft_tree(
     root_position: int,
     temperature: float,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TreeInfo]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TreeInfo, torch.Tensor | None]:
     tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=device)
     tree_len = tree_info.block_size
     noise_ids = torch.full((1, tree_len), raw_drafter.mask_token_id, dtype=torch.long, device=device)
@@ -186,7 +247,7 @@ def draft_tree(
         tree_len=tree_len,
         device=device,
     )
-    draft_hidden_states, _ = drafter_model(
+    draft_hidden_states, backbone_hidden = drafter_model(
         hidden_states=noise_embeddings,
         position_ids=position_ids,
         tree_info=tree_info,
@@ -198,7 +259,10 @@ def draft_tree(
     tree_token_ids[0] = current_root_token
     draft_token_probs = gather_token_probability(draft_logits, tree_token_ids, temperature)
     draft_token_probs[0] = 1.0
-    return tree_token_ids, draft_logits, draft_token_probs, tree_info
+    q_scores = None
+    if getattr(raw_drafter, "q_head", None) is not None:
+        q_scores = torch.sigmoid(raw_drafter.q_head(backbone_hidden)[0, :, 0]).to(torch.float32)
+    return tree_token_ids, draft_logits, draft_token_probs, tree_info, q_scores
 
 
 def verify_tree(
@@ -277,6 +341,8 @@ def speculative_generate(
 ) -> SpecDecodeResult:
     device = next(target_model.parameters()).device
     raw_drafter = unwrap_model(drafter_model)
+    if isinstance(tree_processor, PrunableTreeProcessor) and getattr(raw_drafter, "q_head", None) is None:
+        raise ValueError("tree_type='prunable' requires a drafter checkpoint/config with use_q_head=True.")
     prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
     prefix_cache = DynamicCache()
     prefill_outputs = target_model(
@@ -307,7 +373,7 @@ def speculative_generate(
             break
 
         root_position = output_ids.shape[0] - 1
-        tree_token_ids, draft_logits, draft_token_probs, tree_info = draft_tree(
+        tree_token_ids, draft_logits, draft_token_probs, tree_info, q_scores = draft_tree(
             drafter_model=drafter_model,
             raw_drafter=raw_drafter,
             target_embeddings=target_embeddings,
@@ -320,6 +386,17 @@ def speculative_generate(
             device=device,
         )
         drafted_tokens += tree_info.block_size - 1
+        if isinstance(tree_processor, PrunableTreeProcessor):
+            if q_scores is None:
+                raise ValueError("Prunable speculative decoding requires q_head scores.")
+            tree_token_ids, draft_logits, draft_token_probs, tree_info = prune_drafted_tree(
+                tree_token_ids=tree_token_ids,
+                draft_logits=draft_logits,
+                draft_token_probs=draft_token_probs,
+                tree_info=tree_info,
+                q_scores=q_scores,
+                prune_topk=tree_processor.prune_topk,
+            )
 
         prefix_len = prefix_cache.get_seq_length()
         updated_cache, verifier_logits, tree_ctx_features = verify_tree(
@@ -389,7 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tree-type",
         default="block",
-        choices=["fixed", "block", "branch_off"],
+        choices=["fixed", "block", "branch_off", "prunable"],
     )
     parser.add_argument("--tree-seq-depth", type=int, default=4)
     parser.add_argument("--sub-tree-paths", nargs="*", default=None)
