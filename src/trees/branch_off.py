@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Sequence
 
 import torch
@@ -98,12 +97,16 @@ class BranchOffTreeProcessor:
 
         for flat_idx, (depth_idx, vertex_idx) in enumerate(self.layout):
             depth[flat_idx] = depth_idx + self.subtree.depth_of[vertex_idx]
-            if vertex_idx == 0:
+            if depth_idx == 0 and vertex_idx == 0:
                 non_root_mask[flat_idx] = False
                 primary_path_mask[flat_idx] = True
                 primary_path_indices.append(flat_idx)
                 if depth_idx > 0:
                     parent_idx[flat_idx] = lookup[(depth_idx - 1, 0)]
+            elif vertex_idx == 0:
+                primary_path_mask[flat_idx] = True
+                primary_path_indices.append(flat_idx)
+                parent_idx[flat_idx] = lookup[(depth_idx - 1, 0)]
             else:
                 parent_idx[flat_idx] = lookup[(depth_idx, self.subtree.parent_map[vertex_idx])]
 
@@ -218,7 +221,7 @@ class BranchOffTreeProcessor:
                 tree_position_ids[anchor_idx, flat_idx] = anchor_position + depth_idx + self.subtree.depth_of[vertex_idx]
                 tree_cum_probs[anchor_idx, flat_idx] = path_cumprob
                 tree_valid_mask[anchor_idx, flat_idx] = token != IGNORE_IDX
-                if vertex_idx == 0 and token != IGNORE_IDX:
+                if flat_idx == 0 and token != IGNORE_IDX:
                     tree_noise_ids[anchor_idx, flat_idx] = token
 
         return {

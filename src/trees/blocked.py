@@ -40,6 +40,12 @@ class BlockTreeProcessor:
         self.sub_tree_paths = tuple(sub_tree_paths or DEFAULT_SUB_TREE_PATHS)
         self.subtree = SubTreeInfo(self.sub_tree_paths)
         self.subtree_size = self.subtree.size
+        self.layout = [
+            (depth_idx, vertex_idx)
+            for depth_idx in range(self.tree_seq_depth)
+            for vertex_idx in range(self.subtree_size)
+        ]
+        self.flat_to_depth_vertex = torch.tensor(self.layout, dtype=torch.long)
         self.block_size = self.tree_seq_depth * self.subtree_size
         (
             self.parent_idx,
@@ -66,12 +72,16 @@ class BlockTreeProcessor:
             for vertex_idx in range(self.subtree_size):
                 flat_idx = depth_idx * self.subtree_size + vertex_idx
                 depth[flat_idx] = depth_idx + self.subtree.depth_of[vertex_idx]
-                if vertex_idx == 0:
+                if depth_idx == 0 and vertex_idx == 0:
                     non_root_mask[flat_idx] = False
                     primary_path_mask[flat_idx] = True
                     primary_path_indices.append(flat_idx)
                     if depth_idx > 0:
                         parent_idx[flat_idx] = (depth_idx - 1) * self.subtree_size
+                elif vertex_idx == 0:
+                    primary_path_mask[flat_idx] = True
+                    primary_path_indices.append(flat_idx)
+                    parent_idx[flat_idx] = (depth_idx - 1) * self.subtree_size
                 else:
                     parent_idx[flat_idx] = depth_idx * self.subtree_size + self.subtree.parent_map[vertex_idx]
 
@@ -200,7 +210,7 @@ class BlockTreeProcessor:
                     tree_position_ids[anchor_idx, flat_idx] = anchor_position + depth_idx + self.subtree.depth_of[vertex_idx]
                     tree_cum_probs[anchor_idx, flat_idx] = float(cum_probs[flat_idx].item())
                     tree_valid_mask[anchor_idx, flat_idx] = token != IGNORE_IDX
-                    if vertex_idx == 0 and token != IGNORE_IDX:
+                    if flat_idx == 0 and token != IGNORE_IDX:
                         tree_noise_ids[anchor_idx, flat_idx] = token
 
         return {

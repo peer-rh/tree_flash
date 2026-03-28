@@ -13,6 +13,7 @@ pytest.importorskip("lightning")
 
 from src.data import DataModuleConfig, PackedBatch
 from src.models.dflash import DFlashDraftModel
+from src.spec_decode import choose_deepest_valid_node, gather_path_indices
 from src.trainer import Trainer, TrainerConfig
 from src.trees import BlockTreeProcessor
 
@@ -169,7 +170,7 @@ def test_trainer_smoke_with_fakes(monkeypatch, tmp_path: Path) -> None:
         tree_cum_probs=torch.ones((1, 1, block_size), dtype=torch.float32),
         tree_valid_mask=torch.ones((1, 1, block_size), dtype=torch.bool),
     )
-    packed_batch.tree_noise_ids[:, :, :: tree_processor.subtree_size] = packed_batch.tree_labels[:, :, :: tree_processor.subtree_size]
+    packed_batch.tree_noise_ids[:, :, 0] = packed_batch.tree_labels[:, :, 0]
 
     monkeypatch.setattr(trainer_mod, "Fabric", FakeFabric)
     monkeypatch.setattr(trainer_mod, "AutoTokenizer", FakeTokenizer)
@@ -297,3 +298,13 @@ def test_trainer_accepts_branch_off_tree_type(monkeypatch, tmp_path: Path) -> No
     )
     assert trainer.tree_processor.block_size == 6
     assert trainer.tree_processor.primary_path_indices.tolist() == [0, 2, 5]
+
+
+def test_spec_decode_path_helpers_use_tree_structure() -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
+    accepted_mask = torch.tensor([True, True, False, True, True, True, False, True], dtype=torch.bool)
+
+    deepest_idx = choose_deepest_valid_node(accepted_mask, tree_info)
+    assert deepest_idx == 7
+    assert gather_path_indices(deepest_idx, tree_info) == [0, 4, 5, 7]
