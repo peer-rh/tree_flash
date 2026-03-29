@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 import math
 import json
+import time
 
 from jsonargparse import ArgumentParser, namespace_to_dict
 from lightning.fabric import Fabric
@@ -46,6 +47,7 @@ class TrainerConfig:
     min_lr: float = 1e-6
     seed: int = 42
     eval_batches: int = 32
+    profile_steps: int = 0
     wandb_project: str = "tree-flash"
     wandb_run_name: str | None = None
     no_wandb: bool = False
@@ -253,6 +255,7 @@ class Trainer:
         self.global_step = 0
         self.wandb_run = None
         self.wandb_run_id: str | None = None
+        self._tree_info_cache: dict[tuple[int, int, str, int], Any] = {}
 
         strategy = "ddp" if config.devices > 1 or config.ddp else "auto"
         self.fabric = Fabric(
@@ -313,6 +316,8 @@ class Trainer:
         self.mask_token_id = self.raw_drafter.mask_token_id
         if self.mask_token_id is None:
             raise ValueError("The drafter config must define dflash_config.mask_token_id.")
+        self.has_q_head = getattr(self.raw_drafter, "q_head", None) is not None
+        self.has_ar_head = getattr(self.raw_drafter, "ar_block", None) is not None
         if tree_type == "prunable" and not has_pruning_head(self.raw_drafter):
             raise ValueError(
                 "tree_type='prunable' requires a drafter checkpoint/config with use_q_head=True or use_ar_head=True."
@@ -406,6 +411,21 @@ class Trainer:
         if self.fabric.is_global_zero and self.wandb_run is not None:
             self.wandb_run.log(metrics, step=step)
 
+    def _get_tree_info(
+        self,
+        *,
+        batch_size: int,
+        num_blocks: int,
+        device: torch.device,
+    ):
+        device_key = (device.type, -1 if device.index is None else device.index)
+        cache_key = (batch_size, num_blocks, device_key[0], device_key[1])
+        tree_info = self._tree_info_cache.get(cache_key)
+        if tree_info is None:
+            tree_info = self.tree_processor.build_tree_info(batch_size, num_blocks, device)
+            self._tree_info_cache[cache_key] = tree_info
+        return tree_info
+
     def _forward_anchor_chunk(
         self,
         batch: PackedBatch,
@@ -413,6 +433,7 @@ class Trainer:
         anchor_slice: slice,
         *,
         compute_predictions: bool,
+        profile: bool = False,
     ) -> dict[str, Any]:
         anchor_positions = batch.anchor_positions[:, anchor_slice]
         anchor_valid_mask = batch.anchor_valid_mask[:, anchor_slice]
@@ -423,6 +444,9 @@ class Trainer:
                 "ar_loss_sum": target_ctx_features.new_zeros(()),
                 "valid_count": 0,
                 "predictions": None,
+                "mask_time": 0.0,
+                "drafter_time": 0.0,
+                "ce_time": 0.0,
             }
 
         tree_labels = batch.tree_labels[:, anchor_slice]
@@ -432,8 +456,27 @@ class Trainer:
         tree_valid_mask = batch.tree_valid_mask[:, anchor_slice]
 
         batch_size, num_blocks, block_size = tree_labels.shape
-        tree_info = self.tree_processor.build_tree_info(batch_size, num_blocks, tree_labels.device)
+        tree_info = self._get_tree_info(batch_size=batch_size, num_blocks=num_blocks, device=tree_labels.device)
+        valid_mask = (
+            tree_valid_mask
+            & tree_info.non_root_mask.view(1, 1, -1)
+            & anchor_valid_mask.unsqueeze(-1)
+        )
+        flat_valid_mask = valid_mask.reshape(batch_size, num_blocks * block_size)
+        if not flat_valid_mask.any():
+            return {
+                "loss_sum": target_ctx_features.new_zeros(()),
+                "q_loss_sum": target_ctx_features.new_zeros(()),
+                "ar_loss_sum": target_ctx_features.new_zeros(()),
+                "valid_count": 0,
+                "predictions": None,
+                "mask_time": 0.0,
+                "drafter_time": 0.0,
+                "ce_time": 0.0,
+            }
+
         noise_embeddings = self.target_embeddings(tree_noise_ids.reshape(batch_size, num_blocks * block_size))
+        mask_start = time.perf_counter() if profile else 0.0
         drafter_mask = build_drafter_block_mask(
             anchor_positions=anchor_positions,
             document_mask=batch.document_mask,
@@ -452,30 +495,46 @@ class Trainer:
             batch.position_ids,
             tree_position_ids.reshape(batch_size, num_blocks * block_size),
         ), dim=1)
-        draft_hidden_states, backbone_hidden = self.drafter_model(
+        parent_embeddings = None
+        ar_attention_mask = None
+        ar_position_ids = None
+        if self.has_ar_head:
+            parent_token_ids = self._build_parent_token_ids(tree_labels, tree_info)
+            parent_embeddings = self.target_embeddings(parent_token_ids.reshape(batch_size, num_blocks * block_size))
+            ar_position_ids = tree_position_ids.reshape(batch_size, num_blocks * block_size)
+            ar_attention_mask = build_ar_block_mask(
+                anchor_positions=anchor_positions,
+                document_mask=batch.document_mask,
+                context_valid_mask=batch.context_valid_mask,
+                tree_valid_mask=tree_valid_mask,
+                tree_info=tree_info,
+                block_size=block_size,
+            )
+        mask_time = time.perf_counter() - mask_start if profile else 0.0
+
+        drafter_start = time.perf_counter() if profile else 0.0
+        draft_hidden_states, _, q_logits, ar_hidden_states = self.drafter_model(
             hidden_states=noise_embeddings,
             position_ids=position_ids_with_seq,
             tree_info=tree_info,
             attention_mask=drafter_mask,
             target_ctx_features=target_ctx_features,
+            return_aux=True,
+            parent_embeddings=parent_embeddings,
+            ar_position_ids=ar_position_ids,
+            ar_attention_mask=ar_attention_mask,
         )
-        valid_mask = (
-            tree_valid_mask
-            & tree_info.non_root_mask.view(1, 1, -1)
-            & anchor_valid_mask.unsqueeze(-1)
-        )
-        flat_valid_mask = valid_mask.reshape(batch_size, num_blocks * block_size)
-        loss_sum, valid_count, predictions = self._chunked_loss_and_predictions(
+        drafter_time = time.perf_counter() - drafter_start if profile else 0.0
+        loss_sum, valid_count, predictions, ce_time = self._chunked_loss_and_predictions(
             hidden_states=draft_hidden_states,
             labels=tree_labels.reshape(batch_size, num_blocks * block_size),
             weights=tree_cum_probs.reshape(batch_size, num_blocks * block_size),
             valid_mask=flat_valid_mask,
             compute_predictions=compute_predictions,
+            profile=profile,
         )
         q_loss_sum = draft_hidden_states.new_zeros(())
-        q_head = getattr(self.raw_drafter, "q_head", None)
-        if q_head is not None and flat_valid_mask.any():
-            q_logits = q_head(backbone_hidden).squeeze(-1)
+        if self.has_q_head:
             q_targets = tree_cum_probs.reshape(batch_size, num_blocks * block_size).to(torch.float32)
             q_loss = F.binary_cross_entropy_with_logits(
                 q_logits.float(),
@@ -485,32 +544,16 @@ class Trainer:
             q_loss_sum = q_loss[flat_valid_mask].sum().to(draft_hidden_states.dtype)
 
         ar_loss_sum = draft_hidden_states.new_zeros(())
-        if getattr(self.raw_drafter, "ar_block", None) is not None and flat_valid_mask.any():
-            parent_token_ids = self._build_parent_token_ids(tree_labels, tree_info)
-            parent_embeddings = self.target_embeddings(parent_token_ids.reshape(batch_size, num_blocks * block_size))
-            ar_attention_mask = build_ar_block_mask(
-                anchor_positions=anchor_positions,
-                document_mask=batch.document_mask,
-                context_valid_mask=batch.context_valid_mask,
-                tree_valid_mask=tree_valid_mask,
-                tree_info=tree_info,
-                block_size=block_size,
-            )
-            ar_hidden_states = self.raw_drafter.build_ar_hidden_states(
-                backbone_hidden,
-                parent_embeddings,
-                target_ctx_features=target_ctx_features,
-                tree_info=tree_info,
-                position_ids=tree_position_ids.reshape(batch_size, num_blocks * block_size),
-                attention_mask=ar_attention_mask,
-            )
-            ar_loss_sum, _, _ = self._chunked_loss_and_predictions(
+        if self.has_ar_head:
+            ar_loss_sum, _, _, ar_ce_time = self._chunked_loss_and_predictions(
                 hidden_states=ar_hidden_states,
                 labels=tree_labels.reshape(batch_size, num_blocks * block_size),
                 weights=tree_cum_probs.reshape(batch_size, num_blocks * block_size),
                 valid_mask=flat_valid_mask,
                 compute_predictions=False,
+                profile=profile,
             )
+            ce_time += ar_ce_time
         if predictions is not None:
             predictions = predictions.view(batch_size, num_blocks, block_size)
         return {
@@ -519,6 +562,9 @@ class Trainer:
             "ar_loss_sum": ar_loss_sum,
             "valid_count": valid_count,
             "predictions": predictions,
+            "mask_time": mask_time,
+            "drafter_time": drafter_time,
+            "ce_time": ce_time,
         }
 
     def _build_parent_token_ids(
@@ -541,14 +587,16 @@ class Trainer:
         weights: torch.Tensor,
         valid_mask: torch.Tensor,
         compute_predictions: bool,
-    ) -> tuple[torch.Tensor, int, torch.Tensor | None]:
+        profile: bool = False,
+    ) -> tuple[torch.Tensor, int, torch.Tensor | None, float]:
+        ce_start = time.perf_counter() if profile else 0.0
         batch_size, total_tokens, hidden_size = hidden_states.shape
         flat_hidden = hidden_states.reshape(batch_size * total_tokens, hidden_size)
         flat_labels = labels.reshape(batch_size * total_tokens)
         flat_weights = weights.reshape(batch_size * total_tokens)
         flat_valid = valid_mask.reshape(batch_size * total_tokens)
         if not flat_valid.any():
-            return hidden_states.new_zeros(()), 0, None
+            return hidden_states.new_zeros(()), 0, None, 0.0
 
         chunk_size = self.config.ce_chunk_size or flat_hidden.shape[0]
         total_loss = hidden_states.new_zeros(())
@@ -576,7 +624,8 @@ class Trainer:
         valid_count = int(flat_valid.sum().item())
         if predictions is not None:
             predictions = predictions.view(batch_size, total_tokens)
-        return total_loss, valid_count, predictions
+        ce_time = time.perf_counter() - ce_start if profile else 0.0
+        return total_loss, valid_count, predictions, ce_time
 
     def _count_valid_targets(
         self,
@@ -622,6 +671,10 @@ class Trainer:
                 "valid_count": 0,
                 "acceptance_total": 0.0,
                 "acceptance_count": 0,
+                "prefill_time": 0.0,
+                "mask_time": 0.0,
+                "drafter_time": 0.0,
+                "ce_time": 0.0,
             }
 
         total_valid_count = self._count_valid_targets(batch)
@@ -635,14 +688,24 @@ class Trainer:
                 "valid_count": 0,
                 "acceptance_total": 0.0,
                 "acceptance_count": 0,
+                "prefill_time": 0.0,
+                "mask_time": 0.0,
+                "drafter_time": 0.0,
+                "ce_time": 0.0,
             }
 
+        profile = self.config.profile_steps > 0 and self.global_step < self.config.profile_steps
+        prefill_start = time.perf_counter() if profile else 0.0
         target_ctx_features = self._prefill_target_context(batch)
+        prefill_time = time.perf_counter() - prefill_start if profile else 0.0
         total_loss_sum = torch.zeros((), device=self.fabric.device)
         total_q_loss_sum = torch.zeros((), device=self.fabric.device)
         total_ar_loss_sum = torch.zeros((), device=self.fabric.device)
         acceptance_total = 0.0
         acceptance_count = 0
+        mask_time = 0.0
+        drafter_time = 0.0
+        ce_time = 0.0
         anchor_chunk = self.config.anchor_chunk_size or batch.num_anchors
 
         for start in range(0, batch.num_anchors, anchor_chunk):
@@ -652,12 +715,16 @@ class Trainer:
                 target_ctx_features,
                 slice(start, end),
                 compute_predictions=True,
+                profile=profile,
             )
             if chunk_result["valid_count"] == 0:
                 continue
             chunk_loss_sum = chunk_result["loss_sum"]
             chunk_q_loss_sum = chunk_result["q_loss_sum"]
             chunk_ar_loss_sum = chunk_result["ar_loss_sum"]
+            mask_time += chunk_result["mask_time"]
+            drafter_time += chunk_result["drafter_time"]
+            ce_time += chunk_result["ce_time"]
             if chunk_result["predictions"] is not None:
                 acceptance_chunk_total, acceptance_chunk_count = self._acceptance_proxy(
                     predictions=chunk_result["predictions"],
@@ -688,6 +755,10 @@ class Trainer:
             "valid_count": total_valid_count,
             "acceptance_total": acceptance_total,
             "acceptance_count": acceptance_count,
+            "prefill_time": prefill_time,
+            "mask_time": mask_time,
+            "drafter_time": drafter_time,
+            "ce_time": ce_time,
         }
 
     @torch.no_grad()
@@ -706,6 +777,10 @@ class Trainer:
                 "valid_count": 0,
                 "acceptance_total": 0.0,
                 "acceptance_count": 0,
+                "prefill_time": 0.0,
+                "mask_time": 0.0,
+                "drafter_time": 0.0,
+                "ce_time": 0.0,
             }
 
         total_valid_count = self._count_valid_targets(batch)
@@ -719,6 +794,10 @@ class Trainer:
                 "valid_count": 0,
                 "acceptance_total": 0.0,
                 "acceptance_count": 0,
+                "prefill_time": 0.0,
+                "mask_time": 0.0,
+                "drafter_time": 0.0,
+                "ce_time": 0.0,
             }
 
         target_ctx_features = self._prefill_target_context(batch)
@@ -727,6 +806,9 @@ class Trainer:
         total_ar_loss_sum = torch.zeros((), device=self.fabric.device)
         acceptance_total = 0.0
         acceptance_count = 0
+        mask_time = 0.0
+        drafter_time = 0.0
+        ce_time = 0.0
         anchor_chunk = self.config.anchor_chunk_size or batch.num_anchors
 
         for start in range(0, batch.num_anchors, anchor_chunk):
@@ -736,10 +818,14 @@ class Trainer:
                 target_ctx_features,
                 slice(start, end),
                 compute_predictions=True,
+                profile=False,
             )
             total_loss_sum = total_loss_sum + chunk_result["loss_sum"]
             total_q_loss_sum = total_q_loss_sum + chunk_result["q_loss_sum"]
             total_ar_loss_sum = total_ar_loss_sum + chunk_result["ar_loss_sum"]
+            mask_time += chunk_result["mask_time"]
+            drafter_time += chunk_result["drafter_time"]
+            ce_time += chunk_result["ce_time"]
             if chunk_result["predictions"] is not None:
                 acceptance_chunk_total, acceptance_chunk_count = self._acceptance_proxy(
                     predictions=chunk_result["predictions"],
@@ -761,6 +847,10 @@ class Trainer:
             "valid_count": total_valid_count,
             "acceptance_total": acceptance_total,
             "acceptance_count": acceptance_count,
+            "prefill_time": 0.0,
+            "mask_time": mask_time,
+            "drafter_time": drafter_time,
+            "ce_time": ce_time,
         }
 
     def _acceptance_proxy(
@@ -802,6 +892,10 @@ class Trainer:
         accumulated_ar_loss = 0.0
         accumulated_acceptance_total = 0.0
         accumulated_acceptance_count = 0
+        accumulated_prefill_time = 0.0
+        accumulated_mask_time = 0.0
+        accumulated_drafter_time = 0.0
+        accumulated_ce_time = 0.0
         micro_step = 0
 
         for epoch_idx in range(self.config.num_epochs):
@@ -821,6 +915,10 @@ class Trainer:
                 accumulated_ar_loss += float(batch_result["ar_loss"].detach().item())
                 accumulated_acceptance_total += float(batch_result["acceptance_total"])
                 accumulated_acceptance_count += int(batch_result["acceptance_count"])
+                accumulated_prefill_time += float(batch_result["prefill_time"])
+                accumulated_mask_time += float(batch_result["mask_time"])
+                accumulated_drafter_time += float(batch_result["drafter_time"])
+                accumulated_ce_time += float(batch_result["ce_time"])
 
                 if not is_final_micro:
                     if self.config.dev_run:
@@ -848,6 +946,14 @@ class Trainer:
                 avg_acceptance = accumulated_acceptance_total / max(accumulated_acceptance_count, 1)
                 accumulated_acceptance_total = 0.0
                 accumulated_acceptance_count = 0
+                avg_prefill_time = accumulated_prefill_time / max(self.config.grad_accum_steps, 1)
+                avg_mask_time = accumulated_mask_time / max(self.config.grad_accum_steps, 1)
+                avg_drafter_time = accumulated_drafter_time / max(self.config.grad_accum_steps, 1)
+                avg_ce_time = accumulated_ce_time / max(self.config.grad_accum_steps, 1)
+                accumulated_prefill_time = 0.0
+                accumulated_mask_time = 0.0
+                accumulated_drafter_time = 0.0
+                accumulated_ce_time = 0.0
                 accumulated_loss = 0.0
                 accumulated_q_loss = 0.0
                 accumulated_ar_loss = 0.0
@@ -858,7 +964,11 @@ class Trainer:
                         f"step={self.global_step} loss={avg_loss:.4f} lr={lr:.2e}",
                         flush=True,
                     )
-                if self.global_step % self.config.log_every == 0:
+                should_log_step = (
+                    self.global_step % self.config.log_every == 0
+                    or (self.config.profile_steps > 0 and self.global_step <= self.config.profile_steps)
+                )
+                if should_log_step:
                     self._log(
                         {
                             "train/loss": avg_loss,
@@ -866,6 +976,16 @@ class Trainer:
                             "train/ar_loss": avg_ar_loss,
                             'train/acceptance_proxy': avg_acceptance,
                             "train/lr": lr,
+                            **(
+                                {
+                                    "profile/train_prefill_s": avg_prefill_time,
+                                    "profile/train_mask_s": avg_mask_time,
+                                    "profile/train_drafter_s": avg_drafter_time,
+                                    "profile/train_ce_s": avg_ce_time,
+                                }
+                                if self.config.profile_steps > 0 and self.global_step <= self.config.profile_steps
+                                else {}
+                            ),
                         },
                         self.global_step,
                     )

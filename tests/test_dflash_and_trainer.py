@@ -247,6 +247,11 @@ def _build_fake_trainer_components(
         def extract_ctx_features(self, hidden_states):
             return torch.cat(hidden_states[1:], dim=-1)
 
+        def compute_q_logits(self, backbone_hidden_states):
+            if self.q_head is None:
+                return backbone_hidden_states.new_zeros(backbone_hidden_states.shape[:2])
+            return self.q_head(backbone_hidden_states).squeeze(-1)
+
         def build_ar_hidden_states(
             self,
             backbone_hidden_states,
@@ -262,8 +267,39 @@ def _build_fake_trainer_components(
                 raise ValueError("AR head is not enabled")
             return self.ar_block(self.ar_input_proj(torch.cat([backbone_hidden_states, parent_embeddings], dim=-1)))
 
-        def forward(self, *, hidden_states, position_ids, tree_info, attention_mask, target_ctx_features):
-            return self.proj(hidden_states), hidden_states
+        def forward(
+            self,
+            *,
+            hidden_states,
+            position_ids,
+            tree_info,
+            attention_mask,
+            target_ctx_features,
+            return_aux=False,
+            parent_embeddings=None,
+            ar_position_ids=None,
+            ar_attention_mask=None,
+        ):
+            _ = position_ids, tree_info, attention_mask
+            draft_hidden = self.proj(hidden_states)
+            backbone_hidden = hidden_states
+            if not return_aux:
+                return draft_hidden, backbone_hidden
+            q_logits = self.compute_q_logits(backbone_hidden)
+            if self.ar_input_proj is not None and self.ar_block is not None:
+                if parent_embeddings is None or ar_position_ids is None:
+                    raise ValueError("AR inputs are required when AR head is enabled")
+                ar_hidden = self.build_ar_hidden_states(
+                    backbone_hidden,
+                    parent_embeddings,
+                    target_ctx_features=target_ctx_features,
+                    tree_info=tree_info,
+                    position_ids=ar_position_ids,
+                    attention_mask=ar_attention_mask,
+                )
+            else:
+                ar_hidden = backbone_hidden.new_zeros(backbone_hidden.shape)
+            return draft_hidden, backbone_hidden, q_logits, ar_hidden
 
         def save_pretrained(self, path):
             Path(path).mkdir(parents=True, exist_ok=True)
@@ -476,6 +512,55 @@ def test_dflash_ar_head_reuses_shared_lm_head() -> None:
     assert ar_logits.shape == (1, tree_processor.block_size, config.vocab_size)
 
 
+def test_dflash_forward_return_aux_includes_q_logits_and_ar_hidden() -> None:
+    _require_flex_attention()
+    Qwen3Config = pytest.importorskip("transformers.models.qwen3.modeling_qwen3").Qwen3Config
+    config = Qwen3Config(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=64,
+    )
+    config.num_target_layers = 2
+    config.block_size = 8
+    config.max_tree_size = 8
+    config.dflash_config = {"mask_token_id": 1, "target_layer_ids": [0, 1]}
+    config._attn_implementation = "flex_attention"
+    config.use_q_head = True
+    config.use_ar_head = True
+
+    model = DFlashDraftModel(config)
+    model.config._attn_implementation = "flex_attention"
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
+
+    hidden_states = torch.randn(1, tree_processor.block_size, config.hidden_size)
+    parent_embeddings = torch.randn_like(hidden_states)
+    tree_position_ids = torch.arange(tree_processor.block_size).unsqueeze(0)
+    position_ids = torch.cat([torch.arange(6).unsqueeze(0), tree_position_ids], dim=1)
+    target_ctx_features = torch.randn(1, 6, len(model.target_layer_ids) * config.hidden_size)
+
+    final_hidden, backbone_hidden, q_logits, ar_hidden = model(
+        hidden_states=hidden_states,
+        position_ids=position_ids,
+        tree_info=tree_info,
+        target_ctx_features=target_ctx_features,
+        attention_mask=None,
+        return_aux=True,
+        parent_embeddings=parent_embeddings,
+        ar_position_ids=tree_position_ids,
+        ar_attention_mask=None,
+    )
+
+    assert final_hidden.shape == hidden_states.shape
+    assert backbone_hidden.shape == hidden_states.shape
+    assert q_logits.shape == hidden_states.shape[:2]
+    assert ar_hidden.shape == hidden_states.shape
+
+
 def test_trainer_smoke_with_fakes(monkeypatch, tmp_path: Path) -> None:
     import src.trainer as trainer_mod
 
@@ -613,6 +698,31 @@ def test_train_batch_backwards_once_per_anchor_chunk(monkeypatch, tmp_path: Path
 
     assert result["valid_count"] > 0
     assert len(trainer.fabric.backward_calls) == 2
+
+
+def test_train_batch_caches_tree_info_across_anchor_chunks(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=1,
+        batch=packed_batch,
+    )
+
+    call_count = 0
+    original_build_tree_info = trainer.tree_processor.build_tree_info
+
+    def counting_build_tree_info(batch_size, num_blocks, device):
+        nonlocal call_count
+        call_count += 1
+        return original_build_tree_info(batch_size, num_blocks, device)
+
+    trainer.tree_processor.build_tree_info = counting_build_tree_info
+
+    trainer._train_batch(packed_batch)
+
+    assert call_count == 1
 
 
 def test_train_batch_reports_acceptance_proxy(monkeypatch, tmp_path: Path) -> None:

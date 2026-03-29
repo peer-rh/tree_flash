@@ -300,7 +300,12 @@ def build_pruning_scores(
         ar_scores[0] = 1.0
         return ar_scores
     if getattr(raw_drafter, "q_head", None) is not None:
-        return torch.sigmoid(raw_drafter.q_head(backbone_hidden)[0, :, 0]).to(torch.float32)
+        compute_q_logits = getattr(raw_drafter, "compute_q_logits", None)
+        if compute_q_logits is not None:
+            q_logits = compute_q_logits(backbone_hidden)
+        else:
+            q_logits = raw_drafter.q_head(backbone_hidden).squeeze(-1)
+        return torch.sigmoid(q_logits[0]).to(torch.float32)
     return None
 
 

@@ -292,6 +292,42 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             return None
         return self.hidden_norm(self.fc(target_ctx_features))
 
+    def compute_q_logits(
+        self,
+        backbone_hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.q_head is None:
+            return backbone_hidden_states.new_zeros(backbone_hidden_states.shape[:2])
+        return self.q_head(backbone_hidden_states).squeeze(-1)
+
+    def _build_ar_hidden_states_from_encoded(
+        self,
+        backbone_hidden_states: torch.Tensor,
+        parent_embeddings: torch.Tensor,
+        *,
+        encoded_target_ctx: Optional[torch.Tensor],
+        tree_info: TreeInfo,
+        position_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        ar_inputs = torch.cat([backbone_hidden_states, parent_embeddings], dim=-1)
+        ar_hidden_states = self.ar_input_proj(ar_inputs)
+        position_embeddings = self.rotary_emb(ar_hidden_states, position_ids)
+        score_mod = build_ar_score_mod(
+            tree_info=tree_info,
+            prefix_len=0 if encoded_target_ctx is None else int(encoded_target_ctx.shape[1]),
+        )
+        ar_hidden_states = self.ar_block(
+            hidden_states=ar_hidden_states,
+            target_hidden=encoded_target_ctx,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+            tree_info=tree_info,
+            score_mod=score_mod,
+        )
+        return self.ar_output_norm(ar_hidden_states)
+
     def build_ar_hidden_states(
         self,
         backbone_hidden_states: torch.Tensor,
@@ -314,24 +350,15 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 "position_ids must match the first two dimensions of backbone_hidden_states, "
                 f"got {tuple(position_ids.shape)} and {tuple(backbone_hidden_states.shape[:2])}."
             )
-        ar_inputs = torch.cat([backbone_hidden_states, parent_embeddings], dim=-1)
-        ar_hidden_states = self.ar_input_proj(ar_inputs)
         encoded_target_ctx = self.encode_target_ctx(target_ctx_features)
-        position_embeddings = self.rotary_emb(ar_hidden_states, position_ids)
-        score_mod = build_ar_score_mod(
+        return self._build_ar_hidden_states_from_encoded(
+            backbone_hidden_states,
+            parent_embeddings,
+            encoded_target_ctx=encoded_target_ctx,
             tree_info=tree_info,
-            prefix_len=0 if encoded_target_ctx is None else int(encoded_target_ctx.shape[1]),
-        )
-        ar_hidden_states = self.ar_block(
-            hidden_states=ar_hidden_states,
-            target_hidden=encoded_target_ctx,
-            attention_mask=attention_mask,
             position_ids=position_ids,
-            position_embeddings=position_embeddings,
-            tree_info=tree_info,
-            score_mod=score_mod,
+            attention_mask=attention_mask,
         )
-        return self.ar_output_norm(ar_hidden_states)
 
     def forward(
         self,
@@ -342,9 +369,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_ctx_features: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        return_aux: bool = False,
+        parent_embeddings: Optional[torch.Tensor] = None,
+        ar_position_ids: Optional[torch.LongTensor] = None,
+        ar_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        target_ctx_features = self.encode_target_ctx(target_ctx_features)
+    ) -> tuple[torch.Tensor, ...]:
+        encoded_target_ctx = self.encode_target_ctx(target_ctx_features)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         if self.config.use_tree_pos_emb:
             tree_pos_ids = tree_info.tree_position_ids
@@ -356,7 +387,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         for i, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states=hidden_states,
-                target_hidden=target_ctx_features,
+                target_hidden=encoded_target_ctx,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
@@ -369,4 +400,24 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 backbone_hs = hidden_states
         if backbone_hs is None:
             backbone_hs = hidden_states
-        return self.norm(hidden_states), self.norm(backbone_hs)
+        hidden_states = self.norm(hidden_states)
+        backbone_hs = self.norm(backbone_hs)
+        if not return_aux:
+            return hidden_states, backbone_hs
+
+        q_logits = self.compute_q_logits(backbone_hs)
+        ar_hidden_states = backbone_hs.new_zeros(backbone_hs.shape)
+        if self.ar_input_proj is not None and self.ar_block is not None and self.ar_output_norm is not None:
+            if parent_embeddings is None:
+                raise ValueError("parent_embeddings must be provided when return_aux=True and AR head is enabled.")
+            if ar_position_ids is None:
+                raise ValueError("ar_position_ids must be provided when return_aux=True and AR head is enabled.")
+            ar_hidden_states = self._build_ar_hidden_states_from_encoded(
+                backbone_hs,
+                parent_embeddings,
+                encoded_target_ctx=encoded_target_ctx,
+                tree_info=tree_info,
+                position_ids=ar_position_ids,
+                attention_mask=ar_attention_mask,
+            )
+        return hidden_states, backbone_hs, q_logits, ar_hidden_states
