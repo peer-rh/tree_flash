@@ -16,14 +16,23 @@ from src.models.dflash import DFlashDraftModel
 from src.spec_decode import (
     build_parser as build_spec_decode_parser,
     build_pruning_scores,
+    build_verifier_score_mod,
     build_tree_processor,
     choose_deepest_valid_node,
     gather_path_indices,
     prune_drafted_tree,
     select_pruned_keep_indices,
+    verify_tree,
 )
-from src.trainer import Trainer, TrainerConfig, build_parser as build_trainer_parser
+from src.trainer import Trainer, TrainerConfig, build_parser as build_trainer_parser, build_prefill_attention_mask
 from src.trees import BlockTreeProcessor, PrunableTreeProcessor
+
+
+def _require_flex_attention() -> None:
+    try:
+        import torch.nn.attention.flex_attention  # noqa: F401
+    except ImportError:
+        pytest.skip("flex attention is unavailable in this test environment")
 
 
 def _build_fake_trainer_components(
@@ -221,6 +230,7 @@ def _make_trainer(
 
 
 def test_dflash_forward_shapes() -> None:
+    _require_flex_attention()
     Qwen3Config = pytest.importorskip("transformers.models.qwen3.modeling_qwen3").Qwen3Config
     config = Qwen3Config(
         vocab_size=128,
@@ -235,10 +245,10 @@ def test_dflash_forward_shapes() -> None:
     config.block_size = 8
     config.max_tree_size = 8
     config.dflash_config = {"mask_token_id": 1, "target_layer_ids": [0, 1]}
-    config._attn_implementation = "eager"
+    config._attn_implementation = "flex_attention"
 
     model = DFlashDraftModel(config)
-    model.config._attn_implementation = "eager"
+    model.config._attn_implementation = "flex_attention"
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
 
@@ -258,6 +268,7 @@ def test_dflash_forward_shapes() -> None:
 
 
 def test_dflash_forward_exposes_backbone_for_q_head() -> None:
+    _require_flex_attention()
     Qwen3Config = pytest.importorskip("transformers.models.qwen3.modeling_qwen3").Qwen3Config
     config = Qwen3Config(
         vocab_size=128,
@@ -272,11 +283,11 @@ def test_dflash_forward_exposes_backbone_for_q_head() -> None:
     config.block_size = 8
     config.max_tree_size = 8
     config.dflash_config = {"mask_token_id": 1, "target_layer_ids": [0, 1]}
-    config._attn_implementation = "eager"
+    config._attn_implementation = "flex_attention"
     config.use_q_head = True
 
     model = DFlashDraftModel(config)
-    model.config._attn_implementation = "eager"
+    model.config._attn_implementation = "flex_attention"
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
 
@@ -296,6 +307,7 @@ def test_dflash_forward_exposes_backbone_for_q_head() -> None:
 
 
 def test_dflash_ar_head_reuses_shared_lm_head() -> None:
+    _require_flex_attention()
     Qwen3Config = pytest.importorskip("transformers.models.qwen3.modeling_qwen3").Qwen3Config
     config = Qwen3Config(
         vocab_size=128,
@@ -310,11 +322,11 @@ def test_dflash_ar_head_reuses_shared_lm_head() -> None:
     config.block_size = 8
     config.max_tree_size = 8
     config.dflash_config = {"mask_token_id": 1, "target_layer_ids": [0, 1]}
-    config._attn_implementation = "eager"
+    config._attn_implementation = "flex_attention"
     config.use_ar_head = True
 
     model = DFlashDraftModel(config)
-    model.config._attn_implementation = "eager"
+    model.config._attn_implementation = "flex_attention"
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
 
@@ -814,9 +826,83 @@ def test_build_pruning_scores_prefers_ar_head_and_uses_shared_lm_head() -> None:
     assert pruning_scores[0].item() == pytest.approx(1.0)
 
 
+def test_build_prefill_attention_mask_uses_flex_block_mask() -> None:
+    _require_flex_attention()
+    document_mask = torch.tensor([[1, 1, 1, 2, 2, 0]], dtype=torch.long)
+    valid_mask = torch.tensor([[True, True, True, True, True, False]])
+
+    mask = build_prefill_attention_mask(document_mask, valid_mask)
+
+    assert mask is not None
+    assert type(mask).__name__ == "BlockMask"
+
+
+def test_build_verifier_score_mod_allows_prefix_and_blocks_non_ancestors() -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
+    score_mod = build_verifier_score_mod(tree_info=tree_info, prefix_len=3)
+    score = torch.tensor(0.0)
+
+    prefix_score = score_mod(score, 0, 0, torch.tensor(7), torch.tensor(1))
+    ancestor_tree_score = score_mod(score, 0, 0, torch.tensor(7), torch.tensor(3 + 5))
+    sibling_tree_score = score_mod(score, 0, 0, torch.tensor(7), torch.tensor(3 + 1))
+
+    assert torch.isfinite(prefix_score)
+    assert torch.isfinite(ancestor_tree_score)
+    assert torch.isneginf(sibling_tree_score)
+
+
+def test_verify_tree_uses_score_mod_without_dense_attention_mask() -> None:
+    class DummyCache:
+        def __init__(self, seq_len: int):
+            self.seq_len = seq_len
+
+        def get_seq_length(self):
+            return self.seq_len
+
+    class FakeRawDrafter:
+        def extract_ctx_features(self, hidden_states):
+            return hidden_states[0]
+
+    class FakeTargetModel:
+        def __call__(self, **kwargs):
+            self.kwargs = kwargs
+            hidden = torch.zeros((1, 8, 4), dtype=torch.float32)
+            logits = torch.zeros((1, 8, 16), dtype=torch.float32)
+            return type(
+                "Out",
+                (),
+                {
+                    "past_key_values": kwargs["past_key_values"],
+                    "logits": logits,
+                    "hidden_states": (hidden,),
+                },
+            )()
+
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
+    target_model = FakeTargetModel()
+    target_cache = DummyCache(seq_len=5)
+
+    verify_tree(
+        target_model=target_model,
+        raw_drafter=FakeRawDrafter(),
+        tree_token_ids=torch.arange(tree_info.block_size, dtype=torch.long),
+        tree_info=tree_info,
+        root_position=4,
+        target_cache=target_cache,
+        temperature=0.0,
+    )
+
+    assert target_model.kwargs["attention_mask"] is None
+    assert callable(target_model.kwargs["score_mod"])
+
+
 def test_parsers_accept_prunable_tree_type() -> None:
     trainer_tree_action = next(action for action in build_trainer_parser()._actions if action.dest == "tree_type")
     spec_tree_action = next(action for action in build_spec_decode_parser()._actions if action.dest == "tree_type")
 
     assert "prunable" in trainer_tree_action.choices
     assert "prunable" in spec_tree_action.choices
+    assert all(action.dest != "trainer.target_attn_implementation" for action in build_trainer_parser()._actions)
+    assert all(action.dest != "attn_implementation" for action in build_spec_decode_parser()._actions)

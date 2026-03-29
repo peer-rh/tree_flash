@@ -46,7 +46,6 @@ class TrainerConfig:
     min_lr: float = 1e-6
     seed: int = 42
     eval_batches: int = 32
-    target_attn_implementation: str = "sdpa"
     wandb_project: str = "tree-flash"
     wandb_run_name: str | None = None
     no_wandb: bool = False
@@ -69,24 +68,37 @@ def has_pruning_head(module) -> bool:
 def build_prefill_attention_mask(
     document_mask: torch.Tensor,
     valid_mask: torch.Tensor,
-) -> torch.Tensor:
+):
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+    except ImportError as exc:
+        raise RuntimeError(
+            "Flex attention is required for the target prefill path. "
+            "Install a PyTorch build that provides torch.nn.attention.flex_attention."
+        ) from exc
+
     batch_size, seq_len = document_mask.shape
-    device = document_mask.device
-    position_ids = torch.arange(seq_len, device=device)
-    q_pos = position_ids.view(1, seq_len, 1)
-    k_pos = position_ids.view(1, 1, seq_len)
-    same_doc = document_mask.unsqueeze(2) == document_mask.unsqueeze(1)
-    causal = k_pos <= q_pos
-    key_valid = valid_mask.unsqueeze(1)
-    query_valid = valid_mask.unsqueeze(2)
-    attend = same_doc & causal & key_valid & query_valid
 
-    eye = torch.eye(seq_len, dtype=torch.bool, device=device).unsqueeze(0).expand(batch_size, -1, -1)
-    attend = torch.where(query_valid, attend, eye)
+    def mask_mod(b, h, q_idx, kv_idx):
+        q_valid = valid_mask[b, q_idx]
+        invalid_self = (~q_valid) & (kv_idx == q_idx)
+        attend = (
+            q_valid
+            & valid_mask[b, kv_idx]
+            & (document_mask[b, kv_idx] == document_mask[b, q_idx])
+            & (kv_idx <= q_idx)
+        )
+        return invalid_self | attend
 
-    mask = torch.zeros((batch_size, 1, seq_len, seq_len), dtype=torch.float32, device=device)
-    mask.masked_fill_(~attend.unsqueeze(1), float("-inf"))
-    return mask
+    return create_block_mask(
+        mask_mod,
+        B=batch_size,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=document_mask.device,
+        BLOCK_SIZE=128,
+    )
 
 
 def build_drafter_block_mask(
@@ -217,7 +229,7 @@ class Trainer:
         self.target_model = AutoModelForCausalLM.from_pretrained(
             target,
             torch_dtype=load_dtype,
-            attn_implementation=config.target_attn_implementation,
+            attn_implementation="flex_attention",
         )
         if getattr(self.target_model.config, "pad_token_id", None) is None:
             self.target_model.config.pad_token_id = self.pad_token_id

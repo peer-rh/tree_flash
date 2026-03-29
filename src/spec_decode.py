@@ -79,19 +79,24 @@ def build_tree_processor(
         f"tree_type={tree_type!r} is not implemented for speculative decoding."
     )
 
-
-
-def build_verifier_attention_mask(
+def build_verifier_score_mod(
     *,
     tree_info: TreeInfo,
     prefix_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    tree_len = tree_info.block_size
-    left = torch.zeros((1, 1, tree_len, prefix_len), dtype=torch.float32, device=device)
-    right = torch.zeros((1, 1, tree_len, tree_len), dtype=torch.float32, device=device)
-    right.masked_fill_(~tree_info.tree_mask.view(1, 1, tree_len, tree_len), float("-inf"))
-    return torch.cat([left, right], dim=-1)
+):
+    tree_mask = tree_info.tree_mask
+    block_size = tree_info.block_size
+
+    def score_mod(score, B, H, Q, KV):
+        is_prefix = KV < prefix_len
+        tree_kv = KV - prefix_len
+        valid_tree = (tree_kv >= 0) & (tree_kv < block_size)
+        q_idx = Q.clamp(0, block_size - 1)
+        kv_idx = tree_kv.clamp(0, block_size - 1)
+        legal_tree = valid_tree & tree_mask[q_idx, kv_idx]
+        return torch.where(is_prefix | legal_tree, score, torch.full_like(score, float("-inf")))
+
+    return score_mod
 
 
 def trim_dynamic_cache(
@@ -284,23 +289,23 @@ def verify_tree(
     target_cache: Cache,
     temperature: float,
 ) -> tuple[Cache, torch.Tensor, torch.Tensor]:
-    device = tree_token_ids.device
     prefix_len = target_cache.get_seq_length()
-    attention_mask = build_verifier_attention_mask(
+    score_mod = build_verifier_score_mod(
         tree_info=tree_info,
         prefix_len=prefix_len,
-        device=device,
     )
+    device = tree_token_ids.device
     position_ids = (tree_info.depth.view(1, -1) + root_position).to(device)
     cache_position = torch.arange(prefix_len, prefix_len + tree_info.block_size, device=device)
     outputs = target_model(
         input_ids=tree_token_ids.unsqueeze(0),
         position_ids=position_ids,
-        attention_mask=attention_mask,
+        attention_mask=None,
         past_key_values=target_cache,
         use_cache=True,
         cache_position=cache_position,
         output_hidden_states=True,
+        score_mod=score_mod,
     )
     tree_ctx_features = raw_drafter.extract_ctx_features(outputs.hidden_states)
     return outputs.past_key_values, outputs.logits[0], tree_ctx_features
@@ -491,11 +496,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["bfloat16", "float16", "float32"],
         default="bfloat16",
     )
-    parser.add_argument(
-        "--attn-implementation",
-        choices=["sdpa", "eager", "flex_attention"],
-        default="sdpa",
-    )
     return parser
 
 
@@ -514,7 +514,7 @@ def main() -> None:
     target_model = AutoModelForCausalLM.from_pretrained(
         args.target_model,
         torch_dtype=dtype_map[args.dtype],
-        attn_implementation=args.attn_implementation,
+        attn_implementation="flex_attention",
     ).to(device)
     target_model.eval()
 
