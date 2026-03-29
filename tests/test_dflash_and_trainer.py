@@ -615,6 +615,61 @@ def test_train_batch_backwards_once_per_anchor_chunk(monkeypatch, tmp_path: Path
     assert len(trainer.fabric.backward_calls) == 2
 
 
+def test_train_batch_reports_acceptance_proxy(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+
+    result = trainer._train_batch(packed_batch)
+
+    assert result["acceptance_count"] > 0
+
+    target_ctx_features = trainer._prefill_target_context(packed_batch)
+    chunk_result = trainer._forward_anchor_chunk(
+        packed_batch,
+        target_ctx_features,
+        slice(0, packed_batch.num_anchors),
+        compute_predictions=True,
+    )
+    expected_total, expected_count = trainer._acceptance_proxy(
+        predictions=chunk_result["predictions"],
+        labels=packed_batch.tree_labels,
+        anchor_valid_mask=packed_batch.anchor_valid_mask,
+    )
+
+    assert result["acceptance_total"] == expected_total
+    assert result["acceptance_count"] == expected_count
+
+
+def test_train_batch_acceptance_proxy_is_chunk_invariant(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+
+    trainer_full = _make_trainer(
+        monkeypatch,
+        tmp_path / "full",
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+    trainer_chunked = _make_trainer(
+        monkeypatch,
+        tmp_path / "chunked",
+        anchor_chunk_size=1,
+        batch=packed_batch,
+    )
+
+    full_result = trainer_full._train_batch(packed_batch)
+    chunked_result = trainer_chunked._train_batch(packed_batch)
+
+    assert full_result["acceptance_total"] == chunked_result["acceptance_total"]
+    assert full_result["acceptance_count"] == chunked_result["acceptance_count"]
+
+
 def test_acceptance_proxy_matches_loop_reference(monkeypatch, tmp_path: Path) -> None:
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)

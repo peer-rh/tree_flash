@@ -641,6 +641,8 @@ class Trainer:
         total_loss_sum = torch.zeros((), device=self.fabric.device)
         total_q_loss_sum = torch.zeros((), device=self.fabric.device)
         total_ar_loss_sum = torch.zeros((), device=self.fabric.device)
+        acceptance_total = 0.0
+        acceptance_count = 0
         anchor_chunk = self.config.anchor_chunk_size or batch.num_anchors
 
         for start in range(0, batch.num_anchors, anchor_chunk):
@@ -649,13 +651,21 @@ class Trainer:
                 batch,
                 target_ctx_features,
                 slice(start, end),
-                compute_predictions=False,
+                compute_predictions=True,
             )
             if chunk_result["valid_count"] == 0:
                 continue
             chunk_loss_sum = chunk_result["loss_sum"]
             chunk_q_loss_sum = chunk_result["q_loss_sum"]
             chunk_ar_loss_sum = chunk_result["ar_loss_sum"]
+            if chunk_result["predictions"] is not None:
+                acceptance_chunk_total, acceptance_chunk_count = self._acceptance_proxy(
+                    predictions=chunk_result["predictions"],
+                    labels=batch.tree_labels[:, start:end],
+                    anchor_valid_mask=batch.anchor_valid_mask[:, start:end],
+                )
+                acceptance_total += acceptance_chunk_total
+                acceptance_count += acceptance_chunk_count
             scaled_chunk_loss = (
                 chunk_loss_sum
                 + self.config.q_loss_lambda * chunk_q_loss_sum
@@ -676,8 +686,8 @@ class Trainer:
             "q_loss": q_loss,
             "ar_loss": ar_loss,
             "valid_count": total_valid_count,
-            "acceptance_total": 0.0,
-            "acceptance_count": 0,
+            "acceptance_total": acceptance_total,
+            "acceptance_count": acceptance_count,
         }
 
     @torch.no_grad()
@@ -790,7 +800,8 @@ class Trainer:
         accumulated_loss = 0.0
         accumulated_q_loss = 0.0
         accumulated_ar_loss = 0.0
-        accumulated_acceptance = 0.0
+        accumulated_acceptance_total = 0.0
+        accumulated_acceptance_count = 0
         micro_step = 0
 
         for epoch_idx in range(self.config.num_epochs):
@@ -808,7 +819,8 @@ class Trainer:
                 accumulated_loss += float(loss.detach().item())
                 accumulated_q_loss += float(batch_result["q_loss"].detach().item())
                 accumulated_ar_loss += float(batch_result["ar_loss"].detach().item())
-                accumulated_acceptance += float(batch_result["acceptance_total"]/ batch_result["acceptance_count"] if batch_result["acceptance_count"] > 0 else 0.0)
+                accumulated_acceptance_total += float(batch_result["acceptance_total"])
+                accumulated_acceptance_count += int(batch_result["acceptance_count"])
 
                 if not is_final_micro:
                     if self.config.dev_run:
@@ -833,8 +845,9 @@ class Trainer:
                 avg_loss = accumulated_loss / max(self.config.grad_accum_steps, 1)
                 avg_q_loss = accumulated_q_loss / max(self.config.grad_accum_steps, 1)
                 avg_ar_loss = accumulated_ar_loss / max(self.config.grad_accum_steps, 1)
-                avg_acceptance = accumulated_acceptance / max(self.config.grad_accum_steps, 1) 
-                accumulated_acceptance = 0.0
+                avg_acceptance = accumulated_acceptance_total / max(accumulated_acceptance_count, 1)
+                accumulated_acceptance_total = 0.0
+                accumulated_acceptance_count = 0
                 accumulated_loss = 0.0
                 accumulated_q_loss = 0.0
                 accumulated_ar_loss = 0.0
