@@ -62,6 +62,10 @@ def unwrap_model(module):
     return raw
 
 
+def has_pruning_head(module) -> bool:
+    return getattr(module, "q_head", None) is not None or getattr(module, "ar_fusion", None) is not None
+
+
 def build_prefill_attention_mask(
     document_mask: torch.Tensor,
     valid_mask: torch.Tensor,
@@ -234,8 +238,10 @@ class Trainer:
         self.mask_token_id = self.raw_drafter.mask_token_id
         if self.mask_token_id is None:
             raise ValueError("The drafter config must define dflash_config.mask_token_id.")
-        if tree_type == "prunable" and getattr(self.raw_drafter, "q_head", None) is None:
-            raise ValueError("tree_type='prunable' requires a drafter checkpoint/config with use_q_head=True.")
+        if tree_type == "prunable" and not has_pruning_head(self.raw_drafter):
+            raise ValueError(
+                "tree_type='prunable' requires a drafter checkpoint/config with use_q_head=True or use_ar_head=True."
+            )
 
         if config.compile and hasattr(torch, "compile"):
             self.target_model = torch.compile(self.target_model)
@@ -339,6 +345,7 @@ class Trainer:
             return {
                 "loss_sum": target_ctx_features.new_zeros(()),
                 "q_loss_sum": target_ctx_features.new_zeros(()),
+                "ar_loss_sum": target_ctx_features.new_zeros(()),
                 "valid_count": 0,
                 "predictions": None,
             }
@@ -390,14 +397,40 @@ class Trainer:
                 reduction="none",
             )
             q_loss_sum = q_loss[flat_valid_mask].sum().to(draft_hidden_states.dtype)
+
+        ar_loss_sum = draft_hidden_states.new_zeros(())
+        if getattr(self.raw_drafter, "ar_fusion", None) is not None and flat_valid_mask.any():
+            parent_token_ids = self._build_parent_token_ids(tree_labels, tree_info)
+            parent_embeddings = self.target_embeddings(parent_token_ids.reshape(batch_size, num_blocks * block_size))
+            ar_hidden_states = self.raw_drafter.build_ar_hidden_states(backbone_hidden, parent_embeddings)
+            ar_loss_sum, _, _ = self._chunked_loss_and_predictions(
+                hidden_states=ar_hidden_states,
+                labels=tree_labels.reshape(batch_size, num_blocks * block_size),
+                weights=tree_cum_probs.reshape(batch_size, num_blocks * block_size),
+                valid_mask=flat_valid_mask,
+                compute_predictions=False,
+            )
         if predictions is not None:
             predictions = predictions.view(batch_size, num_blocks, block_size)
         return {
             "loss_sum": loss_sum,
             "q_loss_sum": q_loss_sum,
+            "ar_loss_sum": ar_loss_sum,
             "valid_count": valid_count,
             "predictions": predictions,
         }
+
+    def _build_parent_token_ids(
+        self,
+        tree_token_ids: torch.Tensor,
+        tree_info,
+    ) -> torch.Tensor:
+        parent_token_ids = tree_token_ids.clone()
+        if tree_info.block_size <= 1:
+            return parent_token_ids
+        parent_idx = tree_info.parent_idx.to(tree_token_ids.device)
+        parent_token_ids[..., 1:] = tree_token_ids.index_select(-1, parent_idx[1:])
+        return parent_token_ids
 
     def _chunked_loss_and_predictions(
         self,
@@ -484,6 +517,7 @@ class Trainer:
                 "loss": zero,
                 "ce_loss": zero,
                 "q_loss": zero,
+                "ar_loss": zero,
                 "valid_count": 0,
                 "acceptance_total": 0.0,
                 "acceptance_count": 0,
@@ -496,6 +530,7 @@ class Trainer:
                 "loss": zero,
                 "ce_loss": zero,
                 "q_loss": zero,
+                "ar_loss": zero,
                 "valid_count": 0,
                 "acceptance_total": 0.0,
                 "acceptance_count": 0,
@@ -504,6 +539,7 @@ class Trainer:
         target_ctx_features = self._prefill_target_context(batch)
         total_loss_sum = torch.zeros((), device=self.fabric.device)
         total_q_loss_sum = torch.zeros((), device=self.fabric.device)
+        total_ar_loss_sum = torch.zeros((), device=self.fabric.device)
         anchor_chunk = self.config.anchor_chunk_size or batch.num_anchors
 
         for start in range(0, batch.num_anchors, anchor_chunk):
@@ -518,20 +554,26 @@ class Trainer:
                 continue
             chunk_loss_sum = chunk_result["loss_sum"]
             chunk_q_loss_sum = chunk_result["q_loss_sum"]
+            chunk_ar_loss_sum = chunk_result["ar_loss_sum"]
             scaled_chunk_loss = (
-                chunk_loss_sum + self.config.q_loss_lambda * chunk_q_loss_sum
+                chunk_loss_sum
+                + self.config.q_loss_lambda * chunk_q_loss_sum
+                + self.config.ar_loss_lambda * chunk_ar_loss_sum
             ) / total_valid_count / max(self.config.grad_accum_steps, 1)
             self.fabric.backward(scaled_chunk_loss)
             total_loss_sum = total_loss_sum + chunk_loss_sum.detach()
             total_q_loss_sum = total_q_loss_sum + chunk_q_loss_sum.detach()
+            total_ar_loss_sum = total_ar_loss_sum + chunk_ar_loss_sum.detach()
 
         ce_loss = total_loss_sum / total_valid_count
         q_loss = total_q_loss_sum / total_valid_count
-        loss = ce_loss + self.config.q_loss_lambda * q_loss
+        ar_loss = total_ar_loss_sum / total_valid_count
+        loss = ce_loss + self.config.q_loss_lambda * q_loss + self.config.ar_loss_lambda * ar_loss
         return {
             "loss": loss,
             "ce_loss": ce_loss,
             "q_loss": q_loss,
+            "ar_loss": ar_loss,
             "valid_count": total_valid_count,
             "acceptance_total": 0.0,
             "acceptance_count": 0,
@@ -549,6 +591,7 @@ class Trainer:
                 "loss": zero,
                 "ce_loss": zero,
                 "q_loss": zero,
+                "ar_loss": zero,
                 "valid_count": 0,
                 "acceptance_total": 0.0,
                 "acceptance_count": 0,
@@ -561,6 +604,7 @@ class Trainer:
                 "loss": zero,
                 "ce_loss": zero,
                 "q_loss": zero,
+                "ar_loss": zero,
                 "valid_count": 0,
                 "acceptance_total": 0.0,
                 "acceptance_count": 0,
@@ -569,6 +613,7 @@ class Trainer:
         target_ctx_features = self._prefill_target_context(batch)
         total_loss_sum = torch.zeros((), device=self.fabric.device)
         total_q_loss_sum = torch.zeros((), device=self.fabric.device)
+        total_ar_loss_sum = torch.zeros((), device=self.fabric.device)
         acceptance_total = 0.0
         acceptance_count = 0
         anchor_chunk = self.config.anchor_chunk_size or batch.num_anchors
@@ -583,6 +628,7 @@ class Trainer:
             )
             total_loss_sum = total_loss_sum + chunk_result["loss_sum"]
             total_q_loss_sum = total_q_loss_sum + chunk_result["q_loss_sum"]
+            total_ar_loss_sum = total_ar_loss_sum + chunk_result["ar_loss_sum"]
             if chunk_result["predictions"] is not None:
                 acceptance_chunk_total, acceptance_chunk_count = self._acceptance_proxy(
                     predictions=chunk_result["predictions"],
@@ -594,11 +640,13 @@ class Trainer:
 
         ce_loss = total_loss_sum / total_valid_count
         q_loss = total_q_loss_sum / total_valid_count
-        loss = ce_loss + self.config.q_loss_lambda * q_loss
+        ar_loss = total_ar_loss_sum / total_valid_count
+        loss = ce_loss + self.config.q_loss_lambda * q_loss + self.config.ar_loss_lambda * ar_loss
         return {
             "loss": loss,
             "ce_loss": ce_loss,
             "q_loss": q_loss,
+            "ar_loss": ar_loss,
             "valid_count": total_valid_count,
             "acceptance_total": acceptance_total,
             "acceptance_count": acceptance_count,
@@ -644,6 +692,7 @@ class Trainer:
         optimizer_step = self.global_step
         accumulated_loss = 0.0
         accumulated_q_loss = 0.0
+        accumulated_ar_loss = 0.0
         micro_step = 0
 
         for epoch_idx in range(self.config.num_epochs):
@@ -660,6 +709,7 @@ class Trainer:
                     loss = batch_result["loss"]
                 accumulated_loss += float(loss.detach().item())
                 accumulated_q_loss += float(batch_result["q_loss"].detach().item())
+                accumulated_ar_loss += float(batch_result["ar_loss"].detach().item())
 
                 if not is_final_micro:
                     if self.config.dev_run:
@@ -683,8 +733,10 @@ class Trainer:
 
                 avg_loss = accumulated_loss / max(self.config.grad_accum_steps, 1)
                 avg_q_loss = accumulated_q_loss / max(self.config.grad_accum_steps, 1)
+                avg_ar_loss = accumulated_ar_loss / max(self.config.grad_accum_steps, 1)
                 accumulated_loss = 0.0
                 accumulated_q_loss = 0.0
+                accumulated_ar_loss = 0.0
                 if self.fabric.is_global_zero and (
                     self.config.verbose or self.global_step % self.config.log_every == 0
                 ):
@@ -697,6 +749,7 @@ class Trainer:
                         {
                             "train/loss": avg_loss,
                             "train/q_loss": avg_q_loss,
+                            "train/ar_loss": avg_ar_loss,
                             "train/lr": lr,
                         },
                         self.global_step,
@@ -761,6 +814,7 @@ class Trainer:
         self.drafter_model.eval()
         total_loss = 0.0
         total_q_loss = 0.0
+        total_ar_loss = 0.0
         total_valid = 0
         total_acceptance = 0.0
         total_acceptance_count = 0
@@ -771,6 +825,7 @@ class Trainer:
             batch_result = self._eval_batch(batch)
             total_loss += float(batch_result["loss"].item()) * max(batch_result["valid_count"], 1)
             total_q_loss += float(batch_result["q_loss"].item()) * max(batch_result["valid_count"], 1)
+            total_ar_loss += float(batch_result["ar_loss"].item()) * max(batch_result["valid_count"], 1)
             total_valid += batch_result["valid_count"]
             total_acceptance += batch_result["acceptance_total"]
             total_acceptance_count += batch_result["acceptance_count"]
@@ -781,13 +836,16 @@ class Trainer:
         if total_valid == 0:
             eval_loss = 0.0
             eval_q_loss = 0.0
+            eval_ar_loss = 0.0
         else:
             eval_loss = total_loss / total_valid
             eval_q_loss = total_q_loss / total_valid
+            eval_ar_loss = total_ar_loss / total_valid
         mean_acceptance = total_acceptance / max(total_acceptance_count, 1)
         return {
             "eval/loss": eval_loss,
             "eval/q_loss": eval_q_loss,
+            "eval/ar_loss": eval_ar_loss,
             "eval/mean_acceptance_length": mean_acceptance,
         }
 

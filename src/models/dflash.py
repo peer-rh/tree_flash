@@ -239,6 +239,14 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             self.config.use_q_head = False
         if self.config.use_q_head:
             self.q_head = nn.Linear(config.hidden_size, 1, bias=False)
+
+        self.ar_fusion = None
+        self.ar_norm = None
+        if not hasattr(config, "use_ar_head"):
+            self.config.use_ar_head = False
+        if self.config.use_ar_head:
+            self.ar_fusion = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+            self.ar_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
         self.post_init()
 
@@ -253,6 +261,29 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             return hidden_states.view(batch_size, seq_len, n_layers * hidden_size)
         return hidden_states
 
+    def encode_target_ctx(
+        self,
+        target_ctx_features: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if target_ctx_features is None:
+            return None
+        return self.hidden_norm(self.fc(target_ctx_features))
+
+    def build_ar_hidden_states(
+        self,
+        backbone_hidden_states: torch.Tensor,
+        parent_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.ar_fusion is None or self.ar_norm is None:
+            raise ValueError("AR head is not enabled on this drafter config.")
+        if backbone_hidden_states.shape != parent_embeddings.shape:
+            raise ValueError(
+                "backbone_hidden_states and parent_embeddings must have matching shapes, "
+                f"got {tuple(backbone_hidden_states.shape)} and {tuple(parent_embeddings.shape)}."
+            )
+        ar_inputs = torch.cat([backbone_hidden_states, parent_embeddings], dim=-1)
+        return self.ar_norm(self.ar_fusion(ar_inputs))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -264,8 +295,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         use_cache: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if target_ctx_features is not None:
-            target_ctx_features = self.hidden_norm(self.fc(target_ctx_features))
+        target_ctx_features = self.encode_target_ctx(target_ctx_features)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         if self.config.use_tree_pos_emb:
             tree_pos_ids = tree_info.tree_position_ids

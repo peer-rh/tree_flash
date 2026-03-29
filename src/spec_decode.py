@@ -10,7 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import Cache, DynamicCache
 
 from .models import DFlashDraftModel
-from .trainer import unwrap_model
+from .trainer import has_pruning_head, unwrap_model
 from .trees import (
     BlockTreeProcessor,
     BranchOffTreeProcessor,
@@ -88,12 +88,6 @@ def build_verifier_attention_mask(
     device: torch.device,
 ) -> torch.Tensor:
     tree_len = tree_info.block_size
-    # TODO: Finish this
-    def score_mask_mod(score, B, H, Q, KV):
-        torch.where(
-            KV 
-        )
-
     left = torch.zeros((1, 1, tree_len, prefix_len), dtype=torch.float32, device=device)
     right = torch.zeros((1, 1, tree_len, tree_len), dtype=torch.float32, device=device)
     right.masked_fill_(~tree_info.tree_mask.view(1, 1, tree_len, tree_len), float("-inf"))
@@ -196,6 +190,41 @@ def prune_drafted_tree(
     )
 
 
+def build_tree_parent_token_ids(
+    tree_token_ids: torch.Tensor,
+    tree_info: TreeInfo,
+) -> torch.Tensor:
+    parent_token_ids = tree_token_ids.clone()
+    if tree_info.block_size <= 1:
+        return parent_token_ids
+    parent_idx = tree_info.parent_idx.to(tree_token_ids.device)
+    parent_token_ids[1:] = tree_token_ids.index_select(0, parent_idx[1:])
+    return parent_token_ids
+
+
+def build_pruning_scores(
+    *,
+    raw_drafter,
+    backbone_hidden: torch.Tensor,
+    tree_token_ids: torch.Tensor,
+    tree_info: TreeInfo,
+    target_embeddings,
+    target_lm_head,
+    temperature: float,
+) -> torch.Tensor | None:
+    if getattr(raw_drafter, "ar_fusion", None) is not None:
+        parent_token_ids = build_tree_parent_token_ids(tree_token_ids, tree_info)
+        parent_embeddings = target_embeddings(parent_token_ids.unsqueeze(0))
+        ar_hidden_states = raw_drafter.build_ar_hidden_states(backbone_hidden, parent_embeddings)
+        ar_logits = target_lm_head(ar_hidden_states)[0]
+        ar_scores = gather_token_probability(ar_logits, tree_token_ids, temperature)
+        ar_scores[0] = 1.0
+        return ar_scores
+    if getattr(raw_drafter, "q_head", None) is not None:
+        return torch.sigmoid(raw_drafter.q_head(backbone_hidden)[0, :, 0]).to(torch.float32)
+    return None
+
+
 def draft_tree(
     *,
     drafter_model,
@@ -233,10 +262,16 @@ def draft_tree(
     tree_token_ids[0] = current_root_token
     draft_token_probs = gather_token_probability(draft_logits, tree_token_ids, temperature)
     draft_token_probs[0] = 1.0
-    q_scores = None
-    if getattr(raw_drafter, "q_head", None) is not None:
-        q_scores = torch.sigmoid(raw_drafter.q_head(backbone_hidden)[0, :, 0]).to(torch.float32)
-    return tree_token_ids, draft_logits, draft_token_probs, tree_info, q_scores
+    pruning_scores = build_pruning_scores(
+        raw_drafter=raw_drafter,
+        backbone_hidden=backbone_hidden,
+        tree_token_ids=tree_token_ids,
+        tree_info=tree_info,
+        target_embeddings=target_embeddings,
+        target_lm_head=target_lm_head,
+        temperature=temperature,
+    )
+    return tree_token_ids, draft_logits, draft_token_probs, tree_info, pruning_scores
 
 
 def verify_tree(
@@ -315,8 +350,10 @@ def speculative_generate(
 ) -> SpecDecodeResult:
     device = next(target_model.parameters()).device
     raw_drafter = unwrap_model(drafter_model)
-    if isinstance(tree_processor, PrunableTreeProcessor) and getattr(raw_drafter, "q_head", None) is None:
-        raise ValueError("tree_type='prunable' requires a drafter checkpoint/config with use_q_head=True.")
+    if isinstance(tree_processor, PrunableTreeProcessor) and not has_pruning_head(raw_drafter):
+        raise ValueError(
+            "tree_type='prunable' requires a drafter checkpoint/config with use_q_head=True or use_ar_head=True."
+        )
     prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
     target_cache = DynamicCache()
     prefill_outputs = target_model(
@@ -351,7 +388,7 @@ def speculative_generate(
         prefix_len = target_cache.get_seq_length()
 
         root_position = output_ids.shape[0] - 1
-        tree_token_ids, draft_logits, draft_token_probs, tree_info, q_scores = draft_tree(
+        tree_token_ids, draft_logits, draft_token_probs, tree_info, pruning_scores = draft_tree(
             drafter_model=drafter_model,
             raw_drafter=raw_drafter,
             target_embeddings=target_embeddings,
@@ -366,14 +403,14 @@ def speculative_generate(
         )
         drafted_tokens += tree_info.block_size - 1
         if isinstance(tree_processor, PrunableTreeProcessor):
-            if q_scores is None:
-                raise ValueError("Prunable speculative decoding requires q_head scores.")
+            if pruning_scores is None:
+                raise ValueError("Prunable speculative decoding requires q_head or AR-head scores.")
             tree_token_ids, draft_logits, draft_token_probs, tree_info = prune_drafted_tree(
                 tree_token_ids=tree_token_ids,
                 draft_logits=draft_logits,
                 draft_token_probs=draft_token_probs,
                 tree_info=tree_info,
-                q_scores=q_scores,
+                q_scores=pruning_scores,
                 prune_topk=tree_processor.prune_topk,
             )
 

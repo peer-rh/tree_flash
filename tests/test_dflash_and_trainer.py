@@ -15,6 +15,7 @@ from src.data import DataModuleConfig, PackedBatch
 from src.models.dflash import DFlashDraftModel
 from src.spec_decode import (
     build_parser as build_spec_decode_parser,
+    build_pruning_scores,
     build_tree_processor,
     choose_deepest_valid_node,
     gather_path_indices,
@@ -25,7 +26,12 @@ from src.trainer import Trainer, TrainerConfig, build_parser as build_trainer_pa
 from src.trees import BlockTreeProcessor, PrunableTreeProcessor
 
 
-def _build_fake_trainer_components(block_size: int, *, with_q_head: bool = False):
+def _build_fake_trainer_components(
+    block_size: int,
+    *,
+    with_q_head: bool = False,
+    with_ar_head: bool = False,
+):
     class FakeFabric:
         instances: list["FakeFabric"] = []
 
@@ -113,6 +119,7 @@ def _build_fake_trainer_components(block_size: int, *, with_q_head: bool = False
             super().__init__()
             self.proj = nn.Linear(16, 16)
             self.q_head = nn.Linear(16, 1, bias=False) if with_q_head else None
+            self.ar_fusion = nn.Linear(32, 16, bias=False) if with_ar_head else None
 
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
@@ -120,6 +127,11 @@ def _build_fake_trainer_components(block_size: int, *, with_q_head: bool = False
 
         def extract_ctx_features(self, hidden_states):
             return torch.cat(hidden_states[1:], dim=-1)
+
+        def build_ar_hidden_states(self, backbone_hidden_states, parent_embeddings):
+            if self.ar_fusion is None:
+                raise ValueError("AR head is not enabled")
+            return self.ar_fusion(torch.cat([backbone_hidden_states, parent_embeddings], dim=-1))
 
         def forward(self, *, hidden_states, position_ids, tree_info, attention_mask, target_ctx_features):
             return self.proj(hidden_states), hidden_states
@@ -159,9 +171,11 @@ def _make_trainer(
     anchor_chunk_size: int | None,
     batch: PackedBatch,
     with_q_head: bool = False,
+    with_ar_head: bool = False,
     tree_type: str = "block",
     tree_args: dict | None = None,
     q_loss_lambda: float = 1.0,
+    ar_loss_lambda: float = 0.1,
 ) -> Trainer:
     import src.trainer as trainer_mod
 
@@ -169,6 +183,7 @@ def _make_trainer(
     FakeFabric, FakeTokenizer, FakeTargetModel, FakeDrafter, _ = _build_fake_trainer_components(
         tree_processor.block_size,
         with_q_head=with_q_head,
+        with_ar_head=with_ar_head,
     )
 
     monkeypatch.setattr(trainer_mod, "Fabric", FakeFabric)
@@ -191,6 +206,7 @@ def _make_trainer(
             precision="32-true",
             anchor_chunk_size=anchor_chunk_size,
             q_loss_lambda=q_loss_lambda,
+            ar_loss_lambda=ar_loss_lambda,
         ),
         target="fake-target",
         data=DataModuleConfig(
@@ -277,6 +293,49 @@ def test_dflash_forward_exposes_backbone_for_q_head() -> None:
     )
     q_logits = model.q_head(backbone_hidden)
     assert q_logits.shape == (1, tree_processor.block_size, 1)
+
+
+def test_dflash_ar_head_reuses_shared_lm_head() -> None:
+    Qwen3Config = pytest.importorskip("transformers.models.qwen3.modeling_qwen3").Qwen3Config
+    config = Qwen3Config(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=64,
+    )
+    config.num_target_layers = 2
+    config.block_size = 8
+    config.max_tree_size = 8
+    config.dflash_config = {"mask_token_id": 1, "target_layer_ids": [0, 1]}
+    config._attn_implementation = "eager"
+    config.use_ar_head = True
+
+    model = DFlashDraftModel(config)
+    model.config._attn_implementation = "eager"
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
+
+    hidden_states = torch.randn(1, tree_processor.block_size, config.hidden_size)
+    parent_embeddings = torch.randn_like(hidden_states)
+    position_ids = torch.arange(tree_processor.block_size).unsqueeze(0)
+    target_ctx_features = torch.randn(1, 6, len(model.target_layer_ids) * config.hidden_size)
+    shared_lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    _, backbone_hidden = model(
+        hidden_states=hidden_states,
+        position_ids=position_ids,
+        tree_info=tree_info,
+        target_ctx_features=target_ctx_features,
+        attention_mask=None,
+    )
+    ar_hidden = model.build_ar_hidden_states(backbone_hidden, parent_embeddings)
+    ar_logits = shared_lm_head(ar_hidden)
+
+    assert ar_hidden.shape == hidden_states.shape
+    assert ar_logits.shape == (1, tree_processor.block_size, config.vocab_size)
 
 
 def test_trainer_smoke_with_fakes(monkeypatch, tmp_path: Path) -> None:
@@ -393,6 +452,24 @@ def test_train_batch_adds_q_loss_when_q_head_is_present(monkeypatch, tmp_path: P
     assert torch.isclose(result["loss"], result["ce_loss"] + 0.5 * result["q_loss"])
 
 
+def test_train_batch_adds_ar_loss_when_ar_head_is_present(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size, with_ar_head=True)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+        with_ar_head=True,
+        ar_loss_lambda=0.25,
+    )
+
+    result = trainer._train_batch(packed_batch)
+
+    assert result["ar_loss"].item() > 0
+    assert torch.isclose(result["loss"], result["ce_loss"] + 0.25 * result["ar_loss"])
+
+
 def test_q_loss_respects_non_root_valid_mask(monkeypatch, tmp_path: Path) -> None:
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size, with_q_head=True)
@@ -428,6 +505,43 @@ def test_q_loss_respects_non_root_valid_mask(monkeypatch, tmp_path: Path) -> Non
 
     assert chunk_result["valid_count"] == 0
     assert float(chunk_result["q_loss_sum"].item()) == 0.0
+
+
+def test_ar_loss_respects_non_root_valid_mask(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size, with_ar_head=True)
+    masked_batch = PackedBatch(
+        input_ids=packed_batch.input_ids,
+        position_ids=packed_batch.position_ids,
+        document_mask=packed_batch.document_mask,
+        context_valid_mask=packed_batch.context_valid_mask,
+        anchor_positions=packed_batch.anchor_positions,
+        anchor_document_ids=packed_batch.anchor_document_ids,
+        anchor_valid_mask=packed_batch.anchor_valid_mask,
+        tree_labels=packed_batch.tree_labels,
+        tree_noise_ids=packed_batch.tree_noise_ids,
+        tree_position_ids=packed_batch.tree_position_ids,
+        tree_cum_probs=packed_batch.tree_cum_probs,
+        tree_valid_mask=torch.zeros_like(packed_batch.tree_valid_mask),
+    )
+    masked_batch.tree_valid_mask[:, :, 0] = True
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=masked_batch,
+        with_ar_head=True,
+    )
+
+    chunk_result = trainer._forward_anchor_chunk(
+        masked_batch,
+        trainer._prefill_target_context(masked_batch),
+        slice(0, masked_batch.num_anchors),
+        compute_predictions=False,
+    )
+
+    assert chunk_result["valid_count"] == 0
+    assert float(chunk_result["ar_loss_sum"].item()) == 0.0
 
 
 def test_train_batch_skips_backward_when_no_valid_targets(monkeypatch, tmp_path: Path) -> None:
@@ -566,11 +680,28 @@ def test_trainer_accepts_prunable_tree_type(monkeypatch, tmp_path: Path) -> None
     assert trainer.tree_processor.prune_topk == 2
 
 
+def test_trainer_accepts_prunable_tree_type_with_ar_head(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size, with_ar_head=True)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+        with_ar_head=True,
+        tree_type="prunable",
+        tree_args={"base_tree_type": "block", "prune_topk": 2},
+    )
+
+    assert isinstance(trainer.tree_processor, PrunableTreeProcessor)
+    assert trainer.tree_processor.prune_topk == 2
+
+
 def test_trainer_prunable_requires_q_head(monkeypatch, tmp_path: Path) -> None:
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
 
-    with pytest.raises(ValueError, match="use_q_head"):
+    with pytest.raises(ValueError, match="use_q_head=True or use_ar_head=True"):
         _make_trainer(
             monkeypatch,
             tmp_path,
@@ -654,6 +785,33 @@ def test_prune_drafted_tree_supports_root_only_and_branch_off_base() -> None:
     assert pruned_tokens.tolist() == [0]
     assert pruned_logits.shape[0] == 1
     assert pruned_probs.tolist() == [1.0]
+
+
+def test_build_pruning_scores_prefers_ar_head_and_uses_shared_lm_head() -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
+    _, _, fake_target_model_cls, fake_drafter_cls, _ = _build_fake_trainer_components(
+        tree_processor.block_size,
+        with_ar_head=True,
+    )
+    raw_drafter = fake_drafter_cls()
+    target_model = fake_target_model_cls()
+    backbone_hidden = torch.randn(1, tree_info.block_size, 16)
+    tree_token_ids = torch.arange(tree_info.block_size, dtype=torch.long) % 32
+
+    pruning_scores = build_pruning_scores(
+        raw_drafter=raw_drafter,
+        backbone_hidden=backbone_hidden,
+        tree_token_ids=tree_token_ids,
+        tree_info=tree_info,
+        target_embeddings=target_model.get_input_embeddings(),
+        target_lm_head=target_model.get_output_embeddings(),
+        temperature=0.0,
+    )
+
+    assert pruning_scores is not None
+    assert pruning_scores.shape == (tree_info.block_size,)
+    assert pruning_scores[0].item() == pytest.approx(1.0)
 
 
 def test_parsers_accept_prunable_tree_type() -> None:
