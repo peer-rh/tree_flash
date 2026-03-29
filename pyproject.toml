@@ -8,7 +8,7 @@ dependencies = [
     "h5py>=3.10.0",
     "jsonargparse>=4.32.0",
     "lightning>=2.4.0",
-    "torch>=2.9.0",
+    "torch==2.9.0",
     "transformers>=4.55.0",
     "wandb>=0.18.0",
 ]

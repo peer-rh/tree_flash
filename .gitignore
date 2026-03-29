@@ -4,3 +4,4 @@ __pycache__
 datasets
 .pytest_cache
 /experiments/**/outputs/
+checkpoints

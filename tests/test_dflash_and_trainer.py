@@ -526,6 +526,107 @@ def test_train_batch_backwards_once_per_anchor_chunk(monkeypatch, tmp_path: Path
     assert len(trainer.fabric.backward_calls) == 2
 
 
+def test_acceptance_proxy_matches_loop_reference(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+
+    batch_size = 2
+    num_anchors = 3
+    block_size = trainer.tree_processor.block_size
+    predictions = torch.randint(0, 20, (batch_size, num_anchors, block_size), dtype=torch.long)
+    labels = torch.randint(0, 20, (batch_size, num_anchors, block_size), dtype=torch.long)
+    anchor_valid_mask = torch.tensor(
+        [[True, False, True], [True, True, False]],
+        dtype=torch.bool,
+    )
+
+    future_primary_indices = trainer.tree_processor.primary_path_indices[1:]
+    if future_primary_indices.numel() > 0:
+        predictions[0, 0, future_primary_indices] = labels[0, 0, future_primary_indices]
+        predictions[0, 2, future_primary_indices[0]] = labels[0, 2, future_primary_indices[0]]
+        predictions[0, 2, future_primary_indices[1:]] = labels[0, 2, future_primary_indices[1:]] + 1
+        predictions[1, 0, future_primary_indices] = labels[1, 0, future_primary_indices] + 1
+        predictions[1, 1, future_primary_indices] = labels[1, 1, future_primary_indices]
+
+    total, count = trainer._acceptance_proxy(
+        predictions=predictions,
+        labels=labels,
+        anchor_valid_mask=anchor_valid_mask,
+    )
+
+    pred_primary = predictions[:, :, future_primary_indices]
+    label_primary = labels[:, :, future_primary_indices]
+    expected_total = 0.0
+    expected_count = 0
+    for batch_idx in range(batch_size):
+        for anchor_idx in range(num_anchors):
+            if not bool(anchor_valid_mask[batch_idx, anchor_idx]):
+                continue
+            accepted = 0
+            for depth_idx in range(pred_primary.shape[-1]):
+                if pred_primary[batch_idx, anchor_idx, depth_idx] != label_primary[batch_idx, anchor_idx, depth_idx]:
+                    break
+                accepted += 1
+            expected_total += float(accepted)
+            expected_count += 1
+
+    assert total == expected_total
+    assert count == expected_count
+
+
+def test_acceptance_proxy_returns_zero_for_empty_predictions(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+
+    predictions = torch.empty((0, 0, 0), dtype=torch.long)
+    labels = torch.empty((0, 0, 0), dtype=torch.long)
+    anchor_valid_mask = torch.empty((0, 0), dtype=torch.bool)
+    total, count = trainer._acceptance_proxy(
+        predictions=predictions,
+        labels=labels,
+        anchor_valid_mask=anchor_valid_mask,
+    )
+
+    assert total == 0.0
+    assert count == 0
+
+
+def test_acceptance_proxy_returns_zero_for_degenerate_primary_path(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+
+    trainer.tree_processor.primary_path_indices = torch.tensor([0], dtype=torch.long)
+    predictions = torch.zeros((1, 1, trainer.tree_processor.block_size), dtype=torch.long)
+    labels = torch.zeros_like(predictions)
+    anchor_valid_mask = torch.tensor([[True]], dtype=torch.bool)
+    total, count = trainer._acceptance_proxy(
+        predictions=predictions,
+        labels=labels,
+        anchor_valid_mask=anchor_valid_mask,
+    )
+
+    assert total == 0.0
+    assert count == 0
+
+
 def test_train_batch_adds_q_loss_when_q_head_is_present(monkeypatch, tmp_path: Path) -> None:
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size, with_q_head=True)

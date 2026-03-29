@@ -441,9 +441,20 @@ class Trainer:
             tree_valid_mask=tree_valid_mask,
             block_size=block_size,
         )
+        # if self.config.verbose:
+        #     print("Drafter Mask:", drafter_mask[0,0])
+        #     print("Anchor Positions:", anchor_positions[0,0])
+        #     print("Tree Position Ids:", tree_position_ids[0,0])
+        #     print("Tree Labels:", tree_labels[0,0])
+
+
+        position_ids_with_seq = torch.cat((
+            batch.position_ids,
+            tree_position_ids.reshape(batch_size, num_blocks * block_size),
+        ), dim=1)
         draft_hidden_states, backbone_hidden = self.drafter_model(
             hidden_states=noise_embeddings,
-            position_ids=tree_position_ids.reshape(batch_size, num_blocks * block_size),
+            position_ids=position_ids_with_seq,
             tree_info=tree_info,
             attention_mask=drafter_mask,
             target_ctx_features=target_ctx_features,
@@ -549,7 +560,7 @@ class Trainer:
         for start in range(0, flat_hidden.shape[0], chunk_size):
             end = min(start + chunk_size, flat_hidden.shape[0])
             chunk_hidden = flat_hidden[start:end]
-            logits = self.target_lm_head(chunk_hidden)
+            logits = self.target_lm_head(chunk_hidden.to(self.target_lm_head.weight.dtype))
             if compute_predictions and predictions is not None:
                 predictions[start:end] = logits.argmax(dim=-1)
             ce = F.cross_entropy(
@@ -758,20 +769,16 @@ class Trainer:
         pred_primary = predictions[:, :, future_primary_indices]
         label_primary = labels[:, :, future_primary_indices]
 
-        total = 0.0
-        count = 0
-        # TODO: Vectorize
-        for batch_idx in range(pred_primary.shape[0]):
-            for anchor_idx in range(pred_primary.shape[1]):
-                if not bool(anchor_valid_mask[batch_idx, anchor_idx].item()):
-                    continue
-                accepted = 0
-                for depth_idx in range(pred_primary.shape[-1]):
-                    if pred_primary[batch_idx, anchor_idx, depth_idx] != label_primary[batch_idx, anchor_idx, depth_idx]:
-                        break
-                    accepted += 1
-                total += accepted
-                count += 1
+        mismatches = pred_primary.ne(label_primary)
+        has_mismatch = mismatches.any(dim=-1)
+        first_mismatch = mismatches.to(torch.int64).argmax(dim=-1)
+        full_depth = torch.full_like(first_mismatch, pred_primary.shape[-1])
+        accepted_depth = torch.where(has_mismatch, first_mismatch, full_depth)
+
+        valid_mask = anchor_valid_mask.to(torch.bool)
+        accepted_valid = accepted_depth.masked_select(valid_mask)
+        total = float(accepted_valid.sum().item())
+        count = int(valid_mask.sum().item())
         return total, count
 
     def fit(self):
@@ -783,6 +790,7 @@ class Trainer:
         accumulated_loss = 0.0
         accumulated_q_loss = 0.0
         accumulated_ar_loss = 0.0
+        accumulated_acceptance = 0.0
         micro_step = 0
 
         for epoch_idx in range(self.config.num_epochs):
@@ -800,6 +808,7 @@ class Trainer:
                 accumulated_loss += float(loss.detach().item())
                 accumulated_q_loss += float(batch_result["q_loss"].detach().item())
                 accumulated_ar_loss += float(batch_result["ar_loss"].detach().item())
+                accumulated_acceptance += float(batch_result["acceptance_total"]/ batch_result["acceptance_count"] if batch_result["acceptance_count"] > 0 else 0.0)
 
                 if not is_final_micro:
                     if self.config.dev_run:
@@ -824,6 +833,8 @@ class Trainer:
                 avg_loss = accumulated_loss / max(self.config.grad_accum_steps, 1)
                 avg_q_loss = accumulated_q_loss / max(self.config.grad_accum_steps, 1)
                 avg_ar_loss = accumulated_ar_loss / max(self.config.grad_accum_steps, 1)
+                avg_acceptance = accumulated_acceptance / max(self.config.grad_accum_steps, 1) 
+                accumulated_acceptance = 0.0
                 accumulated_loss = 0.0
                 accumulated_q_loss = 0.0
                 accumulated_ar_loss = 0.0
@@ -840,6 +851,7 @@ class Trainer:
                             "train/loss": avg_loss,
                             "train/q_loss": avg_q_loss,
                             "train/ar_loss": avg_ar_loss,
+                            'train/acceptance_proxy': avg_acceptance,
                             "train/lr": lr,
                         },
                         self.global_step,

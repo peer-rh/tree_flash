@@ -326,6 +326,10 @@ def draft_tree(
     noise_ids[0, 0] = current_root_token
     noise_embeddings = target_embeddings(noise_ids)
     position_ids = (tree_info.depth.view(1, -1) + root_position).to(device)
+    position_ids = torch.cat([
+        torch.arange(pre_len, pre_len + target_ctx_features.shape[1], device=device),
+        position_ids.squeeze(0),
+    ], dim=1)
     draft_hidden_states, backbone_hidden = drafter_model(
         hidden_states=noise_embeddings,
         position_ids=position_ids,
