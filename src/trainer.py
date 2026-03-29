@@ -67,6 +67,175 @@ def has_pruning_head(module) -> bool:
     return getattr(module, "q_head", None) is not None or getattr(module, "ar_block", None) is not None
 
 
+class TrainerValidTargetCounter(torch.nn.Module):
+    def forward(
+        self,
+        tree_valid_mask: torch.Tensor,
+        anchor_valid_mask: torch.Tensor,
+        non_root_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        valid_mask = (
+            tree_valid_mask
+            & non_root_mask.view(1, 1, -1)
+            & anchor_valid_mask.unsqueeze(-1)
+        )
+        return valid_mask.to(torch.int64).sum()
+
+
+class TrainerAcceptanceProxy(torch.nn.Module):
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        labels: torch.Tensor,
+        anchor_valid_mask: torch.Tensor,
+        primary_path_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        zero_total = predictions.new_zeros((), dtype=torch.float32)
+        zero_count = anchor_valid_mask.new_zeros((), dtype=torch.int64)
+        if predictions.numel() == 0 or primary_path_indices.numel() <= 1:
+            return zero_total, zero_count
+        future_primary_indices = primary_path_indices[1:]
+        pred_primary = predictions.index_select(-1, future_primary_indices)
+        label_primary = labels.index_select(-1, future_primary_indices)
+        prefix_matches = pred_primary.eq(label_primary).to(torch.int64).cumprod(dim=-1)
+        accepted_depth = prefix_matches.sum(dim=-1)
+        valid_mask = anchor_valid_mask.to(torch.int64)
+        total = (accepted_depth.to(torch.float32) * valid_mask.to(torch.float32)).sum()
+        count = valid_mask.sum()
+        return total, count
+
+
+class TrainerPrefillTargetContext(torch.nn.Module):
+    def __init__(self, target_model: torch.nn.Module, target_layer_ids: tuple[int, ...]):
+        super().__init__()
+        self.target_model = target_model
+        self.target_layer_ids = target_layer_ids
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        target_out = self.target_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        hidden_states = target_out.hidden_states
+        selected_states = [hidden_states[layer_id + 1] for layer_id in self.target_layer_ids]
+        return torch.cat(selected_states, dim=-1)
+
+
+class TrainerAnchorChunkForward(torch.nn.Module):
+    def __init__(
+        self,
+        target_embeddings: torch.nn.Module,
+        drafter_model: torch.nn.Module,
+        *,
+        has_ar_head: bool,
+    ):
+        super().__init__()
+        self.target_embeddings = target_embeddings
+        self.drafter_model = drafter_model
+        self.has_ar_head = has_ar_head
+
+    def forward(
+        self,
+        tree_noise_ids: torch.Tensor,
+        tree_labels: torch.Tensor,
+        tree_position_ids: torch.Tensor,
+        batch_position_ids: torch.Tensor,
+        tree_info,
+        drafter_mask: torch.Tensor | None,
+        target_ctx_features: torch.Tensor,
+        parent_idx: torch.Tensor,
+        ar_attention_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, num_blocks, block_size = tree_noise_ids.shape
+        flat_tree_len = num_blocks * block_size
+        flat_tree_position_ids = tree_position_ids.reshape(batch_size, flat_tree_len)
+        noise_embeddings = self.target_embeddings(tree_noise_ids.reshape(batch_size, flat_tree_len))
+        position_ids_with_seq = torch.cat((batch_position_ids, flat_tree_position_ids), dim=1)
+        parent_embeddings = None
+        if self.has_ar_head:
+            parent_token_ids = tree_labels.clone()
+            if block_size > 1:
+                parent_token_ids[..., 1:] = tree_labels.index_select(-1, parent_idx[1:])
+            parent_embeddings = self.target_embeddings(parent_token_ids.reshape(batch_size, flat_tree_len))
+        draft_hidden_states, _, q_logits, ar_hidden_states = self.drafter_model(
+            hidden_states=noise_embeddings,
+            position_ids=position_ids_with_seq,
+            tree_info=tree_info,
+            attention_mask=drafter_mask,
+            target_ctx_features=target_ctx_features,
+            return_aux=True,
+            parent_embeddings=parent_embeddings,
+            ar_position_ids=flat_tree_position_ids if self.has_ar_head else None,
+            ar_attention_mask=ar_attention_mask,
+        )
+        return draft_hidden_states, q_logits, ar_hidden_states
+
+
+class TrainerLossAndPredictions(torch.nn.Module):
+    def __init__(
+        self,
+        lm_head_module: torch.nn.Module,
+        *,
+        ce_chunk_size: int | None,
+    ):
+        super().__init__()
+        self.lm_head_module = lm_head_module
+        self.ce_chunk_size = ce_chunk_size
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+        weights: torch.Tensor,
+        valid_mask: torch.Tensor,
+        compute_predictions: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, total_tokens, hidden_size = hidden_states.shape
+        flat_hidden = hidden_states.reshape(batch_size * total_tokens, hidden_size)
+        flat_labels = labels.reshape(batch_size * total_tokens)
+        flat_weights = weights.reshape(batch_size * total_tokens)
+        flat_valid = valid_mask.reshape(batch_size * total_tokens)
+        if not flat_valid.any():
+            empty_predictions = flat_labels.new_empty((0,))
+            return hidden_states.new_zeros(()), flat_valid.to(torch.int64).sum(), empty_predictions
+
+        chunk_size = self.ce_chunk_size or flat_hidden.shape[0]
+        total_loss = hidden_states.new_zeros(())
+        predictions = (
+            torch.full_like(flat_labels, IGNORE_IDX)
+            if compute_predictions
+            else flat_labels.new_empty((0,))
+        )
+        for start in range(0, flat_hidden.shape[0], chunk_size):
+            end = min(start + chunk_size, flat_hidden.shape[0])
+            chunk_hidden = flat_hidden[start:end]
+            logits = self.lm_head_module(chunk_hidden.to(self.lm_head_module.weight.dtype))
+            if compute_predictions:
+                predictions[start:end] = logits.argmax(dim=-1)
+            ce = F.cross_entropy(
+                logits.float(),
+                flat_labels[start:end],
+                ignore_index=IGNORE_IDX,
+                reduction="none",
+            )
+            weighted = ce * flat_weights[start:end]
+            chunk_valid = flat_valid[start:end]
+            if chunk_valid.any():
+                total_loss = total_loss + weighted[chunk_valid].sum()
+        valid_count = flat_valid.to(torch.int64).sum()
+        if compute_predictions:
+            predictions = predictions.view(batch_size, total_tokens)
+        return total_loss, valid_count, predictions
+
+
 def build_prefill_attention_mask(
     document_mask: torch.Tensor,
     valid_mask: torch.Tensor,
@@ -323,10 +492,6 @@ class Trainer:
                 "tree_type='prunable' requires a drafter checkpoint/config with use_q_head=True or use_ar_head=True."
             )
 
-        if config.compile and hasattr(torch, "compile"):
-            self.target_model = torch.compile(self.target_model)
-            self.drafter_model = torch.compile(self.drafter_model, dynamic=True)
-
         self.optimizer = torch.optim.AdamW(
             self.drafter_model.parameters(),
             lr=config.lr,
@@ -340,6 +505,27 @@ class Trainer:
         self.target_lm_head = self.target_model.get_output_embeddings()
         if self.target_lm_head is None:
             raise ValueError("Target model must expose an output embedding / LM head.")
+        self.valid_target_counter = TrainerValidTargetCounter()
+        self.acceptance_proxy_helper = TrainerAcceptanceProxy()
+        self.prefill_target_context = TrainerPrefillTargetContext(
+            self.target_model,
+            tuple(int(layer_id) for layer_id in self.raw_drafter.target_layer_ids),
+        )
+        self.anchor_chunk_forward = TrainerAnchorChunkForward(
+            self.target_embeddings,
+            self.drafter_model,
+            has_ar_head=self.has_ar_head,
+        )
+        self.loss_and_predictions = TrainerLossAndPredictions(
+            self.target_lm_head,
+            ce_chunk_size=self.config.ce_chunk_size,
+        )
+        if config.compile and hasattr(torch, "compile"):
+            self.valid_target_counter = torch.compile(self.valid_target_counter, dynamic=True)
+            self.acceptance_proxy_helper = torch.compile(self.acceptance_proxy_helper, dynamic=True)
+            self.prefill_target_context = torch.compile(self.prefill_target_context, dynamic=True)
+            self.anchor_chunk_forward = torch.compile(self.anchor_chunk_forward, dynamic=True)
+            self.loss_and_predictions = torch.compile(self.loss_and_predictions, dynamic=True)
 
         self.train_loader, self.eval_loader = build_dataloaders(
             config=data,
@@ -475,7 +661,6 @@ class Trainer:
                 "ce_time": 0.0,
             }
 
-        noise_embeddings = self.target_embeddings(tree_noise_ids.reshape(batch_size, num_blocks * block_size))
         mask_start = time.perf_counter() if profile else 0.0
         drafter_mask = build_drafter_block_mask(
             anchor_positions=anchor_positions,
@@ -489,19 +674,8 @@ class Trainer:
         #     print("Anchor Positions:", anchor_positions[0,0])
         #     print("Tree Position Ids:", tree_position_ids[0,0])
         #     print("Tree Labels:", tree_labels[0,0])
-
-
-        position_ids_with_seq = torch.cat((
-            batch.position_ids,
-            tree_position_ids.reshape(batch_size, num_blocks * block_size),
-        ), dim=1)
-        parent_embeddings = None
         ar_attention_mask = None
-        ar_position_ids = None
         if self.has_ar_head:
-            parent_token_ids = self._build_parent_token_ids(tree_labels, tree_info)
-            parent_embeddings = self.target_embeddings(parent_token_ids.reshape(batch_size, num_blocks * block_size))
-            ar_position_ids = tree_position_ids.reshape(batch_size, num_blocks * block_size)
             ar_attention_mask = build_ar_block_mask(
                 anchor_positions=anchor_positions,
                 document_mask=batch.document_mask,
@@ -513,16 +687,16 @@ class Trainer:
         mask_time = time.perf_counter() - mask_start if profile else 0.0
 
         drafter_start = time.perf_counter() if profile else 0.0
-        draft_hidden_states, _, q_logits, ar_hidden_states = self.drafter_model(
-            hidden_states=noise_embeddings,
-            position_ids=position_ids_with_seq,
-            tree_info=tree_info,
-            attention_mask=drafter_mask,
-            target_ctx_features=target_ctx_features,
-            return_aux=True,
-            parent_embeddings=parent_embeddings,
-            ar_position_ids=ar_position_ids,
-            ar_attention_mask=ar_attention_mask,
+        draft_hidden_states, q_logits, ar_hidden_states = self.anchor_chunk_forward(
+            tree_noise_ids,
+            tree_labels,
+            tree_position_ids,
+            batch.position_ids,
+            tree_info,
+            drafter_mask,
+            target_ctx_features,
+            tree_info.parent_idx.to(tree_labels.device),
+            ar_attention_mask,
         )
         drafter_time = time.perf_counter() - drafter_start if profile else 0.0
         loss_sum, valid_count, predictions, ce_time = self._chunked_loss_and_predictions(
@@ -567,18 +741,6 @@ class Trainer:
             "ce_time": ce_time,
         }
 
-    def _build_parent_token_ids(
-        self,
-        tree_token_ids: torch.Tensor,
-        tree_info,
-    ) -> torch.Tensor:
-        parent_token_ids = tree_token_ids.clone()
-        if tree_info.block_size <= 1:
-            return parent_token_ids
-        parent_idx = tree_info.parent_idx.to(tree_token_ids.device)
-        parent_token_ids[..., 1:] = tree_token_ids.index_select(-1, parent_idx[1:])
-        return parent_token_ids
-
     def _chunked_loss_and_predictions(
         self,
         *,
@@ -590,40 +752,16 @@ class Trainer:
         profile: bool = False,
     ) -> tuple[torch.Tensor, int, torch.Tensor | None, float]:
         ce_start = time.perf_counter() if profile else 0.0
-        batch_size, total_tokens, hidden_size = hidden_states.shape
-        flat_hidden = hidden_states.reshape(batch_size * total_tokens, hidden_size)
-        flat_labels = labels.reshape(batch_size * total_tokens)
-        flat_weights = weights.reshape(batch_size * total_tokens)
-        flat_valid = valid_mask.reshape(batch_size * total_tokens)
-        if not flat_valid.any():
-            return hidden_states.new_zeros(()), 0, None, 0.0
-
-        chunk_size = self.config.ce_chunk_size or flat_hidden.shape[0]
-        total_loss = hidden_states.new_zeros(())
-        predictions = (
-            torch.full_like(flat_labels, IGNORE_IDX)
-            if compute_predictions
-            else None
+        total_loss, valid_count_tensor, predictions = self.loss_and_predictions(
+            hidden_states,
+            labels,
+            weights,
+            valid_mask,
+            compute_predictions,
         )
-        for start in range(0, flat_hidden.shape[0], chunk_size):
-            end = min(start + chunk_size, flat_hidden.shape[0])
-            chunk_hidden = flat_hidden[start:end]
-            logits = self.target_lm_head(chunk_hidden.to(self.target_lm_head.weight.dtype))
-            if compute_predictions and predictions is not None:
-                predictions[start:end] = logits.argmax(dim=-1)
-            ce = F.cross_entropy(
-                logits.float(),
-                flat_labels[start:end],
-                ignore_index=IGNORE_IDX,
-                reduction="none",
-            )
-            weighted = ce * flat_weights[start:end]
-            chunk_valid = flat_valid[start:end]
-            if chunk_valid.any():
-                total_loss = total_loss + weighted[chunk_valid].sum()
-        valid_count = int(flat_valid.sum().item())
-        if predictions is not None:
-            predictions = predictions.view(batch_size, total_tokens)
+        valid_count = int(valid_count_tensor.item())
+        if not compute_predictions:
+            predictions = None
         ce_time = time.perf_counter() - ce_start if profile else 0.0
         return total_loss, valid_count, predictions, ce_time
 
@@ -633,13 +771,12 @@ class Trainer:
     ) -> int:
         if batch.num_anchors == 0 or batch.tree_valid_mask.numel() == 0:
             return 0
-        non_root_mask = self.tree_processor.non_root_mask.to(batch.tree_valid_mask.device).view(1, 1, -1)
-        valid_mask = (
-            batch.tree_valid_mask
-            & non_root_mask
-            & batch.anchor_valid_mask.unsqueeze(-1)
+        valid_count = self.valid_target_counter(
+            batch.tree_valid_mask,
+            batch.anchor_valid_mask,
+            self.tree_processor.non_root_mask.to(batch.tree_valid_mask.device),
         )
-        return int(valid_mask.sum().item())
+        return int(valid_count.item())
 
     def _prefill_target_context(
         self,
@@ -647,14 +784,11 @@ class Trainer:
     ) -> torch.Tensor:
         with torch.no_grad():
             prefill_mask = build_prefill_attention_mask(batch.document_mask, batch.context_valid_mask)
-            target_out = self.target_model(
-                input_ids=batch.input_ids,
-                attention_mask=prefill_mask,
-                position_ids=batch.position_ids,
-                output_hidden_states=True,
-                use_cache=False,
+            return self.prefill_target_context(
+                batch.input_ids,
+                prefill_mask,
+                batch.position_ids,
             )
-            return self.raw_drafter.extract_ctx_features(target_out.hidden_states)
 
     def _train_batch(
         self,
@@ -860,26 +994,13 @@ class Trainer:
         labels: torch.Tensor,
         anchor_valid_mask: torch.Tensor,
     ) -> tuple[float, int]:
-        if predictions.numel() == 0:
-            return 0.0, 0
-        primary_indices = self.tree_processor.primary_path_indices
-        if primary_indices.numel() <= 1:
-            return 0.0, 0
-        future_primary_indices = primary_indices[1:]
-        pred_primary = predictions[:, :, future_primary_indices]
-        label_primary = labels[:, :, future_primary_indices]
-
-        mismatches = pred_primary.ne(label_primary)
-        has_mismatch = mismatches.any(dim=-1)
-        first_mismatch = mismatches.to(torch.int64).argmax(dim=-1)
-        full_depth = torch.full_like(first_mismatch, pred_primary.shape[-1])
-        accepted_depth = torch.where(has_mismatch, first_mismatch, full_depth)
-
-        valid_mask = anchor_valid_mask.to(torch.bool)
-        accepted_valid = accepted_depth.masked_select(valid_mask)
-        total = float(accepted_valid.sum().item())
-        count = int(valid_mask.sum().item())
-        return total, count
+        total, count = self.acceptance_proxy_helper(
+            predictions,
+            labels,
+            anchor_valid_mask,
+            self.tree_processor.primary_path_indices.to(predictions.device),
+        )
+        return float(total.item()), int(count.item())
 
     def fit(self):
         total_optimizer_steps = max(

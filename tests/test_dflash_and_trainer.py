@@ -341,6 +341,7 @@ def _make_trainer(
     tree_args: dict | None = None,
     q_loss_lambda: float = 1.0,
     ar_loss_lambda: float = 0.1,
+    compile: bool = False,
 ) -> Trainer:
     import src.trainer as trainer_mod
 
@@ -372,6 +373,7 @@ def _make_trainer(
             anchor_chunk_size=anchor_chunk_size,
             q_loss_lambda=q_loss_lambda,
             ar_loss_lambda=ar_loss_lambda,
+            compile=compile,
         ),
         target="fake-target",
         data=DataModuleConfig(
@@ -608,6 +610,36 @@ def test_trainer_smoke_with_fakes(monkeypatch, tmp_path: Path) -> None:
 
     assert (tmp_path / "ckpts" / "final" / "fabric_ckpt.pt").exists()
     assert (tmp_path / "ckpts" / "final" / "hf_draft" / "pytorch_model.bin").exists()
+
+
+def test_trainer_compile_wraps_internal_compute_helpers(monkeypatch, tmp_path: Path) -> None:
+    import src.trainer as trainer_mod
+
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    compile_calls: list[tuple[str, dict]] = []
+
+    def fake_compile(module, **kwargs):
+        module_name = getattr(module, "__name__", type(module).__name__)
+        compile_calls.append((module_name, kwargs))
+        return module
+
+    monkeypatch.setattr(trainer_mod.torch, "compile", fake_compile)
+
+    _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+        compile=True,
+    )
+
+    compiled_names = [name for name, _ in compile_calls]
+    assert compiled_names.count("TrainerValidTargetCounter") == 1
+    assert compiled_names.count("TrainerAcceptanceProxy") == 1
+    assert compiled_names.count("TrainerPrefillTargetContext") == 1
+    assert compiled_names.count("TrainerAnchorChunkForward") == 1
+    assert compiled_names.count("TrainerLossAndPredictions") == 1
 
 
 def test_trainer_real_loader_emits_fixed_packed_row_batches(monkeypatch, tmp_path: Path) -> None:
