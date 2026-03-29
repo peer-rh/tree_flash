@@ -7,7 +7,7 @@ import pytest
 torch = pytest.importorskip("torch")
 h5py = pytest.importorskip("h5py")
 
-from src.data import PackedBatchCollator, Stage2Dataset
+from src.data import DataModuleConfig, PackedBatchCollator, Stage2Dataset, build_dataloaders
 from src.trees import BlockTreeProcessor, BranchOffTreeProcessor, PrunableTreeProcessor, subset_tree_info
 
 
@@ -47,6 +47,50 @@ def _write_stage2_fixture(path: Path) -> None:
             [0.7, 0.5, 0.25, 0.2],
             [0.5, 0.0, 0.0, 0.0],
         ]
+
+
+def _write_stage2_fixture_many(path: Path) -> None:
+    prompts = [
+        [11, 12],
+        [13],
+        [14, 15],
+        [16],
+        [17, 18],
+    ]
+    responses = [
+        [21, 22, 23, 24],
+        [25, 26, 27],
+        [28, 29, 30, 31],
+        [32, 33, 34],
+        [35, 36, 37, 38],
+    ]
+
+    with h5py.File(path, "w") as hf:
+        vlen = h5py.vlen_dtype("int64")
+        hf.create_dataset("prompt_ids", shape=(len(prompts),), dtype=vlen)
+        hf.create_dataset("response_ids", shape=(len(responses),), dtype=vlen)
+        for idx, prompt in enumerate(prompts):
+            hf["prompt_ids"][idx] = prompt
+        for idx, response in enumerate(responses):
+            hf["response_ids"][idx] = response
+
+        total_rows = sum(len(response) for response in responses)
+        sub_trees = hf.create_dataset("sub_trees", shape=(total_rows, 4), dtype="int64")
+        probs = hf.create_dataset("sub_trees_ar_probs", shape=(total_rows, 4), dtype="float32")
+        offsets = [0]
+        cursor = 0
+        for response in responses:
+            cursor += len(response)
+            offsets.append(cursor)
+        hf.create_dataset("sequence_offsets", data=offsets, dtype="int64")
+        hf.attrs["sub_tree_paths"] = SUB_TREE_PATHS
+
+        row = 0
+        for response in responses:
+            for token in response:
+                sub_trees[row] = [token, token + 10, token + 11, token + 12]
+                probs[row] = [0.8, 0.5, 0.25, 0.2]
+                row += 1
 
 
 def test_stage2_dataset_reads_offsets_and_rows(tmp_path: Path) -> None:
@@ -98,6 +142,87 @@ def test_packed_collator_restarts_positions_and_isolates_documents(tmp_path: Pat
     assert batch.anchor_document_ids.tolist() == [[1, 1, 2, 2]]
     assert batch.anchor_valid_mask.tolist() == [[True, True, True, True]]
     assert batch.tree_labels.shape == (1, 4, 8)
+
+
+def test_build_dataloaders_reads_ahead_to_emit_fixed_packed_row_count(tmp_path: Path) -> None:
+    stage2_path = tmp_path / "stage2_many.h5"
+    _write_stage2_fixture_many(stage2_path)
+
+    train_loader, _ = build_dataloaders(
+        config=DataModuleConfig(
+            path=str(stage2_path),
+            batch_size=2,
+            pack_length=10,
+            num_anchors=2,
+            tree_seq_depth=2,
+            shuffle=False,
+            drop_last=False,
+        ),
+        tree_processor=BlockTreeProcessor(tree_seq_depth=2, sub_tree_paths=SUB_TREE_PATHS),
+        mask_token_id=99,
+        pad_token_id=0,
+    )
+    batch = next(iter(train_loader))
+
+    assert batch.batch_size == 2
+    assert batch.input_ids.shape == (2, 10)
+    assert batch.input_ids[0].tolist()[:10] == [11, 12, 21, 22, 23, 24, 13, 25, 26, 27]
+    assert batch.input_ids[1].tolist()[:10] == [14, 15, 28, 29, 30, 31, 16, 32, 33, 34]
+    assert batch.context_valid_mask[0].tolist()[:10] == [True] * 10
+    assert batch.context_valid_mask[1].tolist()[:10] == [True] * 10
+
+
+def test_train_loader_wraps_with_real_data_to_finish_last_batch(tmp_path: Path) -> None:
+    stage2_path = tmp_path / "stage2_many.h5"
+    _write_stage2_fixture_many(stage2_path)
+
+    train_loader, _ = build_dataloaders(
+        config=DataModuleConfig(
+            path=str(stage2_path),
+            batch_size=2,
+            pack_length=10,
+            num_anchors=2,
+            tree_seq_depth=2,
+            shuffle=False,
+            drop_last=False,
+        ),
+        tree_processor=BlockTreeProcessor(tree_seq_depth=2, sub_tree_paths=SUB_TREE_PATHS),
+        mask_token_id=99,
+        pad_token_id=0,
+    )
+    batches = list(iter(train_loader))
+
+    assert len(batches) == 2
+    assert all(batch.batch_size == 2 for batch in batches)
+    assert batches[1].context_valid_mask[0].sum().item() > 0
+    assert batches[1].context_valid_mask[1].sum().item() > 0
+
+
+def test_eval_loader_is_deterministic_across_iterations(tmp_path: Path) -> None:
+    stage2_path = tmp_path / "stage2_many.h5"
+    _write_stage2_fixture_many(stage2_path)
+
+    _, eval_loader = build_dataloaders(
+        config=DataModuleConfig(
+            path=str(stage2_path),
+            eval_path=str(stage2_path),
+            batch_size=2,
+            pack_length=10,
+            num_anchors=2,
+            tree_seq_depth=2,
+            shuffle=True,
+            drop_last=False,
+        ),
+        tree_processor=BlockTreeProcessor(tree_seq_depth=2, sub_tree_paths=SUB_TREE_PATHS),
+        mask_token_id=99,
+        pad_token_id=0,
+    )
+    first_pass = list(iter(eval_loader))
+    second_pass = list(iter(eval_loader))
+
+    assert len(first_pass) == len(second_pass)
+    assert torch.equal(first_pass[0].input_ids, second_pass[0].input_ids)
+    assert torch.equal(first_pass[0].anchor_positions, second_pass[0].anchor_positions)
 
 
 def test_block_tree_processor_builds_expected_metadata() -> None:

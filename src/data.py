@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 import h5py
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset, random_split
+from torch.utils.data import BatchSampler, DataLoader, Dataset, Subset, random_split
 from datasets import load_dataset, Features, Sequence, Value
 
 from data_pipeline.stage2 import IGNORE_IDX
@@ -106,11 +106,19 @@ class Stage2Dataset(Dataset):
         self.path = str(path)
         with h5py.File(self.path, "r") as hf:
             self.offsets = hf["sequence_offsets"][:]
+            prompt_lengths = []
+            for prompt_ids in hf["prompt_ids"]:
+                prompt_lengths.append(len(prompt_ids))
             raw_paths = hf.attrs.get("sub_tree_paths", [])
             self.sub_tree_paths = tuple(
                 value.decode("utf-8") if isinstance(value, bytes) else str(value)
                 for value in raw_paths
             )
+        response_lengths = self.offsets[1:] - self.offsets[:-1]
+        self.total_lengths = tuple(
+            int(prompt_len + response_len)
+            for prompt_len, response_len in zip(prompt_lengths, response_lengths, strict=True)
+        )
         self._h5: h5py.File | None = None
 
     def __len__(self) -> int:
@@ -139,8 +147,225 @@ class Stage2Dataset(Dataset):
             "response_ids": response_ids,
             "sub_trees": sub_trees,
             "sub_tree_ar_probs": sub_tree_ar_probs,
-            "total_len": int(prompt_ids.numel() + response_ids.numel()),
+            "total_len": self.total_lengths[idx],
         }
+
+
+def _pack_items_into_rows(
+    items: list[tuple[Any, int]],
+    *,
+    pack_length: int,
+) -> list[list[tuple[Any, int, int]]]:
+    rows: list[dict[str, Any]] = []
+    for item, total_len in sorted(items, key=lambda value: value[1], reverse=True):
+        placed = False
+        for row in rows:
+            if row["used"] + total_len <= pack_length:
+                doc_id = len(row["docs"]) + 1
+                row["docs"].append((item, row["used"], doc_id))
+                row["used"] += total_len
+                placed = True
+                break
+        if not placed:
+            rows.append(
+                {
+                    "used": total_len,
+                    "docs": [(item, 0, 1)],
+                }
+            )
+    return [row["docs"] for row in rows]
+
+
+@dataclass(frozen=True)
+class _PendingIndex:
+    uid: int
+    index: int
+    current_epoch: bool
+
+
+class FixedPackedBatchSampler(BatchSampler):
+    def __init__(
+        self,
+        *,
+        sample_lengths: list[int],
+        pack_length: int,
+        packed_batch_size: int,
+        shuffle: bool,
+        drop_last: bool,
+        seed: int,
+        persistent_state: bool,
+    ) -> None:
+        if packed_batch_size <= 0:
+            raise ValueError(f"packed_batch_size must be positive, got {packed_batch_size}.")
+        self.pack_length = pack_length
+        self.packed_batch_size = packed_batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.persistent_state = persistent_state
+        self._rng = random.Random(seed)
+        self._next_uid = 0
+        self._pending: list[tuple[int, int]] = []
+        self._eligible = [
+            (idx, total_len)
+            for idx, total_len in enumerate(sample_lengths)
+            if int(total_len) <= pack_length
+        ]
+        if not self._eligible:
+            raise ValueError(
+                f"No dataset samples fit within pack_length={pack_length}."
+            )
+        self._eligible_indices = [idx for idx, _ in self._eligible]
+        self._length_by_index = {idx: int(total_len) for idx, total_len in self._eligible}
+        self._order: list[int] = []
+        self._cursor = 0
+
+    def _reset_order(self) -> None:
+        self._order = self._eligible_indices.copy()
+        if self.shuffle:
+            self._rng.shuffle(self._order)
+        self._cursor = 0
+
+    def _next_stream_index(
+        self,
+        order: list[int],
+        cursor: int,
+        rng: random.Random,
+    ) -> tuple[int, list[int], int]:
+        if not order or cursor >= len(order):
+            order = self._eligible_indices.copy()
+            if self.shuffle:
+                rng.shuffle(order)
+            cursor = 0
+        index = order[cursor]
+        return index, order, cursor + 1
+
+    def _pack_pending(
+        self,
+        pending: list[_PendingIndex],
+    ) -> list[list[tuple[_PendingIndex, int, int]]]:
+        items = [
+            (entry, self._length_by_index[entry.index])
+            for entry in pending
+        ]
+        return _pack_items_into_rows(items, pack_length=self.pack_length)
+
+    def _run_epoch(
+        self,
+        *,
+        order: list[int],
+        cursor: int,
+        pending_pairs: list[tuple[int, int]],
+        next_uid: int,
+        rng: random.Random,
+        collect_batches: bool,
+    ) -> tuple[list[list[int]], list[tuple[int, int]], list[int], int, int]:
+        pending = [_PendingIndex(uid=uid, index=index, current_epoch=True) for uid, index in pending_pairs]
+        remaining_primary = max(len(self._eligible_indices) - len(pending), 0)
+        emitted_batches: list[list[int]] = []
+        batch_count = 0
+
+        while True:
+            rows = self._pack_pending(pending)
+            if len(rows) >= self.packed_batch_size:
+                consumed_uids = {
+                    entry.uid
+                    for docs in rows[: self.packed_batch_size]
+                    for entry, _, _ in docs
+                }
+                batch_indices = [entry.index for entry in pending if entry.uid in consumed_uids]
+                pending = [entry for entry in pending if entry.uid not in consumed_uids]
+                batch_count += 1
+                if collect_batches:
+                    emitted_batches.append(batch_indices)
+                if remaining_primary == 0 and not any(entry.current_epoch for entry in pending):
+                    break
+                continue
+
+            if remaining_primary > 0:
+                index, order, cursor = self._next_stream_index(order, cursor, rng)
+                pending.append(_PendingIndex(uid=next_uid, index=index, current_epoch=True))
+                next_uid += 1
+                remaining_primary -= 1
+                continue
+
+            if any(entry.current_epoch for entry in pending):
+                if self.drop_last:
+                    pending = [entry for entry in pending if not entry.current_epoch]
+                    break
+                index, order, cursor = self._next_stream_index(order, cursor, rng)
+                pending.append(_PendingIndex(uid=next_uid, index=index, current_epoch=False))
+                next_uid += 1
+                continue
+            break
+
+        next_pending = [(entry.uid, entry.index) for entry in pending]
+        if not collect_batches:
+            emitted_batches = [[] for _ in range(batch_count)]
+        return emitted_batches, next_pending, order, cursor, next_uid
+
+    def __iter__(self):
+        if self.persistent_state:
+            order = self._order.copy()
+            cursor = self._cursor
+            pending_pairs = self._pending.copy()
+            next_uid = self._next_uid
+            rng = self._rng
+        else:
+            order = []
+            cursor = 0
+            pending_pairs = []
+            next_uid = 0
+            rng = random.Random(self.seed)
+
+        emitted_batches, next_pending, next_order, next_cursor, next_uid = self._run_epoch(
+            order=order,
+            cursor=cursor,
+            pending_pairs=pending_pairs,
+            next_uid=next_uid,
+            rng=rng,
+            collect_batches=True,
+        )
+        if self.persistent_state:
+            self._pending = next_pending
+            self._order = next_order
+            self._cursor = next_cursor
+            self._next_uid = next_uid
+        for batch in emitted_batches:
+            yield batch
+
+    def __len__(self) -> int:
+        sim_rng = random.Random()
+        if self.persistent_state:
+            sim_rng.setstate(self._rng.getstate())
+            order = self._order.copy()
+            cursor = self._cursor
+            pending_pairs = self._pending.copy()
+            next_uid = self._next_uid
+        else:
+            sim_rng.seed(self.seed)
+            order = []
+            cursor = 0
+            pending_pairs = []
+            next_uid = 0
+        batches, _, _, _, _ = self._run_epoch(
+            order=order,
+            cursor=cursor,
+            pending_pairs=pending_pairs,
+            next_uid=next_uid,
+            rng=sim_rng,
+            collect_batches=False,
+        )
+        return len(batches)
+
+
+def _dataset_total_lengths(dataset: Dataset) -> list[int]:
+    if isinstance(dataset, Stage2Dataset):
+        return list(dataset.total_lengths)
+    if isinstance(dataset, Subset):
+        base_lengths = _dataset_total_lengths(dataset.dataset)
+        return [int(base_lengths[idx]) for idx in dataset.indices]
+    raise TypeError(f"Unsupported dataset type for fixed packed batching: {type(dataset)!r}")
 
 
 class PackedBatchCollator:
@@ -182,25 +407,8 @@ class PackedBatchCollator:
         )
 
     def _pack_rows(self, samples: list[dict[str, Any]]) -> list[list[tuple[dict[str, Any], int, int]]]:
-        rows: list[dict[str, Any]] = []
-        for sample in sorted(samples, key=lambda item: item["total_len"], reverse=True):
-            placed = False
-            total_len = int(sample["total_len"])
-            for row in rows:
-                if row["used"] + total_len <= self.pack_length:
-                    doc_id = len(row["docs"]) + 1
-                    row["docs"].append((sample, row["used"], doc_id))
-                    row["used"] += total_len
-                    placed = True
-                    break
-            if not placed:
-                rows.append(
-                    {
-                        "used": total_len,
-                        "docs": [(sample, 0, 1)],
-                    }
-                )
-        return [row["docs"] for row in rows]
+        items = [(sample, int(sample["total_len"])) for sample in samples]
+        return _pack_items_into_rows(items, pack_length=self.pack_length)
 
     def _select_anchor_locals(self, sample: dict[str, Any]) -> list[int]:
         response_ids = sample["response_ids"]
@@ -408,21 +616,39 @@ def build_dataloaders(
         sample_anchors=False,
     )
 
+    train_lengths = _dataset_total_lengths(train_dataset)
+    eval_lengths = _dataset_total_lengths(eval_dataset)
+    train_batch_sampler = FixedPackedBatchSampler(
+        sample_lengths=train_lengths,
+        pack_length=config.pack_length,
+        packed_batch_size=config.batch_size,
+        shuffle=config.shuffle,
+        drop_last=config.drop_last,
+        seed=config.seed,
+        persistent_state=True,
+    )
+    eval_batch_sampler = FixedPackedBatchSampler(
+        sample_lengths=eval_lengths,
+        pack_length=config.pack_length,
+        packed_batch_size=config.batch_size,
+        shuffle=False,
+        drop_last=config.drop_last,
+        seed=config.seed,
+        persistent_state=False,
+    )
     loader_kwargs = {
-        "batch_size": config.batch_size,
         "num_workers": config.num_workers,
         "pin_memory": torch.cuda.is_available(),
-        "drop_last": config.drop_last,
     }
     train_loader = DataLoader(
         train_dataset,
-        shuffle=config.shuffle,
+        batch_sampler=train_batch_sampler,
         collate_fn=train_collator,
         **loader_kwargs,
     )
     eval_loader = DataLoader(
         eval_dataset,
-        shuffle=False,
+        batch_sampler=eval_batch_sampler,
         collate_fn=eval_collator,
         **loader_kwargs,
     )

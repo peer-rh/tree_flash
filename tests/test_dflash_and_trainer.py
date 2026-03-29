@@ -84,6 +84,52 @@ def _write_stage2_fixture(path: Path) -> None:
         )
 
 
+def _write_stage2_fixture_many(path: Path) -> None:
+    import h5py
+
+    prompts = [
+        [11, 12],
+        [13],
+        [14, 15],
+        [16],
+        [17, 18],
+    ]
+    responses = [
+        [21, 22, 23, 24],
+        [25, 26, 27],
+        [28, 29, 30, 31],
+        [32, 33, 34],
+        [35, 36, 37, 38],
+    ]
+
+    with h5py.File(path, "w") as hf:
+        vlen = h5py.vlen_dtype("int64")
+        hf.create_dataset("prompt_ids", shape=(len(prompts),), dtype=vlen)
+        hf.create_dataset("response_ids", shape=(len(responses),), dtype=vlen)
+        for idx, prompt in enumerate(prompts):
+            hf["prompt_ids"][idx] = prompt
+        for idx, response in enumerate(responses):
+            hf["response_ids"][idx] = response
+
+        total_rows = sum(len(response) for response in responses)
+        sub_trees = hf.create_dataset("sub_trees", shape=(total_rows, 4), dtype="int64")
+        probs = hf.create_dataset("sub_trees_ar_probs", shape=(total_rows, 4), dtype="float32")
+        offsets = [0]
+        cursor = 0
+        for response in responses:
+            cursor += len(response)
+            offsets.append(cursor)
+        hf.create_dataset("sequence_offsets", data=offsets, dtype="int64")
+        hf.attrs["sub_tree_paths"] = ["0-1", "0-2", "1-3"]
+
+        row = 0
+        for response in responses:
+            for token in response:
+                sub_trees[row] = [token, token + 10, token + 11, token + 12]
+                probs[row] = [0.8, 0.5, 0.25, 0.2]
+                row += 1
+
+
 class _TinyTokenizer:
     def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
         if isinstance(token_ids, torch.Tensor):
@@ -477,6 +523,49 @@ def test_trainer_smoke_with_fakes(monkeypatch, tmp_path: Path) -> None:
 
     assert (tmp_path / "ckpts" / "final" / "fabric_ckpt.pt").exists()
     assert (tmp_path / "ckpts" / "final" / "hf_draft" / "pytorch_model.bin").exists()
+
+
+def test_trainer_real_loader_emits_fixed_packed_row_batches(monkeypatch, tmp_path: Path) -> None:
+    import src.trainer as trainer_mod
+
+    stage2_path = tmp_path / "stage2_many.h5"
+    _write_stage2_fixture_many(stage2_path)
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    FakeFabric, FakeTokenizer, FakeTargetModel, FakeDrafter, _ = _build_fake_trainer_components(
+        tree_processor.block_size
+    )
+
+    monkeypatch.setattr(trainer_mod, "Fabric", FakeFabric)
+    monkeypatch.setattr(trainer_mod, "AutoTokenizer", FakeTokenizer)
+    monkeypatch.setattr(trainer_mod, "AutoModelForCausalLM", FakeTargetModel)
+    monkeypatch.setattr(trainer_mod, "DFlashDraftModel", FakeDrafter)
+
+    trainer = Trainer(
+        config=TrainerConfig(
+            checkpoint_path=str(tmp_path / "ckpts"),
+            no_wandb=True,
+            precision="32-true",
+            dev_run=True,
+        ),
+        target="fake-target",
+        data=DataModuleConfig(
+            path=str(stage2_path),
+            eval_path=str(stage2_path),
+            batch_size=2,
+            pack_length=10,
+            tree_seq_depth=2,
+            num_workers=0,
+            shuffle=False,
+            drop_last=False,
+        ),
+        drafter="fake-drafter",
+        tree_type="block",
+    )
+
+    batch = next(iter(trainer.train_loader))
+
+    assert batch.batch_size == 2
+    assert batch.input_ids.shape == (2, 10)
 
 
 def test_train_batch_chunking_preserves_loss_and_gradients(monkeypatch, tmp_path: Path) -> None:
