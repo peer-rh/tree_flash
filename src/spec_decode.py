@@ -7,7 +7,7 @@ from typing import Any, Sequence
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.cache_utils import DynamicCache
+from transformers.cache_utils import Cache, DynamicCache
 
 from .models import DFlashDraftModel
 from .trainer import unwrap_model
@@ -80,32 +80,6 @@ def build_tree_processor(
     )
 
 
-def build_drafter_inference_mask(
-    *,
-    prefix_len: int,
-    tree_len: int,
-    device: torch.device,
-):
-    try:
-        from torch.nn.attention.flex_attention import create_block_mask
-    except ImportError as exc:
-        raise RuntimeError(
-            "Flex attention is required for the drafter speculative decoder."
-        ) from exc
-
-    def mask_mod(b, h, q_idx, kv_idx):
-        return (kv_idx < prefix_len) | (kv_idx >= prefix_len)
-
-    return create_block_mask(
-        mask_mod,
-        B=1,
-        H=None,
-        Q_LEN=tree_len,
-        KV_LEN=prefix_len + tree_len,
-        device=device,
-        BLOCK_SIZE=128,
-    )
-
 
 def build_verifier_attention_mask(
     *,
@@ -114,6 +88,12 @@ def build_verifier_attention_mask(
     device: torch.device,
 ) -> torch.Tensor:
     tree_len = tree_info.block_size
+    # TODO: Finish this
+    def score_mask_mod(score, B, H, Q, KV):
+        torch.where(
+            KV 
+        )
+
     left = torch.zeros((1, 1, tree_len, prefix_len), dtype=torch.float32, device=device)
     right = torch.zeros((1, 1, tree_len, tree_len), dtype=torch.float32, device=device)
     right.masked_fill_(~tree_info.tree_mask.view(1, 1, tree_len, tree_len), float("-inf"))
@@ -121,31 +101,25 @@ def build_verifier_attention_mask(
 
 
 def trim_dynamic_cache(
-    past_key_values: DynamicCache,
+    past_key_values: Cache,
     *,
     prefix_len: int,
     keep_tree_indices: list[int],
-) -> DynamicCache:
+) -> Cache:
     keep = torch.tensor(keep_tree_indices, dtype=torch.long)
-    for layer_idx in range(len(past_key_values.key_cache)):
-        key_cache = past_key_values.key_cache[layer_idx]
-        value_cache = past_key_values.value_cache[layer_idx]
-        device = key_cache.device
+    for layer in past_key_values.layers:
+        if not getattr(layer, "is_initialized", False) or layer.keys is None or layer.values is None:
+            continue
+        device = layer.keys.device
         select = keep.to(device)
-        prefix_keys = key_cache[:, :, :prefix_len, :]
-        prefix_values = value_cache[:, :, :prefix_len, :]
-        tree_keys = key_cache[:, :, prefix_len:, :]
-        tree_values = value_cache[:, :, prefix_len:, :]
-        past_key_values.key_cache[layer_idx] = torch.cat(
-            [prefix_keys, tree_keys.index_select(2, select)],
-            dim=2,
-        )
-        past_key_values.value_cache[layer_idx] = torch.cat(
-            [prefix_values, tree_values.index_select(2, select)],
-            dim=2,
-        )
-    if hasattr(past_key_values, "_seen_tokens"):
-        past_key_values._seen_tokens = prefix_len + len(keep_tree_indices)
+        prefix_keys = layer.keys[:, :, :prefix_len, :]
+        prefix_values = layer.values[:, :, :prefix_len, :]
+        tree_keys = layer.keys[:, :, prefix_len:, :]
+        tree_values = layer.values[:, :, prefix_len:, :]
+        layer.keys = torch.cat([prefix_keys, tree_keys.index_select(2, select)], dim=2)
+        layer.values = torch.cat([prefix_values, tree_values.index_select(2, select)], dim=2)
+        if hasattr(layer, "cumulative_length"):
+            layer.cumulative_length = int(layer.keys.shape[-2])
     return past_key_values
 
 
@@ -229,7 +203,8 @@ def draft_tree(
     target_embeddings,
     target_lm_head,
     tree_processor,
-    prefix_ctx_features: torch.Tensor,
+    target_ctx_features,
+    drafter_cache: Cache,
     current_root_token: int,
     root_position: int,
     temperature: float,
@@ -237,22 +212,21 @@ def draft_tree(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TreeInfo, torch.Tensor | None]:
     tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=device)
     tree_len = tree_info.block_size
+    pre_len = drafter_cache.get_seq_length()
     noise_ids = torch.full((1, tree_len), raw_drafter.mask_token_id, dtype=torch.long, device=device)
     noise_ids[0, 0] = current_root_token
     noise_embeddings = target_embeddings(noise_ids)
     position_ids = (tree_info.depth.view(1, -1) + root_position).to(device)
-    target_ctx = prefix_ctx_features if prefix_ctx_features.shape[1] > 0 else None
-    attention_mask = build_drafter_inference_mask(
-        prefix_len=0 if target_ctx is None else target_ctx.shape[1],
-        tree_len=tree_len,
-        device=device,
-    )
     draft_hidden_states, backbone_hidden = drafter_model(
         hidden_states=noise_embeddings,
         position_ids=position_ids,
         tree_info=tree_info,
-        attention_mask=attention_mask,
-        target_ctx_features=target_ctx,
+        target_ctx_features=target_ctx_features,
+        past_key_values=drafter_cache,
+        use_cache=True,
+    )
+    drafter_cache.crop(
+        pre_len + target_ctx_features.shape[1],
     )
     draft_logits = target_lm_head(draft_hidden_states)[0]
     tree_token_ids = sample_from_logits(draft_logits, temperature)
@@ -272,11 +246,11 @@ def verify_tree(
     tree_token_ids: torch.Tensor,
     tree_info: TreeInfo,
     root_position: int,
-    prefix_cache: DynamicCache,
+    target_cache: Cache,
     temperature: float,
-) -> tuple[DynamicCache, torch.Tensor, torch.Tensor]:
+) -> tuple[Cache, torch.Tensor, torch.Tensor]:
     device = tree_token_ids.device
-    prefix_len = prefix_cache.get_seq_length()
+    prefix_len = target_cache.get_seq_length()
     attention_mask = build_verifier_attention_mask(
         tree_info=tree_info,
         prefix_len=prefix_len,
@@ -288,7 +262,7 @@ def verify_tree(
         input_ids=tree_token_ids.unsqueeze(0),
         position_ids=position_ids,
         attention_mask=attention_mask,
-        past_key_values=prefix_cache,
+        past_key_values=target_cache,
         use_cache=True,
         cache_position=cache_position,
         output_hidden_states=True,
@@ -344,20 +318,22 @@ def speculative_generate(
     if isinstance(tree_processor, PrunableTreeProcessor) and getattr(raw_drafter, "q_head", None) is None:
         raise ValueError("tree_type='prunable' requires a drafter checkpoint/config with use_q_head=True.")
     prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    prefix_cache = DynamicCache()
+    target_cache = DynamicCache()
     prefill_outputs = target_model(
         input_ids=prompt_ids,
         output_hidden_states=True,
         use_cache=True,
-        past_key_values=prefix_cache,
+        past_key_values=target_cache,
     )
-    prefix_cache = prefill_outputs.past_key_values
-    prefix_ctx_features = raw_drafter.extract_ctx_features(prefill_outputs.hidden_states)
+    target_cache = prefill_outputs.past_key_values
+    target_ctx_features = raw_drafter.extract_ctx_features(prefill_outputs.hidden_states)
+    drafter_cache = DynamicCache()
     current_root_token = int(sample_from_logits(prefill_outputs.logits[:, -1, :], temperature)[0].item())
     output_ids = torch.cat(
         [prompt_ids[0], torch.tensor([current_root_token], dtype=torch.long, device=device)],
         dim=0,
     )
+    input_len = output_ids.shape[0]
     acceptance_lengths: list[int] = []
     drafted_tokens = 0
     committed_tokens = 1
@@ -371,6 +347,8 @@ def speculative_generate(
     while committed_tokens < max_new_tokens:
         if eos_token_id is not None and current_root_token == eos_token_id:
             break
+            
+        prefix_len = target_cache.get_seq_length()
 
         root_position = output_ids.shape[0] - 1
         tree_token_ids, draft_logits, draft_token_probs, tree_info, q_scores = draft_tree(
@@ -379,10 +357,11 @@ def speculative_generate(
             target_embeddings=target_embeddings,
             target_lm_head=target_lm_head,
             tree_processor=tree_processor,
-            prefix_ctx_features=prefix_ctx_features,
+            drafter_cache=drafter_cache,
             current_root_token=current_root_token,
             root_position=root_position,
             temperature=temperature,
+            target_ctx_features=target_ctx_features,
             device=device,
         )
         drafted_tokens += tree_info.block_size - 1
@@ -398,14 +377,13 @@ def speculative_generate(
                 prune_topk=tree_processor.prune_topk,
             )
 
-        prefix_len = prefix_cache.get_seq_length()
         updated_cache, verifier_logits, tree_ctx_features = verify_tree(
             target_model=target_model,
             raw_drafter=raw_drafter,
             tree_token_ids=tree_token_ids,
             tree_info=tree_info,
             root_position=root_position,
-            prefix_cache=prefix_cache,
+            target_cache=target_cache,
             temperature=temperature,
         )
         accepted_mask = build_acceptance_mask(
@@ -435,17 +413,15 @@ def speculative_generate(
         output_ids = torch.cat([output_ids, step_tokens], dim=0)
         committed_tokens += int(step_tokens.numel())
 
-        prefix_ctx_features = torch.cat(
-            [prefix_ctx_features, tree_ctx_features[:, accepted_path, :]],
-            dim=1,
-        )
-        prefix_cache = trim_dynamic_cache(
+        target_ctx_features = tree_ctx_features
+        
+        target_cache = trim_dynamic_cache(
             updated_cache,
             prefix_len=prefix_len,
             keep_tree_indices=accepted_path,
         )
         current_root_token = bonus_token
-        if eos_token_id is not None and output_ids[-1].item() == eos_token_id:
+        if eos_token_id is not None and (output_ids[input_len:] == eos_token_id).any():
             break
 
     text = tokenizer.decode(output_ids, skip_special_tokens=True)
