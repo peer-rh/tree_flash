@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass
+from html import escape
+from pathlib import Path
 from typing import Any, Sequence
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import Cache, DynamicCache
 
+from .data import load_and_process_eval_dataset
 from .models import DFlashDraftModel
 from .trainer import has_pruning_head, unwrap_model
 from .trees import (
@@ -23,13 +26,66 @@ from .trees import (
 @dataclass
 class SpecDecodeResult:
     token_ids: torch.Tensor
+    continuation_ids: torch.Tensor
     text: str
     acceptance_lengths: list[int]
     drafted_tokens: int
     committed_tokens: int
 
 
+@dataclass
+class ComparedToken:
+    token_id: int
+    token_text: str
+    status: str
+    expected_token_id: int | None = None
+    expected_token_text: str | None = None
+
+
+@dataclass
+class EvalExampleResult:
+    index: int
+    prompt: str
+    reference_text: str | None
+    generated_text: str
+    comparisons: list[ComparedToken]
+    missing_reference_tokens: list[ComparedToken]
+    accepted_count: int
+    rejected_count: int
+    extra_count: int
+    missing_count: int
+    exact_match: bool
+    drafted_tokens: int
+    committed_tokens: int
+    mean_acceptance_length: float
+
+
+@dataclass
+class EvalSuiteResult:
+    examples: list[EvalExampleResult]
+    total_examples: int
+    exact_matches: int
+    accepted_count: int
+    rejected_count: int
+    extra_count: int
+    missing_count: int
+
+
+OFFICIAL_DFLASH_MODELS = {
+    "qwen3-8b": "z-lab/Qwen3-8B-DFlash-b16",
+    "qwen3-coder-30b-a3b": "z-lab/Qwen3-Coder-30B-A3B-DFlash-b16",
+    "z-lab/qwen3-8b-dflash-b16": "z-lab/Qwen3-8B-DFlash-b16",
+    "z-lab/qwen3-coder-30b-a3b-dflash-b16": "z-lab/Qwen3-Coder-30B-A3B-DFlash-b16",
+}
+
+OFFICIAL_DFLASH_TARGETS = {
+    "z-lab/Qwen3-8B-DFlash-b16": "Qwen/Qwen3-8B",
+    "z-lab/Qwen3-Coder-30B-A3B-DFlash-b16": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+}
+
+
 def sample_from_logits(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Sample or greedily pick token ids from logits."""
     if temperature <= 0:
         return logits.argmax(dim=-1)
     scaled = logits / temperature
@@ -42,6 +98,7 @@ def gather_token_probability(
     token_ids: torch.Tensor,
     temperature: float,
 ) -> torch.Tensor:
+    """Return model probabilities assigned to specific token ids."""
     if temperature > 0:
         logits = logits / temperature
     probs = torch.softmax(logits.float(), dim=-1)
@@ -55,6 +112,7 @@ def build_tree_processor(
     sub_tree_paths: Sequence[str] | None = None,
     tree_args: dict[str, Any] | None = None,
 ):
+    """Construct the tree processor used by speculative decoding."""
     tree_args = tree_args or {}
     if tree_type in {"fixed", "block"}:
         return BlockTreeProcessor(
@@ -84,6 +142,7 @@ def build_verifier_score_mod(
     tree_info: TreeInfo,
     prefix_len: int,
 ):
+    """Build a verifier mask that only allows prefix and ancestor attention."""
     tree_mask = tree_info.tree_mask
     block_size = tree_info.block_size
 
@@ -105,6 +164,7 @@ def trim_dynamic_cache(
     prefix_len: int,
     keep_tree_indices: list[int],
 ) -> Cache:
+    """Keep only the accepted tree nodes in a DynamicCache."""
     keep = torch.tensor(keep_tree_indices, dtype=torch.long)
     for layer in past_key_values.layers:
         if not getattr(layer, "is_initialized", False) or layer.keys is None or layer.values is None:
@@ -126,6 +186,7 @@ def choose_deepest_valid_node(
     accepted_mask: torch.Tensor,
     tree_info: TreeInfo,
 ) -> int:
+    """Choose the deepest drafted node whose full path was accepted."""
     valid_nodes = []
     for node_idx in range(tree_info.block_size):
         path_mask = tree_info.tree_mask[node_idx]
@@ -140,6 +201,7 @@ def gather_path_indices(
     node_idx: int,
     tree_info: TreeInfo,
 ) -> list[int]:
+    """Return the path from root to a node, inclusive."""
     path = []
     cur = node_idx
     while cur >= 0:
@@ -154,6 +216,7 @@ def select_pruned_keep_indices(
     q_scores: torch.Tensor,
     prune_topk: int,
 ) -> list[int]:
+    """Keep the best-scoring nodes plus their ancestors for pruning."""
     if prune_topk < 0:
         raise ValueError(f"prune_topk must be >= 0, got {prune_topk}.")
     if prune_topk == 0 or tree_info.block_size <= 1:
@@ -177,6 +240,7 @@ def prune_drafted_tree(
     q_scores: torch.Tensor,
     prune_topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TreeInfo]:
+    """Prune a drafted tree down to a smaller ancestor-closed subset."""
     keep_indices = select_pruned_keep_indices(
         tree_info=tree_info,
         q_scores=q_scores,
@@ -199,6 +263,7 @@ def build_tree_parent_token_ids(
     tree_token_ids: torch.Tensor,
     tree_info: TreeInfo,
 ) -> torch.Tensor:
+    """Map each tree node to its parent token id."""
     parent_token_ids = tree_token_ids.clone()
     if tree_info.block_size <= 1:
         return parent_token_ids
@@ -217,6 +282,7 @@ def build_pruning_scores(
     target_lm_head,
     temperature: float,
 ) -> torch.Tensor | None:
+    """Score drafted nodes for pruning using the available drafter head."""
     if getattr(raw_drafter, "ar_fusion", None) is not None:
         parent_token_ids = build_tree_parent_token_ids(tree_token_ids, tree_info)
         parent_embeddings = target_embeddings(parent_token_ids.unsqueeze(0))
@@ -244,6 +310,7 @@ def draft_tree(
     temperature: float,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TreeInfo, torch.Tensor | None]:
+    """Draft a speculative tree from the current root token."""
     tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=device)
     tree_len = tree_info.block_size
     pre_len = drafter_cache.get_seq_length()
@@ -289,6 +356,7 @@ def verify_tree(
     target_cache: Cache,
     temperature: float,
 ) -> tuple[Cache, torch.Tensor, torch.Tensor]:
+    """Verify drafted tokens with the target model under tree constraints."""
     prefix_len = target_cache.get_seq_length()
     score_mod = build_verifier_score_mod(
         tree_info=tree_info,
@@ -320,6 +388,7 @@ def build_acceptance_mask(
     tree_info: TreeInfo,
     temperature: float,
 ) -> torch.Tensor:
+    """Decide which drafted nodes are accepted by the verifier."""
     accepted = torch.zeros((tree_info.block_size,), dtype=torch.bool, device=tree_token_ids.device)
     accepted[0] = True
     if temperature <= 0:
@@ -343,23 +412,24 @@ def build_acceptance_mask(
 
 
 @torch.inference_mode()
-def speculative_generate(
+def speculative_generate_from_ids(
     *,
     target_model,
     drafter_model,
     tokenizer,
-    prompt: str,
+    prompt_ids: torch.Tensor,
     tree_processor,
     max_new_tokens: int = 256,
     temperature: float = 0.0,
 ) -> SpecDecodeResult:
+    """Run tree speculative decoding from already-tokenized prompt ids."""
     device = next(target_model.parameters()).device
     raw_drafter = unwrap_model(drafter_model)
     if isinstance(tree_processor, PrunableTreeProcessor) and not has_pruning_head(raw_drafter):
         raise ValueError(
             "tree_type='prunable' requires a drafter checkpoint/config with use_q_head=True or use_ar_head=True."
         )
-    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    prompt_ids = prompt_ids.to(device).view(1, -1)
     target_cache = DynamicCache()
     prefill_outputs = target_model(
         input_ids=prompt_ids,
@@ -467,8 +537,10 @@ def speculative_generate(
             break
 
     text = tokenizer.decode(output_ids, skip_special_tokens=True)
+    continuation_ids = output_ids[input_len:].detach().cpu()
     return SpecDecodeResult(
         token_ids=output_ids.detach().cpu(),
+        continuation_ids=continuation_ids,
         text=text,
         acceptance_lengths=acceptance_lengths,
         drafted_tokens=drafted_tokens,
@@ -476,11 +548,360 @@ def speculative_generate(
     )
 
 
+@torch.inference_mode()
+def speculative_generate(
+    *,
+    target_model,
+    drafter_model,
+    tokenizer,
+    prompt: str,
+    tree_processor,
+    max_new_tokens: int = 256,
+    temperature: float = 0.0,
+) -> SpecDecodeResult:
+    """Run tree speculative decoding from a text prompt."""
+    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids[0]
+    return speculative_generate_from_ids(
+        target_model=target_model,
+        drafter_model=drafter_model,
+        tokenizer=tokenizer,
+        prompt_ids=prompt_ids,
+        tree_processor=tree_processor,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+    )
+
+
+def resolve_official_dflash_model(model_name: str) -> str:
+    """Resolve a short official DFlash alias to its Hugging Face repo id."""
+    return OFFICIAL_DFLASH_MODELS.get(model_name.lower(), model_name)
+
+
+def infer_target_model_for_draft_model(draft_model: str) -> str | None:
+    """Infer the base target model for a known official DFlash checkpoint."""
+    return OFFICIAL_DFLASH_TARGETS.get(draft_model)
+
+
+def apply_chat_template_if_requested(
+    *,
+    tokenizer,
+    prompt: str,
+    enabled: bool,
+) -> str:
+    """Apply the tokenizer chat template when requested."""
+    if not enabled:
+        return prompt
+    template_kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    try:
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            enable_thinking=False,
+            **template_kwargs,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            **template_kwargs,
+        )
+
+
+def _format_token_text(tokenizer, token_id: int) -> str:
+    """Render a token as a compact string for HTML output."""
+    try:
+        text = tokenizer.decode([token_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+    except TypeError:
+        text = tokenizer.decode([token_id], skip_special_tokens=False)
+    if not text:
+        token = tokenizer.convert_ids_to_tokens([token_id])[0]
+        text = f"<{token}>"
+    return text.replace(" ", "·").replace("\n", "↵\n").replace("\t", "⇥")
+
+
+def compare_generation_to_reference(
+    *,
+    tokenizer,
+    reference_ids: torch.Tensor,
+    generated_ids: torch.Tensor,
+) -> tuple[list[ComparedToken], list[ComparedToken], dict[str, int | bool]]:
+    """Label generated tokens as accepted, rejected, extra, or missing."""
+    comparisons: list[ComparedToken] = []
+    missing_reference_tokens: list[ComparedToken] = []
+    accepted_count = 0
+    rejected_count = 0
+    extra_count = 0
+
+    reference_len = int(reference_ids.numel())
+    generated_len = int(generated_ids.numel())
+    overlap = min(reference_len, generated_len)
+
+    for idx in range(overlap):
+        generated_id = int(generated_ids[idx].item())
+        expected_id = int(reference_ids[idx].item())
+        if generated_id == expected_id:
+            status = "accepted"
+            accepted_count += 1
+        else:
+            status = "rejected"
+            rejected_count += 1
+        comparisons.append(
+            ComparedToken(
+                token_id=generated_id,
+                token_text=_format_token_text(tokenizer, generated_id),
+                status=status,
+                expected_token_id=expected_id,
+                expected_token_text=_format_token_text(tokenizer, expected_id),
+            )
+        )
+
+    for idx in range(overlap, generated_len):
+        generated_id = int(generated_ids[idx].item())
+        comparisons.append(
+            ComparedToken(
+                token_id=generated_id,
+                token_text=_format_token_text(tokenizer, generated_id),
+                status="extra",
+            )
+        )
+        extra_count += 1
+
+    for idx in range(overlap, reference_len):
+        expected_id = int(reference_ids[idx].item())
+        missing_reference_tokens.append(
+            ComparedToken(
+                token_id=expected_id,
+                token_text=_format_token_text(tokenizer, expected_id),
+                status="missing",
+            )
+        )
+
+    metrics = {
+        "accepted_count": accepted_count,
+        "rejected_count": rejected_count,
+        "extra_count": extra_count,
+        "missing_count": len(missing_reference_tokens),
+        "exact_match": generated_len == reference_len and rejected_count == 0,
+    }
+    return comparisons, missing_reference_tokens, metrics
+
+
+def get_eval_prompt(sample: dict[str, Any]) -> str:
+    """Extract a single prompt string from an eval dataset sample."""
+    turns = sample.get("turns")
+    if not turns:
+        raise ValueError("Expected eval dataset samples to contain a non-empty 'turns' field.")
+    return "\n\n".join(str(turn) for turn in turns)
+
+
+def evaluate_prompt_suite(
+    *,
+    data_name: str,
+    tokenizer,
+    generate_fn,
+    max_examples: int | None = None,
+    max_new_tokens: int = 256,
+) -> EvalSuiteResult:
+    """Run generation over prompts from load_and_process_eval_dataset."""
+    dataset = load_and_process_eval_dataset(data_name)
+    examples: list[EvalExampleResult] = []
+
+    for sample_idx in range(len(dataset)):
+        if max_examples is not None and sample_idx >= max_examples:
+            break
+        sample = dataset[sample_idx]
+        prompt = get_eval_prompt(sample)
+        result = generate_fn(prompt=prompt, max_new_tokens=max_new_tokens)
+        generated_ids = result.continuation_ids
+        comparisons = [
+            ComparedToken(
+                token_id=int(token_id.item()),
+                token_text=_format_token_text(tokenizer, int(token_id.item())),
+                status="extra",
+            )
+            for token_id in generated_ids
+        ]
+        examples.append(
+            EvalExampleResult(
+                index=sample_idx,
+                prompt=prompt,
+                reference_text=None,
+                generated_text=tokenizer.decode(generated_ids, skip_special_tokens=False),
+                comparisons=comparisons,
+                missing_reference_tokens=[],
+                accepted_count=0,
+                rejected_count=0,
+                extra_count=len(comparisons),
+                missing_count=0,
+                exact_match=False,
+                drafted_tokens=result.drafted_tokens,
+                committed_tokens=result.committed_tokens,
+                mean_acceptance_length=(
+                    sum(result.acceptance_lengths) / len(result.acceptance_lengths)
+                    if result.acceptance_lengths
+                    else 0.0
+                ),
+            )
+        )
+
+    return EvalSuiteResult(
+        examples=examples,
+        total_examples=len(examples),
+        exact_matches=0,
+        accepted_count=0,
+        rejected_count=0,
+        extra_count=sum(example.extra_count for example in examples),
+        missing_count=0,
+    )
+
+
+def render_eval_suite_html(report: EvalSuiteResult) -> str:
+    """Render a minimal HTML report with colored token spans."""
+    def render_token_spans(tokens: Sequence[ComparedToken]) -> str:
+        if not tokens:
+            return '<span class="empty">None</span>'
+        return "".join(
+            '<span class="token {status}" title="{title}">{text}</span>'.format(
+                status=escape(token.status),
+                title=escape(f"id={token.token_id}"),
+                text=escape(token.token_text),
+            )
+            for token in tokens
+        )
+
+    sections = []
+    for example in report.examples:
+        reference_block = ""
+        if example.reference_text is not None:
+            reference_block = "<h3>Reference</h3><pre>{}</pre>".format(escape(example.reference_text))
+        sections.append(
+            """
+            <section class="example">
+              <h2>Example {index}</h2>
+              <p>
+                match={match_label}
+                accepted={accepted}
+                rejected={rejected}
+                extra={extra}
+                missing={missing}
+                drafted={drafted}
+                committed={committed}
+                mean_acceptance={mean_acceptance:.2f}
+              </p>
+              <h3>Prompt</h3>
+              <pre>{prompt}</pre>
+              {reference_block}
+              <h3>Generated</h3>
+              <pre>{generated_text}</pre>
+              <h3>Accepted / Rejected / Extra Tokens</h3>
+              <div>{comparison_tokens}</div>
+              <h3>Missing Reference Tokens</h3>
+              <div>{missing_tokens}</div>
+            </section>
+            """.format(
+                index=example.index,
+                match_label="exact" if example.exact_match else "mismatch",
+                accepted=example.accepted_count,
+                rejected=example.rejected_count,
+                extra=example.extra_count,
+                missing=example.missing_count,
+                drafted=example.drafted_tokens,
+                committed=example.committed_tokens,
+                mean_acceptance=example.mean_acceptance_length,
+                prompt=escape(example.prompt),
+                reference_block=reference_block,
+                generated_text=escape(example.generated_text),
+                comparison_tokens=render_token_spans(example.comparisons),
+                missing_tokens=render_token_spans(example.missing_reference_tokens),
+            )
+        )
+
+    return """
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <title>Spec Decode Eval Report</title>
+        <style>
+          body {{ font-family: sans-serif; line-height: 1.5; }}
+          .example {{ margin: 1.5rem 0; }}
+          .token {{ padding: 0.1rem 0.35rem; margin-right: 0.2rem; }}
+          .accepted {{ background: #c8f7c5; }}
+          .rejected {{ background: #f7c5c5; }}
+          .extra, .missing {{ background: #c5d9f7; }}
+          pre {{ white-space: pre-wrap; }}
+        </style>
+      </head>
+      <body>
+        <h1>Spec Decode Validation Report</h1>
+        <p>
+          examples={total_examples}
+          exact_matches={exact_matches}
+          accepted={accepted_count}
+          rejected={rejected_count}
+          extra={extra_count}
+          missing={missing_count}
+        </p>
+        {sections}
+      </body>
+    </html>
+    """.format(
+        total_examples=report.total_examples,
+        exact_matches=report.exact_matches,
+        accepted_count=report.accepted_count,
+        rejected_count=report.rejected_count,
+        extra_count=report.extra_count,
+        missing_count=report.missing_count,
+        sections="".join(sections),
+    )
+
+
+@torch.inference_mode()
+def official_dflash_generate_from_ids(
+    *,
+    target_model,
+    drafter_model,
+    tokenizer,
+    prompt_ids: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float,
+) -> SpecDecodeResult:
+    """Run generation through the official DFlash remote-code backend."""
+    device = next(target_model.parameters()).device
+    prompt_ids = prompt_ids.to(device).view(1, -1)
+    eos_token_ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
+    output_ids = drafter_model.spec_generate(
+        input_ids=prompt_ids,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        target=target_model,
+        stop_token_ids=eos_token_ids,
+    )[0]
+    text = tokenizer.decode(output_ids, skip_special_tokens=True)
+    continuation_ids = output_ids[prompt_ids.shape[1] :].detach().cpu()
+    return SpecDecodeResult(
+        token_ids=output_ids.detach().cpu(),
+        continuation_ids=continuation_ids,
+        text=text,
+        acceptance_lengths=[],
+        drafted_tokens=0,
+        committed_tokens=int(continuation_ids.numel()),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for prompt and eval-dataset modes."""
     parser = argparse.ArgumentParser(description="Tree speculative decoding.")
-    parser.add_argument("--target-model", required=True)
-    parser.add_argument("--draft-model", required=True)
-    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--target-model")
+    parser.add_argument("--draft-model")
+    parser.add_argument("--official-dflash-model", default=None)
+    parser.add_argument("--backend", choices=["auto", "tree_flash", "official_dflash"], default="auto")
+    parser.add_argument("--prompt")
+    parser.add_argument("--eval-data", default=None)
+    parser.add_argument("--eval-max-examples", type=int, default=None)
+    parser.add_argument("--html-report", default=None)
+    parser.add_argument("--apply-chat-template", action="store_true")
     parser.add_argument(
         "--tree-type",
         default="block",
@@ -500,45 +921,147 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Run prompt decoding or eval-dataset generation from the command line."""
     parser = build_parser()
     args = parser.parse_args()
+    if args.prompt is None and args.eval_data is None:
+        parser.error("one of --prompt or --eval-data is required")
     tree_args = json.loads(args.tree_args)
     dtype_map = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
         "float32": torch.float32,
     }
+    backend = args.backend
+    draft_model_name = args.draft_model
+    if args.official_dflash_model is not None:
+        draft_model_name = resolve_official_dflash_model(args.official_dflash_model)
+        if backend == "auto":
+            backend = "official_dflash"
+    elif backend == "auto":
+        backend = "tree_flash"
+    if draft_model_name is None:
+        parser.error("a draft model is required via --draft-model or --official-dflash-model")
+    target_model_name = args.target_model or infer_target_model_for_draft_model(draft_model_name)
+    if target_model_name is None:
+        parser.error("target model is required when it cannot be inferred from the draft model")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model)
+    tokenizer_kwargs = {"trust_remote_code": True} if backend == "official_dflash" else {}
+    tokenizer = AutoTokenizer.from_pretrained(target_model_name, **tokenizer_kwargs)
+    target_model_kwargs: dict[str, Any] = {
+        "torch_dtype": dtype_map[args.dtype],
+    }
+    if backend == "tree_flash":
+        target_model_kwargs["attn_implementation"] = "flex_attention"
     target_model = AutoModelForCausalLM.from_pretrained(
-        args.target_model,
-        torch_dtype=dtype_map[args.dtype],
-        attn_implementation="flex_attention",
+        target_model_name,
+        **target_model_kwargs,
     ).to(device)
     target_model.eval()
 
-    drafter_model = DFlashDraftModel.from_pretrained(
-        args.draft_model,
-        torch_dtype=dtype_map[args.dtype],
-    ).to(device)
+    if backend == "official_dflash":
+        drafter_model = AutoModel.from_pretrained(
+            draft_model_name,
+            trust_remote_code=True,
+            torch_dtype=dtype_map[args.dtype],
+        ).to(device)
+    else:
+        drafter_model = DFlashDraftModel.from_pretrained(
+            draft_model_name,
+            torch_dtype=dtype_map[args.dtype],
+        ).to(device)
     drafter_model.eval()
 
-    tree_processor = build_tree_processor(
-        tree_type=args.tree_type,
-        tree_seq_depth=args.tree_seq_depth,
-        sub_tree_paths=args.sub_tree_paths,
-        tree_args=tree_args,
-    )
-    result = speculative_generate(
-        target_model=target_model,
-        drafter_model=drafter_model,
+    if args.eval_data is not None:
+        if backend == "tree_flash":
+            tree_processor = build_tree_processor(
+                tree_type=args.tree_type,
+                tree_seq_depth=args.tree_seq_depth,
+                sub_tree_paths=args.sub_tree_paths,
+                tree_args=tree_args,
+            )
+
+            def generate_fn(*, prompt: str, max_new_tokens: int) -> SpecDecodeResult:
+                return speculative_generate(
+                    target_model=target_model,
+                    drafter_model=drafter_model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    tree_processor=tree_processor,
+                    max_new_tokens=max_new_tokens,
+                    temperature=args.temperature,
+                )
+        else:
+            def generate_fn(*, prompt: str, max_new_tokens: int) -> SpecDecodeResult:
+                prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids[0]
+                return official_dflash_generate_from_ids(
+                    target_model=target_model,
+                    drafter_model=drafter_model,
+                    tokenizer=tokenizer,
+                    prompt_ids=prompt_ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=args.temperature,
+                )
+
+        report = evaluate_prompt_suite(
+            data_name=args.eval_data,
+            tokenizer=tokenizer,
+            generate_fn=generate_fn,
+            max_examples=args.eval_max_examples,
+            max_new_tokens=args.max_new_tokens,
+        )
+        print(
+            json.dumps(
+                {
+                    "total_examples": report.total_examples,
+                    "exact_matches": report.exact_matches,
+                    "accepted_count": report.accepted_count,
+                    "rejected_count": report.rejected_count,
+                    "extra_count": report.extra_count,
+                    "missing_count": report.missing_count,
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
+        if args.html_report is not None:
+            report_path = Path(args.html_report)
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(render_eval_suite_html(report), encoding="utf-8")
+        return
+
+    prompt = apply_chat_template_if_requested(
         tokenizer=tokenizer,
         prompt=args.prompt,
-        tree_processor=tree_processor,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
+        enabled=args.apply_chat_template,
     )
+    if backend == "official_dflash":
+        prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids[0]
+        result = official_dflash_generate_from_ids(
+            target_model=target_model,
+            drafter_model=drafter_model,
+            tokenizer=tokenizer,
+            prompt_ids=prompt_ids,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+        )
+    else:
+        tree_processor = build_tree_processor(
+            tree_type=args.tree_type,
+            tree_seq_depth=args.tree_seq_depth,
+            sub_tree_paths=args.sub_tree_paths,
+            tree_args=tree_args,
+        )
+        result = speculative_generate(
+            target_model=target_model,
+            drafter_model=drafter_model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            tree_processor=tree_processor,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+        )
     print(result.text, flush=True)
 
 

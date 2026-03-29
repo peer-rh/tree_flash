@@ -18,9 +18,14 @@ from src.spec_decode import (
     build_pruning_scores,
     build_verifier_score_mod,
     build_tree_processor,
+    compare_generation_to_reference,
     choose_deepest_valid_node,
+    evaluate_prompt_suite,
     gather_path_indices,
     prune_drafted_tree,
+    render_eval_suite_html,
+    resolve_official_dflash_model,
+    infer_target_model_for_draft_model,
     select_pruned_keep_indices,
     verify_tree,
 )
@@ -33,6 +38,58 @@ def _require_flex_attention() -> None:
         import torch.nn.attention.flex_attention  # noqa: F401
     except ImportError:
         pytest.skip("flex attention is unavailable in this test environment")
+
+
+def _write_stage2_fixture(path: Path) -> None:
+    import h5py
+
+    with h5py.File(path, "w") as hf:
+        vlen = h5py.vlen_dtype("int64")
+        hf.create_dataset("prompt_ids", shape=(2,), dtype=vlen)
+        hf.create_dataset("response_ids", shape=(2,), dtype=vlen)
+        hf["prompt_ids"][0] = [11, 12]
+        hf["response_ids"][0] = [21, 22, 23]
+        hf["prompt_ids"][1] = [13]
+        hf["response_ids"][1] = [24, 25]
+
+        hf.create_dataset("sequence_offsets", data=[0, 3, 5], dtype="int64")
+        hf.attrs["sub_tree_paths"] = ["0-1", "0-2", "1-3"]
+        hf.create_dataset(
+            "sub_trees",
+            data=[
+                [21, 31, 32, 33],
+                [22, 41, 42, 43],
+                [23, 51, 52, 53],
+                [24, 61, 62, 63],
+                [25, 71, 72, 73],
+            ],
+            dtype="int64",
+        )
+        hf.create_dataset(
+            "sub_trees_ar_probs",
+            data=[
+                [0.8, 0.5, 0.25, 0.2],
+                [0.7, 0.4, 0.3, 0.1],
+                [0.6, 0.3, 0.2, 0.1],
+                [0.9, 0.6, 0.5, 0.4],
+                [0.8, 0.5, 0.25, 0.2],
+            ],
+            dtype="float32",
+        )
+
+
+class _TinyTokenizer:
+    def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.tolist()
+        if isinstance(token_ids, int):
+            token_ids = [token_ids]
+        return "".join(chr(64 + int(token_id)) for token_id in token_ids)
+
+    def convert_ids_to_tokens(self, token_ids):
+        if isinstance(token_ids, int):
+            token_ids = [token_ids]
+        return [f"T{int(token_id)}" for token_id in token_ids]
 
 
 def _build_fake_trainer_components(
@@ -898,11 +955,105 @@ def test_verify_tree_uses_score_mod_without_dense_attention_mask() -> None:
     assert callable(target_model.kwargs["score_mod"])
 
 
+def test_compare_generation_to_reference_marks_accepted_rejected_extra_and_missing() -> None:
+    tokenizer = _TinyTokenizer()
+
+    comparisons, missing_tokens, metrics = compare_generation_to_reference(
+        tokenizer=tokenizer,
+        reference_ids=torch.tensor([1, 2, 3], dtype=torch.long),
+        generated_ids=torch.tensor([1, 9, 8, 7], dtype=torch.long),
+    )
+
+    assert [token.status for token in comparisons] == ["accepted", "rejected", "rejected", "extra"]
+    assert [token.status for token in missing_tokens] == []
+    assert metrics == {
+        "accepted_count": 1,
+        "rejected_count": 2,
+        "extra_count": 1,
+        "missing_count": 0,
+        "exact_match": False,
+    }
+
+
+def test_evaluate_prompt_suite_and_render_html(monkeypatch) -> None:
+    import src.spec_decode as spec_decode_mod
+
+    tokenizer = _TinyTokenizer()
+    monkeypatch.setattr(
+        spec_decode_mod,
+        "load_and_process_eval_dataset",
+        lambda data_name: [
+            {"turns": ["Prompt one"]},
+            {"turns": ["Prompt two", "Follow up"]},
+        ],
+    )
+
+    results = [
+        type(
+            "FakeResult",
+            (),
+            {
+                "continuation_ids": torch.tensor([21, 22, 23], dtype=torch.long),
+                "drafted_tokens": 6,
+                "committed_tokens": 3,
+                "acceptance_lengths": [2, 1],
+            },
+        )(),
+        type(
+            "FakeResult",
+            (),
+            {
+                "continuation_ids": torch.tensor([24, 99], dtype=torch.long),
+                "drafted_tokens": 5,
+                "committed_tokens": 2,
+                "acceptance_lengths": [1],
+            },
+        )(),
+    ]
+
+    def generate_fn(*, prompt: str, max_new_tokens: int):
+        _ = prompt, max_new_tokens
+        return results.pop(0)
+
+    report = evaluate_prompt_suite(
+        data_name="alpaca",
+        tokenizer=tokenizer,
+        generate_fn=generate_fn,
+        max_examples=2,
+        max_new_tokens=3,
+    )
+
+    assert report.total_examples == 2
+    assert report.exact_matches == 0
+    assert report.accepted_count == 0
+    assert report.rejected_count == 0
+    assert report.extra_count == 5
+    assert report.missing_count == 0
+
+    html = render_eval_suite_html(report)
+
+    assert "Spec Decode Validation Report" in html
+    assert "token extra" in html
+    assert "match=mismatch" in html
+    assert "accepted=0" in html
+    assert "Prompt one" in html
+    assert "Prompt two" in html
+
+
+def test_official_dflash_aliases_infer_target_pairing() -> None:
+    draft_model = resolve_official_dflash_model("qwen3-8b")
+
+    assert draft_model == "z-lab/Qwen3-8B-DFlash-b16"
+    assert infer_target_model_for_draft_model(draft_model) == "Qwen/Qwen3-8B"
+
+
 def test_parsers_accept_prunable_tree_type() -> None:
     trainer_tree_action = next(action for action in build_trainer_parser()._actions if action.dest == "tree_type")
     spec_tree_action = next(action for action in build_spec_decode_parser()._actions if action.dest == "tree_type")
 
     assert "prunable" in trainer_tree_action.choices
     assert "prunable" in spec_tree_action.choices
+    assert any(action.dest == "official_dflash_model" for action in build_spec_decode_parser()._actions)
+    assert any(action.dest == "eval_data" for action in build_spec_decode_parser()._actions)
     assert all(action.dest != "trainer.target_attn_implementation" for action in build_trainer_parser()._actions)
     assert all(action.dest != "attn_implementation" for action in build_spec_decode_parser()._actions)
