@@ -278,15 +278,23 @@ def build_pruning_scores(
     backbone_hidden: torch.Tensor,
     tree_token_ids: torch.Tensor,
     tree_info: TreeInfo,
+    target_ctx_features: torch.Tensor,
+    position_ids: torch.Tensor,
     target_embeddings,
     target_lm_head,
     temperature: float,
 ) -> torch.Tensor | None:
     """Score drafted nodes for pruning using the available drafter head."""
-    if getattr(raw_drafter, "ar_fusion", None) is not None:
+    if getattr(raw_drafter, "ar_block", None) is not None:
         parent_token_ids = build_tree_parent_token_ids(tree_token_ids, tree_info)
         parent_embeddings = target_embeddings(parent_token_ids.unsqueeze(0))
-        ar_hidden_states = raw_drafter.build_ar_hidden_states(backbone_hidden, parent_embeddings)
+        ar_hidden_states = raw_drafter.build_ar_hidden_states(
+            backbone_hidden,
+            parent_embeddings,
+            target_ctx_features=target_ctx_features,
+            tree_info=tree_info,
+            position_ids=position_ids,
+        )
         ar_logits = target_lm_head(ar_hidden_states)[0]
         ar_scores = gather_token_probability(ar_logits, tree_token_ids, temperature)
         ar_scores[0] = 1.0
@@ -339,6 +347,8 @@ def draft_tree(
         backbone_hidden=backbone_hidden,
         tree_token_ids=tree_token_ids,
         tree_info=tree_info,
+        target_ctx_features=target_ctx_features,
+        position_ids=position_ids,
         target_embeddings=target_embeddings,
         target_lm_head=target_lm_head,
         temperature=temperature,

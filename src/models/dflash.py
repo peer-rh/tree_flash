@@ -52,6 +52,27 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+
+def build_ar_score_mod(
+    *,
+    tree_info: TreeInfo,
+    prefix_len: int,
+):
+    """Allow all context tokens and only ancestor/self attention within a tree."""
+    tree_mask = tree_info.tree_mask
+    block_size = tree_info.block_size
+
+    def score_mod(score, B, H, Q, KV):
+        is_prefix = KV < prefix_len
+        tree_kv = KV - prefix_len
+        valid_tree = (tree_kv >= 0) & (tree_kv < block_size)
+        q_idx = Q.clamp(0, block_size - 1)
+        kv_idx = tree_kv.clamp(0, block_size - 1)
+        legal_tree = valid_tree & tree_mask[q_idx, kv_idx]
+        return torch.where(is_prefix | legal_tree, score, torch.full_like(score, float("-inf")))
+
+    return score_mod
+
 class Qwen3DFlashAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -240,13 +261,15 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         if self.config.use_q_head:
             self.q_head = nn.Linear(config.hidden_size, 1, bias=False)
 
-        self.ar_fusion = None
-        self.ar_norm = None
+        self.ar_input_proj = None
+        self.ar_block = None
+        self.ar_output_norm = None
         if not hasattr(config, "use_ar_head"):
             self.config.use_ar_head = False
         if self.config.use_ar_head:
-            self.ar_fusion = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
-            self.ar_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.ar_input_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+            self.ar_block = Qwen3DFlashDecoderLayer(config, layer_idx=0)
+            self.ar_output_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
         self.post_init()
 
@@ -273,16 +296,42 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self,
         backbone_hidden_states: torch.Tensor,
         parent_embeddings: torch.Tensor,
+        *,
+        target_ctx_features: Optional[torch.Tensor],
+        tree_info: TreeInfo,
+        position_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.ar_fusion is None or self.ar_norm is None:
+        if self.ar_input_proj is None or self.ar_block is None or self.ar_output_norm is None:
             raise ValueError("AR head is not enabled on this drafter config.")
         if backbone_hidden_states.shape != parent_embeddings.shape:
             raise ValueError(
                 "backbone_hidden_states and parent_embeddings must have matching shapes, "
                 f"got {tuple(backbone_hidden_states.shape)} and {tuple(parent_embeddings.shape)}."
             )
+        if backbone_hidden_states.shape[:2] != position_ids.shape:
+            raise ValueError(
+                "position_ids must match the first two dimensions of backbone_hidden_states, "
+                f"got {tuple(position_ids.shape)} and {tuple(backbone_hidden_states.shape[:2])}."
+            )
         ar_inputs = torch.cat([backbone_hidden_states, parent_embeddings], dim=-1)
-        return self.ar_norm(self.ar_fusion(ar_inputs))
+        ar_hidden_states = self.ar_input_proj(ar_inputs)
+        encoded_target_ctx = self.encode_target_ctx(target_ctx_features)
+        position_embeddings = self.rotary_emb(ar_hidden_states, position_ids)
+        score_mod = build_ar_score_mod(
+            tree_info=tree_info,
+            prefix_len=0 if encoded_target_ctx is None else int(encoded_target_ctx.shape[1]),
+        )
+        ar_hidden_states = self.ar_block(
+            hidden_states=ar_hidden_states,
+            target_hidden=encoded_target_ctx,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+            tree_info=tree_info,
+            score_mod=score_mod,
+        )
+        return self.ar_output_norm(ar_hidden_states)
 
     def forward(
         self,

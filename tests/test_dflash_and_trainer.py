@@ -29,7 +29,13 @@ from src.spec_decode import (
     select_pruned_keep_indices,
     verify_tree,
 )
-from src.trainer import Trainer, TrainerConfig, build_parser as build_trainer_parser, build_prefill_attention_mask
+from src.trainer import (
+    Trainer,
+    TrainerConfig,
+    build_ar_block_mask,
+    build_parser as build_trainer_parser,
+    build_prefill_attention_mask,
+)
 from src.trees import BlockTreeProcessor, PrunableTreeProcessor
 
 
@@ -185,7 +191,8 @@ def _build_fake_trainer_components(
             super().__init__()
             self.proj = nn.Linear(16, 16)
             self.q_head = nn.Linear(16, 1, bias=False) if with_q_head else None
-            self.ar_fusion = nn.Linear(32, 16, bias=False) if with_ar_head else None
+            self.ar_input_proj = nn.Linear(32, 16, bias=False) if with_ar_head else None
+            self.ar_block = nn.Linear(16, 16, bias=False) if with_ar_head else None
 
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
@@ -194,10 +201,20 @@ def _build_fake_trainer_components(
         def extract_ctx_features(self, hidden_states):
             return torch.cat(hidden_states[1:], dim=-1)
 
-        def build_ar_hidden_states(self, backbone_hidden_states, parent_embeddings):
-            if self.ar_fusion is None:
+        def build_ar_hidden_states(
+            self,
+            backbone_hidden_states,
+            parent_embeddings,
+            *,
+            target_ctx_features,
+            tree_info,
+            position_ids,
+            attention_mask=None,
+        ):
+            _ = target_ctx_features, tree_info, position_ids, attention_mask
+            if self.ar_input_proj is None or self.ar_block is None:
                 raise ValueError("AR head is not enabled")
-            return self.ar_fusion(torch.cat([backbone_hidden_states, parent_embeddings], dim=-1))
+            return self.ar_block(self.ar_input_proj(torch.cat([backbone_hidden_states, parent_embeddings], dim=-1)))
 
         def forward(self, *, hidden_states, position_ids, tree_info, attention_mask, target_ctx_features):
             return self.proj(hidden_states), hidden_states
@@ -400,7 +417,13 @@ def test_dflash_ar_head_reuses_shared_lm_head() -> None:
         target_ctx_features=target_ctx_features,
         attention_mask=None,
     )
-    ar_hidden = model.build_ar_hidden_states(backbone_hidden, parent_embeddings)
+    ar_hidden = model.build_ar_hidden_states(
+        backbone_hidden,
+        parent_embeddings,
+        target_ctx_features=target_ctx_features,
+        tree_info=tree_info,
+        position_ids=position_ids,
+    )
     ar_logits = shared_lm_head(ar_hidden)
 
     assert ar_hidden.shape == hidden_states.shape
@@ -873,6 +896,8 @@ def test_build_pruning_scores_prefers_ar_head_and_uses_shared_lm_head() -> None:
         backbone_hidden=backbone_hidden,
         tree_token_ids=tree_token_ids,
         tree_info=tree_info,
+        target_ctx_features=torch.randn(1, 6, 32),
+        position_ids=torch.arange(tree_info.block_size, dtype=torch.long).unsqueeze(0),
         target_embeddings=target_model.get_input_embeddings(),
         target_lm_head=target_model.get_output_embeddings(),
         temperature=0.0,
@@ -892,6 +917,39 @@ def test_build_prefill_attention_mask_uses_flex_block_mask() -> None:
 
     assert mask is not None
     assert type(mask).__name__ == "BlockMask"
+
+
+def test_build_ar_block_mask_allows_ctx_and_ancestor_self_only(monkeypatch) -> None:
+    _require_flex_attention()
+    flex_attention = pytest.importorskip("torch.nn.attention.flex_attention")
+    captured = {}
+
+    def fake_create_block_mask(mask_mod, **kwargs):
+        captured["mask_mod"] = mask_mod
+        return "mask"
+
+    monkeypatch.setattr(flex_attention, "create_block_mask", fake_create_block_mask)
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
+
+    mask = build_ar_block_mask(
+        anchor_positions=torch.tensor([[4]], dtype=torch.long),
+        document_mask=torch.tensor([[1, 1, 1, 1, 1, 0]], dtype=torch.long),
+        context_valid_mask=torch.tensor([[True, True, True, True, True, False]]),
+        tree_valid_mask=torch.ones((1, 1, tree_processor.block_size), dtype=torch.bool),
+        tree_info=tree_info,
+        block_size=tree_processor.block_size,
+    )
+
+    mask_mod = captured["mask_mod"]
+
+    assert mask == "mask"
+    assert bool(mask_mod(0, 0, torch.tensor(7), torch.tensor(1)).item())
+    assert bool(mask_mod(0, 0, torch.tensor(7), torch.tensor(6 + 7)).item())
+    assert bool(mask_mod(0, 0, torch.tensor(7), torch.tensor(6 + 5)).item())
+    assert not bool(mask_mod(0, 0, torch.tensor(7), torch.tensor(4)).item())
+    assert not bool(mask_mod(0, 0, torch.tensor(7), torch.tensor(6 + 1)).item())
+    assert not bool(mask_mod(0, 0, torch.tensor(7), torch.tensor(6 + 6)).item())
 
 
 def test_build_verifier_score_mod_allows_prefix_and_blocks_non_ancestors() -> None:

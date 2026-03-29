@@ -62,7 +62,7 @@ def unwrap_model(module):
 
 
 def has_pruning_head(module) -> bool:
-    return getattr(module, "q_head", None) is not None or getattr(module, "ar_fusion", None) is not None
+    return getattr(module, "q_head", None) is not None or getattr(module, "ar_block", None) is not None
 
 
 def build_prefill_attention_mask(
@@ -141,6 +141,69 @@ def build_drafter_block_mask(
         kv_block = tree_idx // block_size
         same_tree = q_block == kv_block
         tree_ok = (~in_ctx) & q_valid & same_tree & flat_block_valid[b, tree_idx]
+        return invalid_self | ctx_ok | tree_ok
+
+    return create_block_mask(
+        mask_mod,
+        B=batch_size,
+        H=None,
+        Q_LEN=total_tree_len,
+        KV_LEN=ctx_len + total_tree_len,
+        device=document_mask.device,
+        BLOCK_SIZE=128,
+    )
+
+
+def build_ar_block_mask(
+    *,
+    anchor_positions: torch.Tensor,
+    document_mask: torch.Tensor,
+    context_valid_mask: torch.Tensor,
+    tree_valid_mask: torch.Tensor,
+    tree_info,
+    block_size: int,
+):
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+    except ImportError as exc:
+        raise RuntimeError(
+            "Flex attention is required for the AR head. "
+            "Install a PyTorch build that provides torch.nn.attention.flex_attention."
+        ) from exc
+
+    batch_size, num_blocks = anchor_positions.shape
+    flat_anchor_positions = anchor_positions.unsqueeze(-1).expand(-1, -1, block_size).reshape(batch_size, -1)
+    flat_block_valid = tree_valid_mask.reshape(batch_size, -1)
+    ctx_len = document_mask.shape[1]
+    total_tree_len = flat_anchor_positions.shape[1]
+    ctx_clamp_max = max(ctx_len - 1, 0)
+    tree_clamp_max = max(total_tree_len - 1, 0)
+    tree_mask = tree_info.tree_mask
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        q_valid = flat_block_valid[b, q_idx]
+        invalid_self = (~q_valid) & (kv_idx == (ctx_len + q_idx))
+
+        in_ctx = kv_idx < ctx_len
+        ctx_idx = kv_idx.clamp(0, ctx_clamp_max)
+        q_anchor = flat_anchor_positions[b, q_idx]
+        same_doc = document_mask[b, ctx_idx] == document_mask[b, q_anchor]
+        causal_ctx = ctx_idx < q_anchor
+        ctx_ok = in_ctx & q_valid & same_doc & causal_ctx & context_valid_mask[b, ctx_idx]
+
+        tree_idx = (kv_idx - ctx_len).clamp(0, tree_clamp_max)
+        q_block = q_idx // block_size
+        kv_block = tree_idx // block_size
+        same_tree = q_block == kv_block
+        q_tree_idx = q_idx % block_size
+        kv_tree_idx = tree_idx % block_size
+        tree_ok = (
+            (~in_ctx)
+            & q_valid
+            & same_tree
+            & flat_block_valid[b, tree_idx]
+            & tree_mask[q_tree_idx, kv_tree_idx]
+        )
         return invalid_self | ctx_ok | tree_ok
 
     return create_block_mask(
@@ -411,10 +474,25 @@ class Trainer:
             q_loss_sum = q_loss[flat_valid_mask].sum().to(draft_hidden_states.dtype)
 
         ar_loss_sum = draft_hidden_states.new_zeros(())
-        if getattr(self.raw_drafter, "ar_fusion", None) is not None and flat_valid_mask.any():
+        if getattr(self.raw_drafter, "ar_block", None) is not None and flat_valid_mask.any():
             parent_token_ids = self._build_parent_token_ids(tree_labels, tree_info)
             parent_embeddings = self.target_embeddings(parent_token_ids.reshape(batch_size, num_blocks * block_size))
-            ar_hidden_states = self.raw_drafter.build_ar_hidden_states(backbone_hidden, parent_embeddings)
+            ar_attention_mask = build_ar_block_mask(
+                anchor_positions=anchor_positions,
+                document_mask=batch.document_mask,
+                context_valid_mask=batch.context_valid_mask,
+                tree_valid_mask=tree_valid_mask,
+                tree_info=tree_info,
+                block_size=block_size,
+            )
+            ar_hidden_states = self.raw_drafter.build_ar_hidden_states(
+                backbone_hidden,
+                parent_embeddings,
+                target_ctx_features=target_ctx_features,
+                tree_info=tree_info,
+                position_ids=tree_position_ids.reshape(batch_size, num_blocks * block_size),
+                attention_mask=ar_attention_mask,
+            )
             ar_loss_sum, _, _ = self._chunked_loss_and_predictions(
                 hidden_states=ar_hidden_states,
                 labels=tree_labels.reshape(batch_size, num_blocks * block_size),
