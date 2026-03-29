@@ -101,10 +101,10 @@ uv run -m src.trainer \
     --tree_type block --tree_args "$TREE_JSON" \
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
-    --data.path ../dflash_2/datasets/q3_4b_100k_stage2.h5 --data.batch_size 4 --data.num_anchors 512 --data.tree_seq_depth 16   \
+    --data.path ../dflash_2/datasets/q3_4b_100k_stage2.h5 --data.batch_size 1 --data.num_anchors 256 --data.tree_seq_depth 16   \
     --trainer.save_every 2048 --trainer.precision bf16-mixed --trainer.grad_accum_steps 4 --trainer.num_epochs 6 \
     --trainer.eval_every 2048 --trainer.wandb_run_name $EXPERIMENT_NAME \
-    --trainer.anchor_chunk_size 64 --trainer.ce_chunk_size 3072 \
+    --trainer.anchor_chunk_size null --trainer.ce_chunk_size 3072 \
     --trainer.dev_run false --trainer.verbose true --trainer.compile true \
 
 # EOF
