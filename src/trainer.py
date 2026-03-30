@@ -262,6 +262,9 @@ class Trainer:
         self.wandb_run_id: str | None = None
         self._tree_info_cache: dict[tuple[int, int, str, int], Any] = {}
         self._acceptance_path_cache: dict[tuple[tuple[int, ...], str, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._build_prefill_attention_mask = build_prefill_attention_mask
+        self._build_drafter_block_mask = build_drafter_block_mask
+        self._build_ar_block_mask = build_ar_block_mask
 
         strategy = "ddp" if config.devices > 1 or config.ddp else "auto"
         self.fabric = Fabric(
@@ -332,6 +335,9 @@ class Trainer:
         if config.compile and hasattr(torch, "compile"):
             self.target_model = torch.compile(self.target_model)
             self.drafter_model = torch.compile(self.drafter_model, dynamic=True)
+            self._build_prefill_attention_mask = torch.compile(self._build_prefill_attention_mask, dynamic=True)
+            self._build_drafter_block_mask = torch.compile(self._build_drafter_block_mask, dynamic=True)
+            self._build_ar_block_mask = torch.compile(self._build_ar_block_mask, dynamic=True)
 
         self.optimizer = torch.optim.AdamW(
             self.drafter_model.parameters(),
@@ -509,7 +515,7 @@ class Trainer:
             parent_token_ids = self._build_parent_token_ids(tree_labels, tree_info)
             parent_embeddings = self.target_embeddings(parent_token_ids.reshape(batch_size, num_blocks * block_size))
             ar_position_ids = tree_position_ids.reshape(batch_size, num_blocks * block_size)
-            ar_attention_mask = build_ar_block_mask(
+            ar_attention_mask = self._build_ar_block_mask(
                 anchor_positions=anchor_positions,
                 document_mask=batch.document_mask,
                 context_valid_mask=batch.context_valid_mask,
@@ -727,7 +733,7 @@ class Trainer:
         batch: PackedBatch,
     ) -> torch.Tensor:
         with torch.no_grad():
-            prefill_mask = build_prefill_attention_mask(batch.document_mask, batch.context_valid_mask)
+            prefill_mask = self._build_prefill_attention_mask(batch.document_mask, batch.context_valid_mask)
             target_out = self.target_model(
                 input_ids=batch.input_ids,
                 attention_mask=prefill_mask,
