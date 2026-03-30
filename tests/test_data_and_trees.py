@@ -138,10 +138,10 @@ def test_packed_collator_restarts_positions_and_isolates_documents(tmp_path: Pat
     assert batch.document_mask[0, :10].tolist() == [1, 1, 1, 1, 1, 1, 2, 2, 2, 2]
     assert batch.context_valid_mask[0, :10].tolist() == [True] * 10
 
-    assert batch.anchor_positions.tolist() == [[2, 3, 7, 8]]
-    assert batch.anchor_document_ids.tolist() == [[1, 1, 2, 2]]
-    assert batch.anchor_valid_mask.tolist() == [[True, True, True, True]]
-    assert batch.tree_labels.shape == (1, 4, 8)
+    assert batch.anchor_positions.tolist() == [[2, 3]]
+    assert batch.anchor_document_ids.tolist() == [[1, 1]]
+    assert batch.anchor_valid_mask.tolist() == [[True, True]]
+    assert batch.tree_labels.shape == (1, 2, 8)
 
 
 def test_build_dataloaders_reads_ahead_to_emit_fixed_packed_row_count(tmp_path: Path) -> None:
@@ -223,6 +223,60 @@ def test_eval_loader_is_deterministic_across_iterations(tmp_path: Path) -> None:
     assert len(first_pass) == len(second_pass)
     assert torch.equal(first_pass[0].input_ids, second_pass[0].input_ids)
     assert torch.equal(first_pass[0].anchor_positions, second_pass[0].anchor_positions)
+
+
+def test_train_collator_samples_valid_anchors_at_row_level(tmp_path: Path) -> None:
+    stage2_path = tmp_path / "stage2.h5"
+    _write_stage2_fixture(stage2_path)
+
+    dataset = Stage2Dataset(stage2_path)
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2, sub_tree_paths=SUB_TREE_PATHS)
+    collator = PackedBatchCollator(
+        tree_processor=tree_processor,
+        pack_length=16,
+        num_anchors=2,
+        mask_token_id=99,
+        pad_token_id=0,
+        seed=0,
+        sample_anchors=True,
+    )
+    batch = collator([dataset[0], dataset[1]])
+
+    assert batch.anchor_positions.shape == (1, 2)
+    assert batch.anchor_valid_mask.tolist() == [[True, True]]
+    assert batch.anchor_positions[0].tolist() == sorted(batch.anchor_positions[0].tolist())
+    assert set(batch.anchor_positions[0].tolist()).issubset({2, 3, 7, 8})
+
+
+def test_row_level_anchor_sampling_uses_remaining_valid_documents(tmp_path: Path) -> None:
+    stage2_path = tmp_path / "stage2.h5"
+    _write_stage2_fixture(stage2_path)
+
+    dataset = Stage2Dataset(stage2_path)
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2, sub_tree_paths=SUB_TREE_PATHS)
+    collator = PackedBatchCollator(
+        tree_processor=tree_processor,
+        pack_length=16,
+        num_anchors=2,
+        mask_token_id=99,
+        pad_token_id=0,
+        seed=0,
+        sample_anchors=False,
+    )
+
+    sample0 = dataset[0]
+    sample1 = dataset[1]
+    sample0 = {
+        **sample0,
+        "sub_trees": sample0["sub_trees"].clone(),
+    }
+    sample0["sub_trees"][:, 0] = -1
+
+    batch = collator([sample0, sample1])
+
+    assert batch.anchor_positions.tolist() == [[7, 8]]
+    assert batch.anchor_document_ids.tolist() == [[2, 2]]
+    assert batch.anchor_valid_mask.tolist() == [[True, True]]
 
 
 def test_block_tree_processor_builds_expected_metadata() -> None:

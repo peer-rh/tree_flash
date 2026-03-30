@@ -410,7 +410,7 @@ class PackedBatchCollator:
         items = [(sample, int(sample["total_len"])) for sample in samples]
         return _pack_items_into_rows(items, pack_length=self.pack_length)
 
-    def _select_anchor_locals(self, sample: dict[str, Any]) -> list[int]:
+    def _valid_anchor_locals(self, sample: dict[str, Any]) -> list[int]:
         response_ids = sample["response_ids"]
         response_len = int(response_ids.numel())
         if response_len < self.tree_processor.tree_seq_depth:
@@ -421,13 +421,7 @@ class PackedBatchCollator:
             root_slice = sample["sub_trees"][anchor_local : anchor_local + self.tree_processor.tree_seq_depth, 0]
             if torch.all(root_slice != IGNORE_IDX):
                 valid.append(anchor_local)
-        if len(valid) <= self.num_anchors:
-            return valid
-        if self.sample_anchors:
-            chosen = self._rng.sample(valid, self.num_anchors)
-            chosen.sort()
-            return chosen
-        return valid[: self.num_anchors]
+        return valid
 
     def _pad_1d(self, rows: list[torch.Tensor], fill_value: int, dtype: torch.dtype) -> torch.Tensor:
         max_len = max((row.numel() for row in rows), default=0)
@@ -485,6 +479,7 @@ class PackedBatchCollator:
             row_tree_positions: list[torch.Tensor] = []
             row_tree_cum_probs: list[torch.Tensor] = []
             row_tree_valid: list[torch.Tensor] = []
+            row_anchor_candidates: list[tuple[int, int, dict[str, Any], int, int]] = []
 
             for sample, row_start, doc_id in docs:
                 prompt_ids = sample["prompt_ids"]
@@ -499,19 +494,37 @@ class PackedBatchCollator:
                 document_mask[row_start:row_end] = doc_id
                 context_valid[row_start:row_end] = True
 
-                anchor_locals = self._select_anchor_locals(sample)
-                if not anchor_locals:
-                    continue
-                anchor_positions = [row_start + prompt_len + anchor_local for anchor_local in anchor_locals]
+                for anchor_local in self._valid_anchor_locals(sample):
+                    row_anchor_candidates.append(
+                        (
+                            row_start + prompt_len + anchor_local,
+                            doc_id,
+                            sample,
+                            row_start,
+                            anchor_local,
+                        )
+                    )
+
+            row_anchor_candidates.sort(key=lambda item: item[0])
+            if len(row_anchor_candidates) > self.num_anchors:
+                if self.sample_anchors:
+                    selected_indices = sorted(self._rng.sample(range(len(row_anchor_candidates)), self.num_anchors))
+                    selected_candidates = [row_anchor_candidates[idx] for idx in selected_indices]
+                else:
+                    selected_candidates = row_anchor_candidates[: self.num_anchors]
+            else:
+                selected_candidates = row_anchor_candidates
+
+            for anchor_position, doc_id, sample, _, anchor_local in selected_candidates:
                 tree_tensors = self.tree_processor.build_anchor_tensors(
                     response_subtrees=sample["sub_trees"],
                     response_probs=sample["sub_tree_ar_probs"],
-                    anchor_local_positions=anchor_locals,
-                    anchor_positions=anchor_positions,
+                    anchor_local_positions=[anchor_local],
+                    anchor_positions=[anchor_position],
                     mask_token_id=self.mask_token_id,
                 )
-                row_anchor_positions.extend(anchor_positions)
-                row_anchor_document_ids.extend([doc_id] * len(anchor_positions))
+                row_anchor_positions.append(anchor_position)
+                row_anchor_document_ids.append(doc_id)
                 row_tree_labels.append(tree_tensors["tree_labels"])
                 row_tree_noise.append(tree_tensors["tree_noise_ids"])
                 row_tree_positions.append(tree_tensors["tree_position_ids"])
