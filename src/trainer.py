@@ -457,6 +457,11 @@ def get_lr(
     return min_lr + (lr - min_lr) * cosine
 
 
+def maybe_cuda_synchronize(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device=device)
+
+
 class Trainer:
     tree_processor: Any
 
@@ -783,8 +788,12 @@ class Trainer:
             }
 
         noise_embeddings = self.target_embeddings(tree_noise_ids.reshape(batch_size, num_blocks * block_size))
-        mask_start = time.perf_counter() if profile else 0.0
-        drafter_mask = build_drafter_block_mask(
+        if profile:
+            maybe_cuda_synchronize(tree_labels.device)
+            mask_start = time.perf_counter()
+        else:
+            mask_start = 0.0
+        drafter_mask = self._build_drafter_block_mask(
             anchor_positions=anchor_positions,
             document_mask=batch.document_mask,
             context_valid_mask=batch.context_valid_mask,
@@ -817,9 +826,17 @@ class Trainer:
                 tree_info=tree_info,
                 block_size=block_size,
             )
-        mask_time = time.perf_counter() - mask_start if profile else 0.0
+        if profile:
+            maybe_cuda_synchronize(tree_labels.device)
+            mask_time = time.perf_counter() - mask_start
+        else:
+            mask_time = 0.0
 
-        drafter_start = time.perf_counter() if profile else 0.0
+        if profile:
+            maybe_cuda_synchronize(tree_labels.device)
+            drafter_start = time.perf_counter()
+        else:
+            drafter_start = 0.0
         draft_hidden_states, _, q_logits, ar_hidden_states = self.drafter_model(
             hidden_states=noise_embeddings,
             position_ids=position_ids_with_seq,
@@ -831,7 +848,11 @@ class Trainer:
             ar_position_ids=ar_position_ids,
             ar_attention_mask=ar_attention_mask,
         )
-        drafter_time = time.perf_counter() - drafter_start if profile else 0.0
+        if profile:
+            maybe_cuda_synchronize(tree_labels.device)
+            drafter_time = time.perf_counter() - drafter_start
+        else:
+            drafter_time = 0.0
         loss_sum, valid_count, predictions, ce_time = self._chunked_loss_and_predictions(
             hidden_states=draft_hidden_states,
             labels=tree_labels.reshape(batch_size, num_blocks * block_size),
@@ -935,7 +956,11 @@ class Trainer:
             tensor of shape ``(batch, total_tokens)``, and ``ce_time`` is a
             float duration in seconds.
         """
-        ce_start = time.perf_counter() if profile else 0.0
+        if profile:
+            maybe_cuda_synchronize(hidden_states.device)
+            ce_start = time.perf_counter()
+        else:
+            ce_start = 0.0
         batch_size, total_tokens, hidden_size = hidden_states.shape
         flat_hidden = hidden_states.reshape(batch_size * total_tokens, hidden_size)
         flat_labels = labels.reshape(batch_size * total_tokens)
@@ -954,7 +979,11 @@ class Trainer:
         valid_count = int(valid_count_tensor.item())
         if predictions is not None:
             predictions = predictions.view(batch_size, total_tokens)
-        ce_time = time.perf_counter() - ce_start if profile else 0.0
+        if profile:
+            maybe_cuda_synchronize(hidden_states.device)
+            ce_time = time.perf_counter() - ce_start
+        else:
+            ce_time = 0.0
         return total_loss, valid_count, predictions, ce_time
 
     def _compute_linear_cross_entropy(
@@ -1140,9 +1169,17 @@ class Trainer:
             }
 
         profile = self.config.profile_steps > 0 and self.global_step < self.config.profile_steps
-        prefill_start = time.perf_counter() if profile else 0.0
+        if profile:
+            maybe_cuda_synchronize(batch.input_ids.device)
+            prefill_start = time.perf_counter()
+        else:
+            prefill_start = 0.0
         target_ctx_features = self._prefill_target_context(batch)
-        prefill_time = time.perf_counter() - prefill_start if profile else 0.0
+        if profile:
+            maybe_cuda_synchronize(batch.input_ids.device)
+            prefill_time = time.perf_counter() - prefill_start
+        else:
+            prefill_time = 0.0
         total_loss_sum = torch.zeros((), device=self.fabric.device)
         total_q_loss_sum = torch.zeros((), device=self.fabric.device)
         total_ar_loss_sum = torch.zeros((), device=self.fabric.device)
