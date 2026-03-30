@@ -946,7 +946,7 @@ class Trainer:
     ) -> tuple[float, int]:
         if predictions.numel() == 0:
             return 0.0, 0
-        primary_indices = self.tree_processor.primary_path_indices
+        primary_indices = self.tree_processor.primary_path_indices.to(predictions.device)
         if primary_indices.numel() <= 1:
             return 0.0, 0
         target_main_path = labels.index_select(-1, primary_indices)[..., 1:]
