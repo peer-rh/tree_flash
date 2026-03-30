@@ -14,6 +14,16 @@ pytest.importorskip("lightning")
 
 from data_pipeline.stage2 import IGNORE_IDX
 from src.data import DataModuleConfig, PackedBatch
+from src.eagle3_eval import (
+    _raise_flex_backend_unsupported,
+    build_parser as build_eagle3_eval_parser,
+    build_upstream_generate_fn,
+    infer_target_model_for_eagle3_draft_model,
+    load_upstream_eagle3_model,
+    official_eagle3_generate_from_ids,
+    prepare_eagle3_prompt,
+    resolve_official_eagle3_model,
+)
 from src.models.dflash import DFlashDraftModel
 from src.spec_decode import (
     build_parser as build_spec_decode_parser,
@@ -1705,13 +1715,166 @@ def test_official_dflash_aliases_infer_target_pairing() -> None:
     assert infer_target_model_for_draft_model(draft_model) == "Qwen/Qwen3-8B"
 
 
+def test_official_eagle3_aliases_infer_target_pairing() -> None:
+    draft_model = resolve_official_eagle3_model("llama-3.1-8b-instruct")
+
+    assert draft_model == "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+    assert infer_target_model_for_eagle3_draft_model(draft_model) == "meta-llama/Llama-3.1-8B-Instruct"
+
+
+def test_official_eagle3_alias_rejects_qwen_community_checkpoint() -> None:
+    with pytest.raises(ValueError, match="community checkpoints"):
+        resolve_official_eagle3_model("AngelSlim/Qwen3-8B_eagle3")
+
+
+def test_prepare_eagle3_prompt_auto_applies_chat_template_when_required() -> None:
+    class TemplateTokenizer:
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+            _ = tokenize, add_generation_prompt, kwargs
+            return f"templated::{messages[0]['content']}"
+
+    prompt = prepare_eagle3_prompt(
+        tokenizer=TemplateTokenizer(),
+        prompt="hello",
+        target_model="meta-llama/Llama-3.1-8B-Instruct",
+        apply_chat_template=False,
+    )
+
+    assert prompt == "templated::hello"
+
+
+def test_load_upstream_eagle3_model_raises_clean_error_without_dependency(monkeypatch) -> None:
+    import src.eagle3_eval as eagle3_eval_mod
+
+    def fail_import():
+        raise ImportError("missing")
+
+    monkeypatch.setattr(eagle3_eval_mod, "_get_upstream_ea_model_class", fail_import)
+    with pytest.raises(RuntimeError, match="upstream EAGLE package is not available"):
+        load_upstream_eagle3_model(
+            base_model="base",
+            ea_model="draft",
+            dtype=torch.float16,
+            total_token=-1,
+            depth=7,
+            top_k=10,
+            threshold=1.0,
+        )
+
+
+def test_official_eagle3_generate_from_ids_extracts_continuation_ids() -> None:
+    class FakeTokenizer:
+        def decode(self, token_ids, skip_special_tokens=True):
+            _ = skip_special_tokens
+            return ",".join(str(int(token)) for token in token_ids)
+
+    class FakeBaseModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1, 1)
+
+    class FakeEagleModel:
+        def __init__(self):
+            self.base_model = FakeBaseModel()
+
+        def eagenerate(self, prompt_ids, temperature, max_new_tokens):
+            _ = temperature, max_new_tokens
+            return torch.cat([prompt_ids, torch.tensor([[7, 8]], dtype=torch.long)], dim=1)
+
+    result = official_eagle3_generate_from_ids(
+        eagle_model=FakeEagleModel(),
+        tokenizer=FakeTokenizer(),
+        prompt_ids=torch.tensor([1, 2, 3], dtype=torch.long),
+        max_new_tokens=2,
+        temperature=0.0,
+    )
+
+    assert result.continuation_ids.tolist() == [7, 8]
+    assert result.committed_tokens == 2
+    assert result.drafted_tokens == 0
+
+
+def test_eagle3_eval_generate_fn_integrates_with_eval_suite(monkeypatch) -> None:
+    import src.spec_decode as spec_decode_mod
+
+    monkeypatch.setattr(
+        spec_decode_mod,
+        "load_and_process_eval_dataset",
+        lambda data_name: [{"turns": ["Prompt one"]}],
+    )
+
+    class FakeTokenizer:
+        def __init__(self):
+            self.last_prompt = None
+
+        def __call__(self, prompt, return_tensors="pt"):
+            self.last_prompt = prompt
+            return type("Encoded", (), {"input_ids": torch.tensor([[11, 12]], dtype=torch.long)})()
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            _ = skip_special_tokens
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.tolist()
+            return "|".join(str(int(token_id)) for token_id in token_ids)
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+            _ = tokenize, add_generation_prompt, kwargs
+            return f"chat::{messages[0]['content']}"
+
+    class FakeBaseModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1, 1)
+
+    class FakeEagleModel:
+        def __init__(self):
+            self.base_model = FakeBaseModel()
+
+        def eagenerate(self, prompt_ids, temperature, max_new_tokens):
+            _ = temperature, max_new_tokens
+            return torch.cat([prompt_ids, torch.tensor([[21, 22]], dtype=torch.long)], dim=1)
+
+    tokenizer = FakeTokenizer()
+    generate_fn = build_upstream_generate_fn(
+        eagle_model=FakeEagleModel(),
+        tokenizer=tokenizer,
+        target_model="meta-llama/Llama-3.1-8B-Instruct",
+        temperature=0.0,
+        apply_chat_template=False,
+    )
+
+    report = evaluate_prompt_suite(
+        data_name="alpaca",
+        tokenizer=tokenizer,
+        generate_fn=generate_fn,
+        max_examples=1,
+        max_new_tokens=2,
+    )
+
+    assert tokenizer.last_prompt == "chat::Prompt one"
+    assert report.total_examples == 1
+    assert report.examples[0].generated_text == "21|22"
+
+
+def test_flex_backend_raises_clean_error() -> None:
+    with pytest.raises(ValueError, match="Use --backend upstream"):
+        _raise_flex_backend_unsupported(
+            ea_model="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+            base_model="meta-llama/Llama-3.1-8B-Instruct",
+        )
+
+
 def test_parsers_accept_prunable_tree_type() -> None:
     trainer_tree_action = next(action for action in build_trainer_parser()._actions if action.dest == "tree_type")
     spec_tree_action = next(action for action in build_spec_decode_parser()._actions if action.dest == "tree_type")
+    eagle3_backend_action = next(action for action in build_eagle3_eval_parser()._actions if action.dest == "backend")
 
     assert "prunable" in trainer_tree_action.choices
     assert "prunable" in spec_tree_action.choices
     assert any(action.dest == "official_dflash_model" for action in build_spec_decode_parser()._actions)
     assert any(action.dest == "eval_data" for action in build_spec_decode_parser()._actions)
+    assert any(action.dest == "official_eagle3_model" for action in build_eagle3_eval_parser()._actions)
+    assert any(action.dest == "threshold" for action in build_eagle3_eval_parser()._actions)
+    assert eagle3_backend_action.choices == ["upstream", "flex"]
     assert all(action.dest != "trainer.target_attn_implementation" for action in build_trainer_parser()._actions)
     assert all(action.dest != "attn_implementation" for action in build_spec_decode_parser()._actions)

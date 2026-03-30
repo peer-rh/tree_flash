@@ -18,6 +18,13 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
+eagle = [
+    "eagle-llm @ git+https://github.com/SafeAILab/EAGLE.git",
+    "fschat>=0.2.36",
+]
+
+[project.scripts]
+eagle3-eval = "src.eagle3_eval:main"
 
 [build-system]
 requires = ["hatchling"]
