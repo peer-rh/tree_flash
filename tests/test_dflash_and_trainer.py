@@ -647,10 +647,8 @@ def test_trainer_compile_wraps_internal_compute_helpers(monkeypatch, tmp_path: P
     )
 
     compiled_names = [name for name, _ in compile_calls]
-    assert compiled_names.count("TrainerValidTargetCounter") == 1
-    assert compiled_names.count("TrainerAcceptanceProxy") == 1
-    assert compiled_names.count("TrainerPrefillTargetContext") == 1
-    assert compiled_names.count("TrainerAnchorChunkForward") == 1
+    assert compiled_names.count("FakeTargetModel") == 1
+    assert compiled_names.count("FakeDrafter") == 1
     assert compiled_names.count("TrainerLossAndPredictions") == 1
 
 
@@ -1096,6 +1094,45 @@ def test_loss_and_predictions_match_dense_reference_with_valid_row_compaction(mo
     assert valid_count == int(flat_valid.sum().item())
     assert torch.isclose(loss_sum, reference_loss)
     assert torch.equal(predictions.reshape(-1), reference_predictions)
+
+
+def test_loss_and_predictions_skip_prediction_path_when_disabled(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+
+    hidden_states = torch.randn(1, 6, 16, requires_grad=True)
+    labels = torch.tensor([[3, 4, 5, 6, 7, 8]], dtype=torch.long)
+    weights = torch.tensor([[1.0, 0.5, 0.25, 0.75, 0.0, 1.25]], dtype=torch.float32)
+    valid_mask = torch.tensor([[True, False, True, True, False, True]], dtype=torch.bool)
+
+    loss_sum, valid_count, predictions, _ = trainer._chunked_loss_and_predictions(
+        hidden_states=hidden_states,
+        labels=labels,
+        weights=weights,
+        valid_mask=valid_mask,
+        prediction_mask=None,
+        compute_predictions=False,
+    )
+
+    flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+    flat_labels = labels.reshape(-1)
+    flat_weights = weights.reshape(-1)
+    flat_valid = valid_mask.reshape(-1)
+    logits = trainer.target_lm_head(flat_hidden.to(trainer.target_lm_head.weight.dtype))
+    reference_loss = (
+        F.cross_entropy(logits[flat_valid].float(), flat_labels[flat_valid], reduction="none")
+        * flat_weights[flat_valid]
+    ).sum()
+
+    assert valid_count == int(flat_valid.sum().item())
+    assert torch.isclose(loss_sum, reference_loss)
+    assert predictions is None
 
 
 def test_loss_uses_cce_backend_when_available(monkeypatch, tmp_path: Path) -> None:

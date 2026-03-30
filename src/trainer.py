@@ -26,6 +26,83 @@ except ImportError:
     cce_linear_cross_entropy = None
 
 
+def compute_linear_cross_entropy(
+    hidden_states: torch.Tensor,
+    labels: torch.Tensor,
+    target_lm_head: torch.nn.Module,
+) -> torch.Tensor:
+    weight = target_lm_head.weight
+    bias = getattr(target_lm_head, "bias", None)
+    hidden_states = hidden_states.to(weight.dtype)
+    if cce_linear_cross_entropy is not None:
+        preferred_impl = "cce" if hidden_states.is_cuda else "torch_compile"
+        try:
+            return cce_linear_cross_entropy(
+                hidden_states,
+                weight,
+                labels,
+                bias=bias,
+                reduction="none",
+                impl=preferred_impl,
+            )
+        except Exception:
+            if preferred_impl != "torch_compile":
+                try:
+                    return cce_linear_cross_entropy(
+                        hidden_states,
+                        weight,
+                        labels,
+                        bias=bias,
+                        reduction="none",
+                        impl="torch_compile",
+                    )
+                except Exception:
+                    pass
+
+    logits = target_lm_head(hidden_states)
+    return F.cross_entropy(
+        logits.float(),
+        labels,
+        reduction="none",
+    )
+
+
+class TrainerLossAndPredictions(torch.nn.Module):
+    def __init__(self, target_lm_head: torch.nn.Module):
+        super().__init__()
+        self.target_lm_head = target_lm_head
+
+    def forward(
+        self,
+        *,
+        flat_hidden: torch.Tensor,
+        flat_labels: torch.Tensor,
+        flat_weights: torch.Tensor,
+        flat_valid: torch.Tensor,
+        flat_prediction_mask: torch.Tensor,
+        compute_predictions: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        valid_hidden = flat_hidden[flat_valid]
+        valid_labels = flat_labels[flat_valid]
+        valid_weights = flat_weights[flat_valid]
+        per_token_loss = compute_linear_cross_entropy(valid_hidden, valid_labels, self.target_lm_head)
+        total_loss = (per_token_loss * valid_weights).sum()
+        valid_count = flat_valid.sum()
+
+        predictions = None
+        if compute_predictions:
+            prediction_logits = self.target_lm_head(
+                flat_hidden[flat_prediction_mask].detach().to(self.target_lm_head.weight.dtype)
+            )
+            predictions = torch.full_like(flat_labels, IGNORE_IDX)
+            predictions = predictions.masked_scatter(
+                flat_prediction_mask,
+                prediction_logits.argmax(dim=-1),
+            )
+
+        return total_loss, valid_count, predictions
+
+
 @dataclass
 class TrainerConfig:
     num_epochs: int = 10
@@ -352,6 +429,9 @@ class Trainer:
         self.target_lm_head = self.target_model.get_output_embeddings()
         if self.target_lm_head is None:
             raise ValueError("Target model must expose an output embedding / LM head.")
+        self._loss_and_predictions = TrainerLossAndPredictions(self.target_lm_head)
+        if config.compile and hasattr(torch, "compile"):
+            self._loss_and_predictions = torch.compile(self._loss_and_predictions, dynamic=True)
 
         self.train_loader, self.eval_loader = build_dataloaders(
             config=data,
@@ -614,23 +694,17 @@ class Trainer:
         flat_valid = valid_mask.reshape(batch_size * total_tokens)
         if not flat_valid.any():
             return hidden_states.new_zeros(()), 0, None, 0.0
-
-        valid_hidden = flat_hidden[flat_valid]
-        valid_labels = flat_labels[flat_valid]
-        valid_weights = flat_weights[flat_valid]
-        per_token_loss = self._compute_linear_cross_entropy(valid_hidden, valid_labels)
-        total_loss = (per_token_loss * valid_weights).sum()
-        valid_count = int(flat_valid.sum().item())
-        predictions = None
-        if compute_predictions:
-            predictions = torch.full_like(flat_labels, IGNORE_IDX)
-            flat_prediction_mask = flat_valid if prediction_mask is None else prediction_mask.reshape(batch_size * total_tokens)
-            if flat_prediction_mask.any():
-                with torch.no_grad():
-                    prediction_logits = self.target_lm_head(
-                        flat_hidden[flat_prediction_mask].to(self.target_lm_head.weight.dtype)
-                    )
-                    predictions[flat_prediction_mask] = prediction_logits.argmax(dim=-1)
+        flat_prediction_mask = flat_valid if prediction_mask is None else prediction_mask.reshape(batch_size * total_tokens)
+        total_loss, valid_count_tensor, predictions = self._loss_and_predictions(
+            flat_hidden=flat_hidden,
+            flat_labels=flat_labels,
+            flat_weights=flat_weights,
+            flat_valid=flat_valid,
+            flat_prediction_mask=flat_prediction_mask,
+            compute_predictions=compute_predictions,
+        )
+        valid_count = int(valid_count_tensor.item())
+        if predictions is not None:
             predictions = predictions.view(batch_size, total_tokens)
         ce_time = time.perf_counter() - ce_start if profile else 0.0
         return total_loss, valid_count, predictions, ce_time
@@ -640,40 +714,7 @@ class Trainer:
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
     ) -> torch.Tensor:
-        weight = self.target_lm_head.weight
-        bias = getattr(self.target_lm_head, "bias", None)
-        hidden_states = hidden_states.to(weight.dtype)
-        if cce_linear_cross_entropy is not None:
-            preferred_impl = "cce" if hidden_states.is_cuda else "torch_compile"
-            try:
-                return cce_linear_cross_entropy(
-                    hidden_states,
-                    weight,
-                    labels,
-                    bias=bias,
-                    reduction="none",
-                    impl=preferred_impl,
-                )
-            except Exception:
-                if preferred_impl != "torch_compile":
-                    try:
-                        return cce_linear_cross_entropy(
-                            hidden_states,
-                            weight,
-                            labels,
-                            bias=bias,
-                            reduction="none",
-                            impl="torch_compile",
-                        )
-                    except Exception:
-                        pass
-
-        logits = self.target_lm_head(hidden_states)
-        return F.cross_entropy(
-            logits.float(),
-            labels,
-            reduction="none",
-        )
+        return compute_linear_cross_entropy(hidden_states, labels, self.target_lm_head)
 
     def _get_acceptance_path_tensors(
         self,
