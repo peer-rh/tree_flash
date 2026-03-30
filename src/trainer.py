@@ -728,6 +728,11 @@ class Trainer:
         )
         return int(valid_mask.sum().item())
 
+    def _should_log_training_metrics_for_step(self, optimizer_step: int) -> bool:
+        if self.config.log_every > 0 and optimizer_step % self.config.log_every == 0:
+            return True
+        return self.config.profile_steps > 0 and optimizer_step <= self.config.profile_steps
+
     def _prefill_target_context(
         self,
         batch: PackedBatch,
@@ -746,6 +751,8 @@ class Trainer:
     def _train_batch(
         self,
         batch: PackedBatch,
+        *,
+        compute_acceptance: bool = True,
     ) -> dict[str, Any]:
         batch = batch.to(self.fabric.device)
         if not batch.context_valid_mask.any() or batch.num_anchors == 0:
@@ -801,7 +808,7 @@ class Trainer:
                 batch,
                 target_ctx_features,
                 slice(start, end),
-                compute_predictions=True,
+                compute_predictions=compute_acceptance,
                 profile=profile,
             )
             if chunk_result["valid_count"] == 0:
@@ -1018,12 +1025,14 @@ class Trainer:
             for batch in self.train_loader:
                 micro_step += 1
                 is_final_micro = micro_step % self.config.grad_accum_steps == 0
+                upcoming_optimizer_step = optimizer_step + 1
+                compute_acceptance = self._should_log_training_metrics_for_step(upcoming_optimizer_step)
                 sync_context = self.fabric.no_backward_sync(
                     self.drafter_model,
                     enabled=not is_final_micro,
                 )
                 with sync_context:
-                    batch_result = self._train_batch(batch)
+                    batch_result = self._train_batch(batch, compute_acceptance=compute_acceptance)
                     loss = batch_result["loss"]
                 accumulated_loss += float(loss.detach().item())
                 accumulated_q_loss += float(batch_result["q_loss"].detach().item())
@@ -1073,16 +1082,14 @@ class Trainer:
                 accumulated_q_loss = 0.0
                 accumulated_ar_loss = 0.0
                 if self.fabric.is_global_zero and (
-                    self.config.verbose or self.global_step % self.config.log_every == 0
+                    self.config.verbose
+                    or (self.config.log_every > 0 and self.global_step % self.config.log_every == 0)
                 ):
                     print(
                         f"step={self.global_step} loss={avg_loss:.4f} lr={lr:.2e}",
                         flush=True,
                     )
-                should_log_step = (
-                    self.global_step % self.config.log_every == 0
-                    or (self.config.profile_steps > 0 and self.global_step <= self.config.profile_steps)
-                )
+                should_log_step = self._should_log_training_metrics_for_step(self.global_step)
                 if should_log_step:
                     self._log(
                         {

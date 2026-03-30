@@ -1878,3 +1878,88 @@ def test_parsers_accept_prunable_tree_type() -> None:
     assert eagle3_backend_action.choices == ["upstream", "flex"]
     assert all(action.dest != "trainer.target_attn_implementation" for action in build_trainer_parser()._actions)
     assert all(action.dest != "attn_implementation" for action in build_spec_decode_parser()._actions)
+
+
+
+def test_fit_only_computes_acceptance_for_logged_optimizer_steps(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+    trainer.config.grad_accum_steps = 2
+    trainer.config.log_every = 2
+    trainer.config.eval_every = 0
+    trainer.config.save_every = 0
+    trainer.config.dev_run = False
+    trainer.train_loader = [packed_batch, packed_batch, packed_batch, packed_batch]
+
+    compute_predictions_calls: list[bool] = []
+    original_forward_anchor_chunk = trainer._forward_anchor_chunk
+
+    def spy_forward_anchor_chunk(
+        batch: PackedBatch,
+        target_ctx_features: torch.Tensor,
+        anchor_slice: slice,
+        *,
+        compute_predictions: bool,
+        profile: bool = False,
+    ) -> dict[str, object]:
+        compute_predictions_calls.append(compute_predictions)
+        return original_forward_anchor_chunk(
+            batch,
+            target_ctx_features,
+            anchor_slice,
+            compute_predictions=compute_predictions,
+            profile=profile,
+        )
+
+    trainer._forward_anchor_chunk = spy_forward_anchor_chunk
+    trainer._log = lambda metrics, step: None
+
+    trainer.fit()
+
+    assert compute_predictions_calls == [False, False, True, True]
+
+
+def test_fit_logs_acceptance_proxy_over_full_accumulated_batch(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+    trainer.config.grad_accum_steps = 2
+    trainer.config.log_every = 1
+    trainer.config.eval_every = 0
+    trainer.config.save_every = 0
+    trainer.config.dev_run = False
+    trainer.train_loader = [packed_batch, packed_batch]
+
+    acceptance_results = [(1.0, 1), (9.0, 3)]
+    acceptance_calls = 0
+
+    def fake_acceptance_proxy(*, predictions, labels, anchor_valid_mask, tree_valid_mask) -> tuple[float, int]:
+        nonlocal acceptance_calls
+        result = acceptance_results[acceptance_calls]
+        acceptance_calls += 1
+        return result
+
+    logged_acceptance: list[tuple[int, float]] = []
+
+    def capture_log(metrics: dict[str, float], step: int) -> None:
+        if "train/acceptance_proxy" in metrics:
+            logged_acceptance.append((step, metrics["train/acceptance_proxy"]))
+
+    trainer._acceptance_proxy = fake_acceptance_proxy
+    trainer._log = capture_log
+
+    trainer.fit()
+
+    assert acceptance_calls == 2
+    assert logged_acceptance == [(1, 2.5)]
