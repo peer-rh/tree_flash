@@ -114,15 +114,18 @@ def build_tree_processor(
 ):
     """Construct the tree processor used by speculative decoding."""
     tree_args = tree_args or {}
+    resolved_sub_tree_paths = (
+        tree_args.get("sub_tree_paths") if sub_tree_paths is None else sub_tree_paths
+    )
     if tree_type in {"fixed", "block"}:
         return BlockTreeProcessor(
             tree_seq_depth=tree_seq_depth,
-            sub_tree_paths=sub_tree_paths or tree_args.get("sub_tree_paths"),
+            sub_tree_paths=resolved_sub_tree_paths,
         )
     if tree_type == "branch_off":
         return BranchOffTreeProcessor(
             tree_seq_depth=tree_seq_depth,
-            sub_tree_paths=sub_tree_paths or tree_args.get("sub_tree_paths"),
+            sub_tree_paths=resolved_sub_tree_paths,
             branching_pattern=tree_args.get("branching_pattern"),
         )
     if tree_type == "prunable":
@@ -130,11 +133,25 @@ def build_tree_processor(
             tree_seq_depth=tree_seq_depth,
             base_tree_type=tree_args.get("base_tree_type", "block"),
             prune_topk=int(tree_args.get("prune_topk", 0)),
-            sub_tree_paths=sub_tree_paths or tree_args.get("sub_tree_paths"),
+            sub_tree_paths=resolved_sub_tree_paths,
             branching_pattern=tree_args.get("branching_pattern"),
         )
     raise NotImplementedError(
         f"tree_type={tree_type!r} is not implemented for speculative decoding."
+    )
+
+
+def build_dflash_sequence_tree_processor(
+    *,
+    block_size: int,
+):
+    """Represent a DFlash block as a single linear chain in the tree decoder."""
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}.")
+    return build_tree_processor(
+        tree_type="block",
+        tree_seq_depth=block_size,
+        sub_tree_paths=[],
     )
 
 def build_verifier_score_mod(

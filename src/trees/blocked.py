@@ -264,7 +264,9 @@ class BlockTreeProcessor:
         sub_tree_paths: Sequence[str] | None = None,
     ) -> None:
         self.tree_seq_depth = tree_seq_depth
-        self.sub_tree_paths = tuple(sub_tree_paths or DEFAULT_SUB_TREE_PATHS)
+        self.sub_tree_paths = (
+            tuple(DEFAULT_SUB_TREE_PATHS) if sub_tree_paths is None else tuple(sub_tree_paths)
+        )
         self.subtree = SubTreeInfo(self.sub_tree_paths)
         self.subtree_size = self.subtree.size
         self.layout = [

@@ -270,6 +270,18 @@ def test_block_tree_processor_builds_expected_metadata() -> None:
     assert info.tree_position_ids.shape == (2, 3, 8)
 
 
+def test_block_tree_processor_empty_subtree_paths_builds_linear_chain() -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=4, sub_tree_paths=[])
+
+    assert tree_processor.sub_tree_paths == ()
+    assert tree_processor.subtree_size == 1
+    assert tree_processor.block_size == 4
+    assert tree_processor.parent_idx.tolist() == [-1, 0, 1, 2]
+    assert tree_processor.depth.tolist() == [0, 1, 2, 3]
+    assert tree_processor.primary_path_indices.tolist() == [0, 1, 2, 3]
+    assert tree_processor.tree_mask[3].tolist() == [True, True, True, True]
+
+
 def test_block_tree_processor_builds_multi_anchor_tensors() -> None:
     tree_processor = BlockTreeProcessor(tree_seq_depth=2, sub_tree_paths=SUB_TREE_PATHS)
 

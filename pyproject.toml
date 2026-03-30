@@ -24,6 +24,7 @@ dev = [
 # ]
 
 [project.scripts]
+dflash-eval = "src.dflash_eval:main"
 eagle3-eval = "src.eagle3_eval:main"
 
 [build-system]
