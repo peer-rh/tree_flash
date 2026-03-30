@@ -156,6 +156,57 @@ class _TinyTokenizer:
         return [f"T{int(token_id)}" for token_id in token_ids]
 
 
+def _acceptance_proxy_loop_reference(
+    *,
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    anchor_valid_mask: torch.Tensor,
+    tree_valid_mask: torch.Tensor,
+    tree_info,
+    primary_indices: torch.Tensor,
+) -> tuple[float, int]:
+    total = 0.0
+    count = 0
+    primary_list = primary_indices.tolist()
+    primary_depths = tree_info.depth.index_select(0, primary_indices).tolist()
+    depth_to_target_idx = {
+        int(depth_idx): primary_offset
+        for primary_offset, depth_idx in enumerate(primary_depths)
+    }
+
+    batch_size, num_anchors, block_size = predictions.shape
+    for batch_idx in range(batch_size):
+        for anchor_idx in range(num_anchors):
+            if not bool(anchor_valid_mask[batch_idx, anchor_idx]):
+                continue
+            count += 1
+            target_main = labels[batch_idx, anchor_idx, primary_list].tolist()
+            accepted = 0
+            for node_idx in range(block_size):
+                node_depth = int(tree_info.depth[node_idx].item())
+                if node_depth not in depth_to_target_idx:
+                    continue
+                path = gather_path_indices(node_idx, tree_info)
+                path_ok = True
+                for ancestor_idx in path:
+                    ancestor_depth = int(tree_info.depth[ancestor_idx].item())
+                    target_idx = depth_to_target_idx.get(ancestor_depth)
+                    if target_idx is None:
+                        path_ok = False
+                        break
+                    if not bool(tree_valid_mask[batch_idx, anchor_idx, ancestor_idx]):
+                        path_ok = False
+                        break
+                    if int(predictions[batch_idx, anchor_idx, ancestor_idx].item()) != int(target_main[target_idx]):
+                        path_ok = False
+                        break
+                if path_ok:
+                    accepted = max(accepted, node_depth)
+            total += float(accepted)
+
+    return total, count
+
+
 def _build_fake_trainer_components(
     block_size: int,
     *,
@@ -826,14 +877,16 @@ def test_train_batch_acceptance_proxy_is_chunk_invariant(monkeypatch, tmp_path: 
 
 
 def test_acceptance_proxy_matches_loop_reference(monkeypatch, tmp_path: Path) -> None:
-    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
-    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    tree_processor = BlockTreeProcessor(tree_seq_depth=3)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(BlockTreeProcessor(tree_seq_depth=2).block_size)
     trainer = _make_trainer(
         monkeypatch,
         tmp_path,
         anchor_chunk_size=None,
         batch=packed_batch,
     )
+    trainer.tree_processor = tree_processor
+    trainer._acceptance_path_cache.clear()
 
     batch_size = 2
     num_anchors = 3
@@ -849,28 +902,29 @@ def test_acceptance_proxy_matches_loop_reference(monkeypatch, tmp_path: Path) ->
     primary_indices = trainer.tree_processor.primary_path_indices
     future_primary_indices = primary_indices[1:]
     if future_primary_indices.numel() > 0:
-        target_prefix = labels.index_select(-1, primary_indices)[..., 1:]
-        predictions[0, 0, future_primary_indices[0]] = target_prefix[0, 0, 0]
-        predictions[1, 1, future_primary_indices] = target_prefix[1, 1]
+        target_main = labels.index_select(-1, primary_indices)
+        predictions[0, 0, future_primary_indices[0]] = target_main[0, 0, 1]
+        predictions[1, 1, future_primary_indices] = target_main[1, 1, 1:]
 
     tree_info = trainer.tree_processor.build_tree_info(
         batch_size=batch_size,
         num_blocks=num_anchors,
         device=torch.device("cpu"),
     )
-    non_primary_nodes = [
-        node_idx
-        for node_idx in range(block_size)
-        if node_idx not in set(primary_indices.tolist()) and len(gather_path_indices(node_idx, tree_info)) > 1
-    ]
-    assert non_primary_nodes
-    best_branch = max(non_primary_nodes, key=lambda idx: len(gather_path_indices(idx, tree_info)))
-    best_branch_path = gather_path_indices(best_branch, tree_info)[1:]
-    target_prefix = labels.index_select(-1, primary_indices)[..., 1:]
-    for depth_idx, node_idx in enumerate(best_branch_path):
-        predictions[0, 2, node_idx] = target_prefix[0, 2, depth_idx]
-    if future_primary_indices.numel() > 0:
-        predictions[0, 2, future_primary_indices[0]] = target_prefix[0, 2, 0] + 1
+    target_main = labels.index_select(-1, primary_indices)
+    branch_node = max(
+        (
+            node_idx
+            for node_idx in range(block_size)
+            if node_idx not in set(primary_indices.tolist()) and int(tree_info.depth[node_idx].item()) == 2
+        ),
+        key=lambda idx: idx,
+    )
+    branch_path = gather_path_indices(branch_node, tree_info)
+    for node_idx in branch_path:
+        depth_idx = int(tree_info.depth[node_idx].item())
+        predictions[0, 2, node_idx] = target_main[0, 2, depth_idx]
+    predictions[0, 2, primary_indices[1]] = target_main[0, 2, 1] + 1
 
     total, count = trainer._acceptance_proxy(
         predictions=predictions,
@@ -879,28 +933,14 @@ def test_acceptance_proxy_matches_loop_reference(monkeypatch, tmp_path: Path) ->
         tree_valid_mask=tree_valid_mask,
     )
 
-    expected_total = 0.0
-    expected_count = 0
-    primary_list = primary_indices.tolist()
-    for batch_idx in range(batch_size):
-        for anchor_idx in range(num_anchors):
-            if not bool(anchor_valid_mask[batch_idx, anchor_idx]):
-                continue
-            target_main = labels[batch_idx, anchor_idx, primary_list][1:].tolist()
-            accepted = 0
-            for node_idx in range(block_size):
-                if not bool(tree_valid_mask[batch_idx, anchor_idx, node_idx]):
-                    continue
-                path = gather_path_indices(node_idx, tree_info)[1:]
-                if len(path) > len(target_main):
-                    continue
-                if all(
-                    int(predictions[batch_idx, anchor_idx, tree_idx].item()) == int(target_main[depth_idx])
-                    for depth_idx, tree_idx in enumerate(path)
-                ):
-                    accepted = max(accepted, len(path))
-            expected_total += float(accepted)
-            expected_count += 1
+    expected_total, expected_count = _acceptance_proxy_loop_reference(
+        predictions=predictions,
+        labels=labels,
+        anchor_valid_mask=anchor_valid_mask,
+        tree_valid_mask=tree_valid_mask,
+        tree_info=tree_info,
+        primary_indices=primary_indices,
+    )
 
     assert total == expected_total
     assert count == expected_count
@@ -930,21 +970,16 @@ def test_acceptance_proxy_prefers_best_matching_non_primary_branch(monkeypatch, 
     )
 
     primary_indices = trainer.tree_processor.primary_path_indices
-    target_main = labels.index_select(-1, primary_indices)[0, 0, 1:]
-    non_primary_nodes = [
+    target_main = labels.index_select(-1, primary_indices)[0, 0]
+    branch_node = next(
         node_idx
         for node_idx in range(block_size)
-        if node_idx not in set(primary_indices.tolist()) and len(gather_path_indices(node_idx, tree_info)) > 1
-    ]
-    assert non_primary_nodes
-    branch_node = max(non_primary_nodes, key=lambda idx: len(gather_path_indices(idx, tree_info)))
-    branch_path = gather_path_indices(branch_node, tree_info)[1:]
-    assert len(branch_path) >= 1
+        if node_idx not in set(primary_indices.tolist()) and int(tree_info.depth[node_idx].item()) == 1
+    )
 
-    for depth_idx, node_idx in enumerate(branch_path):
-        predictions[0, 0, node_idx] = target_main[depth_idx]
-    if primary_indices.numel() > 1:
-        predictions[0, 0, primary_indices[1]] = target_main[0] + 1
+    predictions[0, 0, 0] = target_main[0]
+    predictions[0, 0, branch_node] = target_main[1]
+    predictions[0, 0, primary_indices[1]] = target_main[1] + 1
 
     total, count = trainer._acceptance_proxy(
         predictions=predictions,
@@ -953,19 +988,21 @@ def test_acceptance_proxy_prefers_best_matching_non_primary_branch(monkeypatch, 
         tree_valid_mask=tree_valid_mask,
     )
 
-    assert total == float(len(branch_path))
+    assert total == 1.0
     assert count == 1
 
 
 def test_acceptance_proxy_ignores_invalid_nodes_in_best_branch(monkeypatch, tmp_path: Path) -> None:
-    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
-    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    tree_processor = BlockTreeProcessor(tree_seq_depth=3)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(BlockTreeProcessor(tree_seq_depth=2).block_size)
     trainer = _make_trainer(
         monkeypatch,
         tmp_path,
         anchor_chunk_size=None,
         batch=packed_batch,
     )
+    trainer.tree_processor = tree_processor
+    trainer._acceptance_path_cache.clear()
 
     batch_size = 1
     num_anchors = 1
@@ -981,19 +1018,17 @@ def test_acceptance_proxy_ignores_invalid_nodes_in_best_branch(monkeypatch, tmp_
     )
 
     primary_indices = trainer.tree_processor.primary_path_indices
-    target_main = labels.index_select(-1, primary_indices)[0, 0, 1:]
-    non_primary_nodes = [
+    target_main = labels.index_select(-1, primary_indices)[0, 0]
+    branch_node = next(
         node_idx
         for node_idx in range(block_size)
-        if node_idx not in set(primary_indices.tolist()) and len(gather_path_indices(node_idx, tree_info)) > 2
-    ]
-    assert non_primary_nodes
-    branch_node = max(non_primary_nodes, key=lambda idx: len(gather_path_indices(idx, tree_info)))
-    branch_path = gather_path_indices(branch_node, tree_info)[1:]
-    for depth_idx, node_idx in enumerate(branch_path):
-        predictions[0, 0, node_idx] = target_main[depth_idx]
+        if node_idx not in set(primary_indices.tolist()) and int(tree_info.depth[node_idx].item()) == 2
+    )
+    branch_path = gather_path_indices(branch_node, tree_info)
+    for node_idx in branch_path:
+        predictions[0, 0, node_idx] = target_main[int(tree_info.depth[node_idx].item())]
 
-    tree_valid_mask[0, 0, branch_path[-1]] = False
+    tree_valid_mask[0, 0, branch_path[1]] = False
 
     total, count = trainer._acceptance_proxy(
         predictions=predictions,
@@ -1002,7 +1037,7 @@ def test_acceptance_proxy_ignores_invalid_nodes_in_best_branch(monkeypatch, tmp_
         tree_valid_mask=tree_valid_mask,
     )
 
-    assert total == float(len(branch_path) - 1)
+    assert total == 0.0
     assert count == 1
 
 
@@ -1084,18 +1119,45 @@ def test_loss_and_predictions_match_dense_reference_with_valid_row_compaction(mo
     flat_labels = labels.reshape(-1)
     flat_weights = weights.reshape(-1)
     flat_valid = valid_mask.reshape(-1)
-    flat_prediction = prediction_mask.reshape(-1)
     logits = trainer.target_lm_head(flat_hidden.to(trainer.target_lm_head.weight.dtype))
     reference_loss = (
         F.cross_entropy(logits[flat_valid].float(), flat_labels[flat_valid], reduction="none")
         * flat_weights[flat_valid]
     ).sum()
-    reference_predictions = torch.full_like(flat_labels, IGNORE_IDX)
-    reference_predictions[flat_prediction] = logits[flat_prediction].argmax(dim=-1)
+    reference_predictions = logits.argmax(dim=-1)
 
     assert valid_count == int(flat_valid.sum().item())
     assert torch.isclose(loss_sum, reference_loss)
     assert torch.equal(predictions.reshape(-1), reference_predictions)
+
+
+def test_chunked_predictions_cover_ignore_idx_positions(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+
+    hidden_states = torch.randn(1, 4, 16, requires_grad=True)
+    labels = torch.tensor([[3, IGNORE_IDX, 5, IGNORE_IDX]], dtype=torch.long)
+    weights = torch.tensor([[1.0, 0.0, 0.5, 0.0]], dtype=torch.float32)
+    valid_mask = torch.tensor([[True, False, True, False]], dtype=torch.bool)
+    prediction_mask = torch.tensor([[True, False, True, False]], dtype=torch.bool)
+
+    _, _, predictions, _ = trainer._chunked_loss_and_predictions(
+        hidden_states=hidden_states,
+        labels=labels,
+        weights=weights,
+        valid_mask=valid_mask,
+        prediction_mask=prediction_mask,
+        compute_predictions=True,
+    )
+
+    logits = trainer.target_lm_head(hidden_states.reshape(-1, hidden_states.shape[-1]).to(trainer.target_lm_head.weight.dtype))
+    assert torch.equal(predictions.reshape(-1), logits.argmax(dim=-1))
 
 
 def test_loss_uses_cce_backend_when_available(monkeypatch, tmp_path: Path) -> None:

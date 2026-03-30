@@ -14,8 +14,6 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from data_pipeline.stage2 import IGNORE_IDX
-
 from .data import DataModuleConfig, PackedBatch, build_dataloaders
 from .models import DFlashDraftModel
 from .trees import BlockTreeProcessor, BranchOffTreeProcessor, PrunableTreeProcessor
@@ -261,7 +259,10 @@ class Trainer:
         self.wandb_run = None
         self.wandb_run_id: str | None = None
         self._tree_info_cache: dict[tuple[int, int, str, int], Any] = {}
-        self._acceptance_path_cache: dict[tuple[tuple[int, ...], str, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._acceptance_path_cache: dict[
+            tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], str, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
         self._build_prefill_attention_mask = build_prefill_attention_mask
         self._build_drafter_block_mask = build_drafter_block_mask
         self._build_ar_block_mask = build_ar_block_mask
@@ -623,14 +624,19 @@ class Trainer:
         valid_count = int(flat_valid.sum().item())
         predictions = None
         if compute_predictions:
-            predictions = torch.full_like(flat_labels, IGNORE_IDX)
-            flat_prediction_mask = flat_valid if prediction_mask is None else prediction_mask.reshape(batch_size * total_tokens)
-            if flat_prediction_mask.any():
-                with torch.no_grad():
+            prediction_chunk_size = self.config.ce_chunk_size or flat_hidden.shape[0]
+            predictions = torch.empty(
+                (batch_size * total_tokens,),
+                dtype=torch.long,
+                device=flat_hidden.device,
+            )
+            with torch.no_grad():
+                for start in range(0, flat_hidden.shape[0], prediction_chunk_size):
+                    end = min(start + prediction_chunk_size, flat_hidden.shape[0])
                     prediction_logits = self.target_lm_head(
-                        flat_hidden[flat_prediction_mask].to(self.target_lm_head.weight.dtype)
+                        flat_hidden[start:end].to(self.target_lm_head.weight.dtype)
                     )
-                    predictions[flat_prediction_mask] = prediction_logits.argmax(dim=-1)
+                    predictions[start:end] = prediction_logits.argmax(dim=-1)
             predictions = predictions.view(batch_size, total_tokens)
         ce_time = time.perf_counter() - ce_start if profile else 0.0
         return total_loss, valid_count, predictions, ce_time
@@ -681,36 +687,30 @@ class Trainer:
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         parent_idx = self.tree_processor.parent_idx
+        depth = self.tree_processor.depth
+        primary_path_indices = self.tree_processor.primary_path_indices
         parent_key = tuple(int(idx) for idx in parent_idx.tolist())
+        depth_key = tuple(int(idx) for idx in depth.tolist())
+        primary_key = tuple(int(idx) for idx in primary_path_indices.tolist())
         device_key = (device.type, -1 if device.index is None else device.index)
-        cache_key = (parent_key, device_key[0], device_key[1])
+        cache_key = (parent_key, depth_key, primary_key, device_key[0], device_key[1])
         cached = self._acceptance_path_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        node_paths: list[list[int]] = []
-        max_path_len = 0
-        for node_idx in range(int(parent_idx.numel())):
-            path: list[int] = []
-            cur = node_idx
-            while cur > 0:
-                path.append(cur)
-                cur = int(parent_idx[cur].item())
-            path.reverse()
-            node_paths.append(path)
-            max_path_len = max(max_path_len, len(path))
+        ancestor_mask = self.tree_processor.tree_mask.to(device=device)
+        node_depths = depth.to(device=device)
+        primary_depths = depth.index_select(0, primary_path_indices)
+        node_target_indices = torch.full(
+            (int(node_depths.numel()),),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+        for primary_offset, depth_idx in enumerate(primary_depths.tolist()):
+            node_target_indices[node_depths == int(depth_idx)] = primary_offset
 
-        path_indices = torch.zeros((len(node_paths), max_path_len), dtype=torch.long, device=device)
-        path_mask = torch.zeros((len(node_paths), max_path_len), dtype=torch.bool, device=device)
-        path_lengths = torch.zeros((len(node_paths),), dtype=torch.long, device=device)
-        for node_idx, path in enumerate(node_paths):
-            path_lengths[node_idx] = len(path)
-            if not path:
-                continue
-            path_indices[node_idx, : len(path)] = torch.tensor(path, dtype=torch.long, device=device)
-            path_mask[node_idx, : len(path)] = True
-
-        cached = (path_indices, path_mask, path_lengths)
+        cached = (ancestor_mask, node_depths, node_target_indices)
         self._acceptance_path_cache[cache_key] = cached
         return cached
 
@@ -962,41 +962,33 @@ class Trainer:
         primary_indices = self.tree_processor.primary_path_indices.to(predictions.device)
         if primary_indices.numel() <= 1:
             return 0.0, 0
-        target_main_path = labels.index_select(-1, primary_indices)[..., 1:]
-        path_indices, path_mask, path_lengths = self._get_acceptance_path_tensors(device=predictions.device)
-        if path_mask.shape[-1] == 0:
+        target_main_path = labels.index_select(-1, primary_indices)
+        ancestor_mask, node_depths, node_target_indices = self._get_acceptance_path_tensors(device=predictions.device)
+        comparable_mask = node_target_indices >= 0
+        if not bool(comparable_mask.any().item()):
             return 0.0, int(anchor_valid_mask.to(torch.bool).sum().item())
 
-        gathered_predictions = predictions.unsqueeze(-2).expand(-1, -1, path_indices.shape[0], -1).gather(
+        target_tree_sd = target_main_path.gather(
             -1,
-            path_indices.view(1, 1, path_indices.shape[0], path_indices.shape[1]).expand(
+            node_target_indices.clamp(min=0).view(1, 1, -1).expand(
                 predictions.shape[0],
                 predictions.shape[1],
                 -1,
-                -1,
             ),
         )
-        compare_depth = min(gathered_predictions.shape[-1], target_main_path.shape[-1])
-        gathered_validity = tree_valid_mask.unsqueeze(-2).expand(-1, -1, path_indices.shape[0], -1).gather(
-            -1,
-            path_indices.view(1, 1, path_indices.shape[0], path_indices.shape[1]).expand(
-                tree_valid_mask.shape[0],
-                tree_valid_mask.shape[1],
-                -1,
-                -1,
-            ),
-        )
-        expanded_path_mask = path_mask.view(1, 1, path_indices.shape[0], path_indices.shape[1])
-        prefix_matches = (
-            gathered_predictions[..., :compare_depth]
-            == target_main_path.unsqueeze(-2)[..., :compare_depth]
-        ) | ~expanded_path_mask[..., :compare_depth]
-        node_matches = prefix_matches.all(dim=-1)
-        node_matches = node_matches & (gathered_validity | ~expanded_path_mask).all(dim=-1)
-        node_matches = node_matches & (path_lengths.view(1, 1, -1) <= target_main_path.shape[-1])
-        node_matches = node_matches & tree_valid_mask[..., : path_indices.shape[0]]
+        local_matches = predictions.eq(target_tree_sd)
+        local_matches = local_matches & tree_valid_mask
+        local_matches = local_matches & comparable_mask.view(1, 1, -1)
 
-        accepted_depth = (node_matches * path_lengths.view(1, 1, -1)).amax(dim=-1)
+        accepted_nodes = (
+            local_matches.unsqueeze(-2)
+            | ~ancestor_mask.view(1, 1, ancestor_mask.shape[0], ancestor_mask.shape[1])
+        ).all(dim=-1)
+        accepted_nodes = accepted_nodes & comparable_mask.view(1, 1, -1)
+
+        accepted_depth = (
+            accepted_nodes.to(node_depths.dtype) * node_depths.view(1, 1, -1)
+        ).amax(dim=-1)
         valid_mask = anchor_valid_mask.to(torch.bool)
         accepted_valid = accepted_depth.masked_select(valid_mask)
         total = float(accepted_valid.sum().item())
