@@ -20,6 +20,11 @@ from .data import DataModuleConfig, PackedBatch, build_dataloaders
 from .models import DFlashDraftModel
 from .trees import BlockTreeProcessor, BranchOffTreeProcessor, PrunableTreeProcessor
 
+try:
+    from cut_cross_entropy import linear_cross_entropy as cce_linear_cross_entropy
+except ImportError:
+    cce_linear_cross_entropy = None
+
 
 @dataclass
 class TrainerConfig:
@@ -256,6 +261,7 @@ class Trainer:
         self.wandb_run = None
         self.wandb_run_id: str | None = None
         self._tree_info_cache: dict[tuple[int, int, str, int], Any] = {}
+        self._acceptance_path_cache: dict[tuple[tuple[int, ...], str, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
         strategy = "ddp" if config.devices > 1 or config.ddp else "auto"
         self.fabric = Fabric(
@@ -470,6 +476,7 @@ class Trainer:
                 "ar_loss_sum": target_ctx_features.new_zeros(()),
                 "valid_count": 0,
                 "predictions": None,
+                "tree_valid_mask": tree_valid_mask,
                 "mask_time": 0.0,
                 "drafter_time": 0.0,
                 "ce_time": 0.0,
@@ -530,6 +537,7 @@ class Trainer:
             labels=tree_labels.reshape(batch_size, num_blocks * block_size),
             weights=tree_cum_probs.reshape(batch_size, num_blocks * block_size),
             valid_mask=flat_valid_mask,
+            prediction_mask=(tree_valid_mask & anchor_valid_mask.unsqueeze(-1)).reshape(batch_size, num_blocks * block_size),
             compute_predictions=compute_predictions,
             profile=profile,
         )
@@ -550,6 +558,7 @@ class Trainer:
                 labels=tree_labels.reshape(batch_size, num_blocks * block_size),
                 weights=tree_cum_probs.reshape(batch_size, num_blocks * block_size),
                 valid_mask=flat_valid_mask,
+                prediction_mask=None,
                 compute_predictions=False,
                 profile=profile,
             )
@@ -562,6 +571,7 @@ class Trainer:
             "ar_loss_sum": ar_loss_sum,
             "valid_count": valid_count,
             "predictions": predictions,
+            "tree_valid_mask": tree_valid_mask,
             "mask_time": mask_time,
             "drafter_time": drafter_time,
             "ce_time": ce_time,
@@ -586,6 +596,7 @@ class Trainer:
         labels: torch.Tensor,
         weights: torch.Tensor,
         valid_mask: torch.Tensor,
+        prediction_mask: torch.Tensor | None,
         compute_predictions: bool,
         profile: bool = False,
     ) -> tuple[torch.Tensor, int, torch.Tensor | None, float]:
@@ -598,34 +609,104 @@ class Trainer:
         if not flat_valid.any():
             return hidden_states.new_zeros(()), 0, None, 0.0
 
-        chunk_size = self.config.ce_chunk_size or flat_hidden.shape[0]
-        total_loss = hidden_states.new_zeros(())
-        predictions = (
-            torch.full_like(flat_labels, IGNORE_IDX)
-            if compute_predictions
-            else None
-        )
-        for start in range(0, flat_hidden.shape[0], chunk_size):
-            end = min(start + chunk_size, flat_hidden.shape[0])
-            chunk_hidden = flat_hidden[start:end]
-            logits = self.target_lm_head(chunk_hidden.to(self.target_lm_head.weight.dtype))
-            if compute_predictions and predictions is not None:
-                predictions[start:end] = logits.argmax(dim=-1)
-            ce = F.cross_entropy(
-                logits.float(),
-                flat_labels[start:end],
-                ignore_index=IGNORE_IDX,
-                reduction="none",
-            )
-            weighted = ce * flat_weights[start:end]
-            chunk_valid = flat_valid[start:end]
-            if chunk_valid.any():
-                total_loss = total_loss + weighted[chunk_valid].sum()
+        valid_hidden = flat_hidden[flat_valid]
+        valid_labels = flat_labels[flat_valid]
+        valid_weights = flat_weights[flat_valid]
+        per_token_loss = self._compute_linear_cross_entropy(valid_hidden, valid_labels)
+        total_loss = (per_token_loss * valid_weights).sum()
         valid_count = int(flat_valid.sum().item())
-        if predictions is not None:
+        predictions = None
+        if compute_predictions:
+            predictions = torch.full_like(flat_labels, IGNORE_IDX)
+            flat_prediction_mask = flat_valid if prediction_mask is None else prediction_mask.reshape(batch_size * total_tokens)
+            if flat_prediction_mask.any():
+                with torch.no_grad():
+                    prediction_logits = self.target_lm_head(
+                        flat_hidden[flat_prediction_mask].to(self.target_lm_head.weight.dtype)
+                    )
+                    predictions[flat_prediction_mask] = prediction_logits.argmax(dim=-1)
             predictions = predictions.view(batch_size, total_tokens)
         ce_time = time.perf_counter() - ce_start if profile else 0.0
         return total_loss, valid_count, predictions, ce_time
+
+    def _compute_linear_cross_entropy(
+        self,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        weight = self.target_lm_head.weight
+        bias = getattr(self.target_lm_head, "bias", None)
+        hidden_states = hidden_states.to(weight.dtype)
+        if cce_linear_cross_entropy is not None:
+            preferred_impl = "cce" if hidden_states.is_cuda else "torch_compile"
+            try:
+                return cce_linear_cross_entropy(
+                    hidden_states,
+                    weight,
+                    labels,
+                    bias=bias,
+                    reduction="none",
+                    impl=preferred_impl,
+                )
+            except Exception:
+                if preferred_impl != "torch_compile":
+                    try:
+                        return cce_linear_cross_entropy(
+                            hidden_states,
+                            weight,
+                            labels,
+                            bias=bias,
+                            reduction="none",
+                            impl="torch_compile",
+                        )
+                    except Exception:
+                        pass
+
+        logits = self.target_lm_head(hidden_states)
+        return F.cross_entropy(
+            logits.float(),
+            labels,
+            reduction="none",
+        )
+
+    def _get_acceptance_path_tensors(
+        self,
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        parent_idx = self.tree_processor.parent_idx
+        parent_key = tuple(int(idx) for idx in parent_idx.tolist())
+        device_key = (device.type, -1 if device.index is None else device.index)
+        cache_key = (parent_key, device_key[0], device_key[1])
+        cached = self._acceptance_path_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        node_paths: list[list[int]] = []
+        max_path_len = 0
+        for node_idx in range(int(parent_idx.numel())):
+            path: list[int] = []
+            cur = node_idx
+            while cur > 0:
+                path.append(cur)
+                cur = int(parent_idx[cur].item())
+            path.reverse()
+            node_paths.append(path)
+            max_path_len = max(max_path_len, len(path))
+
+        path_indices = torch.zeros((len(node_paths), max_path_len), dtype=torch.long, device=device)
+        path_mask = torch.zeros((len(node_paths), max_path_len), dtype=torch.bool, device=device)
+        path_lengths = torch.zeros((len(node_paths),), dtype=torch.long, device=device)
+        for node_idx, path in enumerate(node_paths):
+            path_lengths[node_idx] = len(path)
+            if not path:
+                continue
+            path_indices[node_idx, : len(path)] = torch.tensor(path, dtype=torch.long, device=device)
+            path_mask[node_idx, : len(path)] = True
+
+        cached = (path_indices, path_mask, path_lengths)
+        self._acceptance_path_cache[cache_key] = cached
+        return cached
 
     def _count_valid_targets(
         self,
@@ -730,6 +811,7 @@ class Trainer:
                     predictions=chunk_result["predictions"],
                     labels=batch.tree_labels[:, start:end],
                     anchor_valid_mask=batch.anchor_valid_mask[:, start:end],
+                    tree_valid_mask=chunk_result["tree_valid_mask"],
                 )
                 acceptance_total += acceptance_chunk_total
                 acceptance_count += acceptance_chunk_count
@@ -831,6 +913,7 @@ class Trainer:
                     predictions=chunk_result["predictions"],
                     labels=batch.tree_labels[:, start:end],
                     anchor_valid_mask=batch.anchor_valid_mask[:, start:end],
+                    tree_valid_mask=chunk_result["tree_valid_mask"],
                 )
                 acceptance_total += acceptance_chunk_total
                 acceptance_count += acceptance_chunk_count
@@ -859,22 +942,48 @@ class Trainer:
         predictions: torch.Tensor,
         labels: torch.Tensor,
         anchor_valid_mask: torch.Tensor,
+        tree_valid_mask: torch.Tensor,
     ) -> tuple[float, int]:
         if predictions.numel() == 0:
             return 0.0, 0
         primary_indices = self.tree_processor.primary_path_indices
         if primary_indices.numel() <= 1:
             return 0.0, 0
-        future_primary_indices = primary_indices[1:]
-        pred_primary = predictions[:, :, future_primary_indices]
-        label_primary = labels[:, :, future_primary_indices]
+        target_main_path = labels.index_select(-1, primary_indices)[..., 1:]
+        path_indices, path_mask, path_lengths = self._get_acceptance_path_tensors(device=predictions.device)
+        if path_mask.shape[-1] == 0:
+            return 0.0, int(anchor_valid_mask.to(torch.bool).sum().item())
 
-        mismatches = pred_primary.ne(label_primary)
-        has_mismatch = mismatches.any(dim=-1)
-        first_mismatch = mismatches.to(torch.int64).argmax(dim=-1)
-        full_depth = torch.full_like(first_mismatch, pred_primary.shape[-1])
-        accepted_depth = torch.where(has_mismatch, first_mismatch, full_depth)
+        gathered_predictions = predictions.unsqueeze(-2).expand(-1, -1, path_indices.shape[0], -1).gather(
+            -1,
+            path_indices.view(1, 1, path_indices.shape[0], path_indices.shape[1]).expand(
+                predictions.shape[0],
+                predictions.shape[1],
+                -1,
+                -1,
+            ),
+        )
+        compare_depth = min(gathered_predictions.shape[-1], target_main_path.shape[-1])
+        gathered_validity = tree_valid_mask.unsqueeze(-2).expand(-1, -1, path_indices.shape[0], -1).gather(
+            -1,
+            path_indices.view(1, 1, path_indices.shape[0], path_indices.shape[1]).expand(
+                tree_valid_mask.shape[0],
+                tree_valid_mask.shape[1],
+                -1,
+                -1,
+            ),
+        )
+        expanded_path_mask = path_mask.view(1, 1, path_indices.shape[0], path_indices.shape[1])
+        prefix_matches = (
+            gathered_predictions[..., :compare_depth]
+            == target_main_path.unsqueeze(-2)[..., :compare_depth]
+        ) | ~expanded_path_mask[..., :compare_depth]
+        node_matches = prefix_matches.all(dim=-1)
+        node_matches = node_matches & (gathered_validity | ~expanded_path_mask).all(dim=-1)
+        node_matches = node_matches & (path_lengths.view(1, 1, -1) <= target_main_path.shape[-1])
+        node_matches = node_matches & tree_valid_mask[..., : path_indices.shape[0]]
 
+        accepted_depth = (node_matches * path_lengths.view(1, 1, -1)).amax(dim=-1)
         valid_mask = anchor_valid_mask.to(torch.bool)
         accepted_valid = accepted_depth.masked_select(valid_mask)
         total = float(accepted_valid.sum().item())

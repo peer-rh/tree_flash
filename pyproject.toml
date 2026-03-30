@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Tree-structured drafter training on top of Stage 2 HDF5 data"
 requires-python = ">=3.11"
 dependencies = [
+    "cut-cross-entropy",
     "datasets>=2.20.0",
     "h5py>=3.10.0",
     "jsonargparse>=4.32.0",

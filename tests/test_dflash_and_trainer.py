@@ -7,10 +7,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 nn = pytest.importorskip("torch.nn")
+F = pytest.importorskip("torch.nn.functional")
 pytest.importorskip("h5py")
 transformers = pytest.importorskip("transformers")
 pytest.importorskip("lightning")
 
+from data_pipeline.stage2 import IGNORE_IDX
 from src.data import DataModuleConfig, PackedBatch
 from src.models.dflash import DFlashDraftModel
 from src.spec_decode import (
@@ -782,6 +784,7 @@ def test_train_batch_reports_acceptance_proxy(monkeypatch, tmp_path: Path) -> No
         predictions=chunk_result["predictions"],
         labels=packed_batch.tree_labels,
         anchor_valid_mask=packed_batch.anchor_valid_mask,
+        tree_valid_mask=chunk_result["tree_valid_mask"],
     )
 
     assert result["acceptance_total"] == expected_total
@@ -831,39 +834,166 @@ def test_acceptance_proxy_matches_loop_reference(monkeypatch, tmp_path: Path) ->
         [[True, False, True], [True, True, False]],
         dtype=torch.bool,
     )
+    tree_valid_mask = torch.ones((batch_size, num_anchors, block_size), dtype=torch.bool)
 
-    future_primary_indices = trainer.tree_processor.primary_path_indices[1:]
+    primary_indices = trainer.tree_processor.primary_path_indices
+    future_primary_indices = primary_indices[1:]
     if future_primary_indices.numel() > 0:
-        predictions[0, 0, future_primary_indices] = labels[0, 0, future_primary_indices]
-        predictions[0, 2, future_primary_indices[0]] = labels[0, 2, future_primary_indices[0]]
-        predictions[0, 2, future_primary_indices[1:]] = labels[0, 2, future_primary_indices[1:]] + 1
-        predictions[1, 0, future_primary_indices] = labels[1, 0, future_primary_indices] + 1
-        predictions[1, 1, future_primary_indices] = labels[1, 1, future_primary_indices]
+        target_prefix = labels.index_select(-1, primary_indices)[..., 1:]
+        predictions[0, 0, future_primary_indices[0]] = target_prefix[0, 0, 0]
+        predictions[1, 1, future_primary_indices] = target_prefix[1, 1]
+
+    tree_info = trainer.tree_processor.build_tree_info(
+        batch_size=batch_size,
+        num_blocks=num_anchors,
+        device=torch.device("cpu"),
+    )
+    non_primary_nodes = [
+        node_idx
+        for node_idx in range(block_size)
+        if node_idx not in set(primary_indices.tolist()) and len(gather_path_indices(node_idx, tree_info)) > 1
+    ]
+    assert non_primary_nodes
+    best_branch = max(non_primary_nodes, key=lambda idx: len(gather_path_indices(idx, tree_info)))
+    best_branch_path = gather_path_indices(best_branch, tree_info)[1:]
+    target_prefix = labels.index_select(-1, primary_indices)[..., 1:]
+    for depth_idx, node_idx in enumerate(best_branch_path):
+        predictions[0, 2, node_idx] = target_prefix[0, 2, depth_idx]
+    if future_primary_indices.numel() > 0:
+        predictions[0, 2, future_primary_indices[0]] = target_prefix[0, 2, 0] + 1
 
     total, count = trainer._acceptance_proxy(
         predictions=predictions,
         labels=labels,
         anchor_valid_mask=anchor_valid_mask,
+        tree_valid_mask=tree_valid_mask,
     )
 
-    pred_primary = predictions[:, :, future_primary_indices]
-    label_primary = labels[:, :, future_primary_indices]
     expected_total = 0.0
     expected_count = 0
+    primary_list = primary_indices.tolist()
     for batch_idx in range(batch_size):
         for anchor_idx in range(num_anchors):
             if not bool(anchor_valid_mask[batch_idx, anchor_idx]):
                 continue
+            target_main = labels[batch_idx, anchor_idx, primary_list][1:].tolist()
             accepted = 0
-            for depth_idx in range(pred_primary.shape[-1]):
-                if pred_primary[batch_idx, anchor_idx, depth_idx] != label_primary[batch_idx, anchor_idx, depth_idx]:
-                    break
-                accepted += 1
+            for node_idx in range(block_size):
+                if not bool(tree_valid_mask[batch_idx, anchor_idx, node_idx]):
+                    continue
+                path = gather_path_indices(node_idx, tree_info)[1:]
+                if len(path) > len(target_main):
+                    continue
+                if all(
+                    int(predictions[batch_idx, anchor_idx, tree_idx].item()) == int(target_main[depth_idx])
+                    for depth_idx, tree_idx in enumerate(path)
+                ):
+                    accepted = max(accepted, len(path))
             expected_total += float(accepted)
             expected_count += 1
 
     assert total == expected_total
     assert count == expected_count
+
+
+def test_acceptance_proxy_prefers_best_matching_non_primary_branch(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+
+    batch_size = 1
+    num_anchors = 1
+    block_size = trainer.tree_processor.block_size
+    predictions = torch.full((batch_size, num_anchors, block_size), -999, dtype=torch.long)
+    labels = torch.randint(100, 200, (batch_size, num_anchors, block_size), dtype=torch.long)
+    anchor_valid_mask = torch.tensor([[True]], dtype=torch.bool)
+    tree_valid_mask = torch.ones((batch_size, num_anchors, block_size), dtype=torch.bool)
+    tree_info = trainer.tree_processor.build_tree_info(
+        batch_size=batch_size,
+        num_blocks=num_anchors,
+        device=torch.device("cpu"),
+    )
+
+    primary_indices = trainer.tree_processor.primary_path_indices
+    target_main = labels.index_select(-1, primary_indices)[0, 0, 1:]
+    non_primary_nodes = [
+        node_idx
+        for node_idx in range(block_size)
+        if node_idx not in set(primary_indices.tolist()) and len(gather_path_indices(node_idx, tree_info)) > 1
+    ]
+    assert non_primary_nodes
+    branch_node = max(non_primary_nodes, key=lambda idx: len(gather_path_indices(idx, tree_info)))
+    branch_path = gather_path_indices(branch_node, tree_info)[1:]
+    assert len(branch_path) >= 1
+
+    for depth_idx, node_idx in enumerate(branch_path):
+        predictions[0, 0, node_idx] = target_main[depth_idx]
+    if primary_indices.numel() > 1:
+        predictions[0, 0, primary_indices[1]] = target_main[0] + 1
+
+    total, count = trainer._acceptance_proxy(
+        predictions=predictions,
+        labels=labels,
+        anchor_valid_mask=anchor_valid_mask,
+        tree_valid_mask=tree_valid_mask,
+    )
+
+    assert total == float(len(branch_path))
+    assert count == 1
+
+
+def test_acceptance_proxy_ignores_invalid_nodes_in_best_branch(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+
+    batch_size = 1
+    num_anchors = 1
+    block_size = trainer.tree_processor.block_size
+    predictions = torch.full((batch_size, num_anchors, block_size), -999, dtype=torch.long)
+    labels = torch.randint(100, 200, (batch_size, num_anchors, block_size), dtype=torch.long)
+    anchor_valid_mask = torch.tensor([[True]], dtype=torch.bool)
+    tree_valid_mask = torch.ones((batch_size, num_anchors, block_size), dtype=torch.bool)
+    tree_info = trainer.tree_processor.build_tree_info(
+        batch_size=batch_size,
+        num_blocks=num_anchors,
+        device=torch.device("cpu"),
+    )
+
+    primary_indices = trainer.tree_processor.primary_path_indices
+    target_main = labels.index_select(-1, primary_indices)[0, 0, 1:]
+    non_primary_nodes = [
+        node_idx
+        for node_idx in range(block_size)
+        if node_idx not in set(primary_indices.tolist()) and len(gather_path_indices(node_idx, tree_info)) > 2
+    ]
+    assert non_primary_nodes
+    branch_node = max(non_primary_nodes, key=lambda idx: len(gather_path_indices(idx, tree_info)))
+    branch_path = gather_path_indices(branch_node, tree_info)[1:]
+    for depth_idx, node_idx in enumerate(branch_path):
+        predictions[0, 0, node_idx] = target_main[depth_idx]
+
+    tree_valid_mask[0, 0, branch_path[-1]] = False
+
+    total, count = trainer._acceptance_proxy(
+        predictions=predictions,
+        labels=labels,
+        anchor_valid_mask=anchor_valid_mask,
+        tree_valid_mask=tree_valid_mask,
+    )
+
+    assert total == float(len(branch_path) - 1)
+    assert count == 1
 
 
 def test_acceptance_proxy_returns_zero_for_empty_predictions(monkeypatch, tmp_path: Path) -> None:
@@ -883,6 +1013,7 @@ def test_acceptance_proxy_returns_zero_for_empty_predictions(monkeypatch, tmp_pa
         predictions=predictions,
         labels=labels,
         anchor_valid_mask=anchor_valid_mask,
+        tree_valid_mask=torch.empty((0, 0, 0), dtype=torch.bool),
     )
 
     assert total == 0.0
@@ -907,10 +1038,92 @@ def test_acceptance_proxy_returns_zero_for_degenerate_primary_path(monkeypatch, 
         predictions=predictions,
         labels=labels,
         anchor_valid_mask=anchor_valid_mask,
+        tree_valid_mask=torch.ones_like(predictions, dtype=torch.bool),
     )
 
     assert total == 0.0
     assert count == 0
+
+
+def test_loss_and_predictions_match_dense_reference_with_valid_row_compaction(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+
+    hidden_states = torch.randn(1, 6, 16, requires_grad=True)
+    labels = torch.tensor([[3, 4, 5, 6, 7, 8]], dtype=torch.long)
+    weights = torch.tensor([[1.0, 0.5, 0.25, 0.75, 0.0, 1.25]], dtype=torch.float32)
+    valid_mask = torch.tensor([[True, False, True, True, False, True]], dtype=torch.bool)
+    prediction_mask = torch.tensor([[True, True, True, True, False, False]], dtype=torch.bool)
+
+    loss_sum, valid_count, predictions, _ = trainer._chunked_loss_and_predictions(
+        hidden_states=hidden_states,
+        labels=labels,
+        weights=weights,
+        valid_mask=valid_mask,
+        prediction_mask=prediction_mask,
+        compute_predictions=True,
+    )
+
+    flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+    flat_labels = labels.reshape(-1)
+    flat_weights = weights.reshape(-1)
+    flat_valid = valid_mask.reshape(-1)
+    flat_prediction = prediction_mask.reshape(-1)
+    logits = trainer.target_lm_head(flat_hidden.to(trainer.target_lm_head.weight.dtype))
+    reference_loss = (
+        F.cross_entropy(logits[flat_valid].float(), flat_labels[flat_valid], reduction="none")
+        * flat_weights[flat_valid]
+    ).sum()
+    reference_predictions = torch.full_like(flat_labels, IGNORE_IDX)
+    reference_predictions[flat_prediction] = logits[flat_prediction].argmax(dim=-1)
+
+    assert valid_count == int(flat_valid.sum().item())
+    assert torch.isclose(loss_sum, reference_loss)
+    assert torch.equal(predictions.reshape(-1), reference_predictions)
+
+
+def test_loss_uses_cce_backend_when_available(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+    calls: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+
+    def fake_cce(hidden_states, weight, labels, *, bias=None, reduction="none", impl="torch_compile"):
+        calls.append((impl, tuple(hidden_states.shape), tuple(labels.shape)))
+        logits = F.linear(hidden_states, weight, bias)
+        return F.cross_entropy(logits.float(), labels, reduction=reduction)
+
+    import src.trainer as trainer_mod
+
+    monkeypatch.setattr(trainer_mod, "cce_linear_cross_entropy", fake_cce)
+    hidden_states = torch.randn(1, 5, 16)
+    labels = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    weights = torch.ones((1, 5), dtype=torch.float32)
+    valid_mask = torch.tensor([[True, False, True, True, False]], dtype=torch.bool)
+
+    loss_sum, valid_count, _, _ = trainer._chunked_loss_and_predictions(
+        hidden_states=hidden_states,
+        labels=labels,
+        weights=weights,
+        valid_mask=valid_mask,
+        prediction_mask=None,
+        compute_predictions=False,
+    )
+
+    assert valid_count == 3
+    assert calls == [("torch_compile", (3, 16), (3,))]
+    assert torch.isfinite(loss_sum)
 
 
 def test_train_batch_adds_q_loss_when_q_head_is_present(monkeypatch, tmp_path: Path) -> None:
