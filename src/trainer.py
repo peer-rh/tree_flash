@@ -336,9 +336,9 @@ class Trainer:
         if config.compile and hasattr(torch, "compile"):
             self.target_model = torch.compile(self.target_model)
             self.drafter_model = torch.compile(self.drafter_model, dynamic=True)
-            self._build_prefill_attention_mask = torch.compile(self._build_prefill_attention_mask, dynamic=True)
-            self._build_drafter_block_mask = torch.compile(self._build_drafter_block_mask, dynamic=True)
-            self._build_ar_block_mask = torch.compile(self._build_ar_block_mask, dynamic=True)
+            self._build_prefill_attention_mask = torch.compile(self._build_prefill_attention_mask)
+            self._build_drafter_block_mask = torch.compile(self._build_drafter_block_mask)
+            self._build_ar_block_mask = torch.compile(self._build_ar_block_mask)
 
         self.optimizer = torch.optim.AdamW(
             self.drafter_model.parameters(),

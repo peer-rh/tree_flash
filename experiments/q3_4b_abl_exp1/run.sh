@@ -104,7 +104,7 @@ uv run -m src.trainer \
     --data.path ../dflash_2/datasets/q3_4b_100k_stage2.h5 --data.batch_size 1 --data.num_anchors 512 --data.tree_seq_depth 16   \
     --trainer.save_every 2048 --trainer.precision bf16-true --trainer.grad_accum_steps 8 --trainer.num_epochs 6 \
     --trainer.eval_every 2048 --trainer.wandb_run_name $EXPERIMENT_NAME --trainer.checkpoint_path $OUTPUT_DIR/checkpoints \
-    --trainer.anchor_chunk_size 256 \
+    --trainer.anchor_chunk_size 256 --trainer.ce_chunk_size 8192 \
     --trainer.dev_run false --trainer.verbose true --trainer.compile true --trainer.profile_steps 10 \
 
 # EOF
