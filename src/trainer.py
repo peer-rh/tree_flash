@@ -14,8 +14,6 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from data_pipeline.stage2 import IGNORE_IDX
-
 from .data import DataModuleConfig, PackedBatch, build_dataloaders
 from .models import DFlashDraftModel
 from .trees import BlockTreeProcessor, BranchOffTreeProcessor, PrunableTreeProcessor
@@ -31,6 +29,17 @@ def compute_linear_cross_entropy(
     labels: torch.Tensor,
     target_lm_head: torch.nn.Module,
 ) -> torch.Tensor:
+    """Compute unreduced token cross-entropy from hidden states and labels.
+
+    Args:
+        hidden_states: Hidden activations with shape ``(..., hidden_dim)``.
+        labels: Token ids aligned with ``hidden_states.shape[:-1]``.
+        target_lm_head: Output projection that maps ``hidden_dim`` features to
+            vocabulary logits.
+
+    Returns:
+        Tensor of per-token cross-entropy losses with shape ``labels.shape``.
+    """
     weight = target_lm_head.weight
     bias = getattr(target_lm_head, "bias", None)
     hidden_states = hidden_states.to(weight.dtype)
@@ -69,6 +78,12 @@ def compute_linear_cross_entropy(
 
 class TrainerLossAndPredictions(torch.nn.Module):
     def __init__(self, target_lm_head: torch.nn.Module):
+        """Store the LM head used for loss computation and argmax predictions.
+
+        Args:
+            target_lm_head: Module mapping hidden states of shape
+                ``(..., hidden_dim)`` to logits of shape ``(..., vocab_size)``.
+        """
         super().__init__()
         self.target_lm_head = target_lm_head
 
@@ -82,6 +97,29 @@ class TrainerLossAndPredictions(torch.nn.Module):
         flat_prediction_mask: torch.Tensor,
         compute_predictions: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Compute a weighted loss sum and optional flat predictions.
+
+        Args:
+            flat_hidden: Flattened hidden states with shape
+                ``(num_tokens, hidden_dim)``.
+            flat_labels: Flattened target token ids with shape ``(num_tokens,)``.
+            flat_weights: Per-token loss weights with shape ``(num_tokens,)``.
+            flat_valid: Boolean mask selecting tokens that contribute to loss,
+                shape ``(num_tokens,)``.
+            flat_prediction_mask: Boolean mask selecting tokens for argmax
+                prediction, shape ``(num_tokens,)``. The full argmax is now
+                materialized regardless of this mask and the mask is retained
+                only for call-site compatibility.
+            compute_predictions: Unused compatibility flag. Full argmax
+                predictions are always materialized.
+
+        Returns:
+            Tuple ``(total_loss, valid_count, predictions)`` where ``total_loss``
+            is a scalar weighted loss sum, ``valid_count`` is a scalar tensor
+            containing the number of valid loss positions, and ``predictions`` is
+            either ``None`` or a tensor of shape ``(num_tokens,)`` containing
+            argmax token ids for every flattened position.
+        """
         valid_hidden = flat_hidden[flat_valid]
         valid_labels = flat_labels[flat_valid]
         valid_weights = flat_weights[flat_valid]
@@ -92,13 +130,9 @@ class TrainerLossAndPredictions(torch.nn.Module):
         predictions = None
         if compute_predictions:
             prediction_logits = self.target_lm_head(
-                flat_hidden[flat_prediction_mask].detach().to(self.target_lm_head.weight.dtype)
+                flat_hidden.detach().to(self.target_lm_head.weight.dtype)
             )
-            predictions = torch.full_like(flat_labels, IGNORE_IDX)
-            predictions = predictions.masked_scatter(
-                flat_prediction_mask,
-                prediction_logits.argmax(dim=-1),
-            )
+            predictions = prediction_logits.argmax(dim=-1)
 
         return total_loss, valid_count, predictions
 
@@ -137,6 +171,14 @@ class TrainerConfig:
 
 
 def unwrap_model(module):
+    """Remove common Fabric or compile wrappers around a module.
+
+    Args:
+        module: Potentially wrapped module instance.
+
+    Returns:
+        The innermost exposed module after stripping known wrapper attributes.
+    """
     raw = module
     if hasattr(raw, "_forward_module"):
         raw = raw._forward_module
@@ -146,6 +188,14 @@ def unwrap_model(module):
 
 
 def has_pruning_head(module) -> bool:
+    """Check whether a drafter module exposes pruning-related heads.
+
+    Args:
+        module: Drafter module to inspect.
+
+    Returns:
+        ``True`` when the module has either a ``q_head`` or an ``ar_block``.
+    """
     return getattr(module, "q_head", None) is not None or getattr(module, "ar_block", None) is not None
 
 
@@ -153,6 +203,17 @@ def build_prefill_attention_mask(
     document_mask: torch.Tensor,
     valid_mask: torch.Tensor,
 ):
+    """Build a causal flex-attention mask for target-model context prefill.
+
+    Args:
+        document_mask: Document ids with shape ``(batch, seq_len)`` used to
+            prevent cross-document attention.
+        valid_mask: Boolean mask with shape ``(batch, seq_len)`` indicating
+            which context positions are real tokens.
+
+    Returns:
+        A flex-attention block mask for queries and keys of length ``seq_len``.
+    """
     try:
         from torch.nn.attention.flex_attention import create_block_mask
     except ImportError as exc:
@@ -164,6 +225,17 @@ def build_prefill_attention_mask(
     batch_size, seq_len = document_mask.shape
 
     def mask_mod(b, h, q_idx, kv_idx):
+        """Return whether query ``q_idx`` may attend to key ``kv_idx``.
+
+        Args:
+            b: Batch index.
+            h: Attention head index or ``None`` for head-independent masks.
+            q_idx: Query token index in ``[0, seq_len)``.
+            kv_idx: Key/value token index in ``[0, seq_len)``.
+
+        Returns:
+            Boolean scalar indicating whether the attention edge is enabled.
+        """
         q_valid = valid_mask[b, q_idx]
         invalid_self = (~q_valid) & (kv_idx == q_idx)
         attend = (
@@ -193,6 +265,23 @@ def build_drafter_block_mask(
     tree_valid_mask: torch.Tensor,
     block_size: int,
 ):
+    """Build the drafter attention mask for tree-token decoding blocks.
+
+    Args:
+        anchor_positions: Anchor token indices with shape
+            ``(batch, num_blocks)``.
+        document_mask: Document ids for context tokens with shape
+            ``(batch, ctx_len)``.
+        context_valid_mask: Boolean context-token validity mask with shape
+            ``(batch, ctx_len)``.
+        tree_valid_mask: Boolean tree-token validity mask with shape
+            ``(batch, num_blocks, block_size)``.
+        block_size: Number of tree nodes per anchor block.
+
+    Returns:
+        A flex-attention block mask with query length ``num_blocks * block_size``
+        and key length ``ctx_len + num_blocks * block_size``.
+    """
     try:
         from torch.nn.attention.flex_attention import create_block_mask
     except ImportError as exc:
@@ -210,6 +299,17 @@ def build_drafter_block_mask(
     tree_clamp_max = max(total_tree_len - 1, 0)
 
     def mask_mod(b, h, q_idx, kv_idx):
+        """Return whether a drafter tree query may attend to a given key.
+
+        Args:
+            b: Batch index.
+            h: Attention head index or ``None`` for head-independent masks.
+            q_idx: Query tree-token index in ``[0, total_tree_len)``.
+            kv_idx: Key/value index in ``[0, ctx_len + total_tree_len)``.
+
+        Returns:
+            Boolean scalar indicating whether the attention edge is enabled.
+        """
         q_valid = flat_block_valid[b, q_idx]
         invalid_self = (~q_valid) & (kv_idx == (ctx_len + q_idx))
 
@@ -247,6 +347,24 @@ def build_ar_block_mask(
     tree_info,
     block_size: int,
 ):
+    """Build the AR-head attention mask for autoregressive tree scoring.
+
+    Args:
+        anchor_positions: Anchor token indices with shape
+            ``(batch, num_blocks)``.
+        document_mask: Document ids for context tokens with shape
+            ``(batch, ctx_len)``.
+        context_valid_mask: Boolean context-token validity mask with shape
+            ``(batch, ctx_len)``.
+        tree_valid_mask: Boolean tree-token validity mask with shape
+            ``(batch, num_blocks, block_size)``.
+        tree_info: Tree metadata object exposing at least ``tree_mask``.
+        block_size: Number of tree nodes per anchor block.
+
+    Returns:
+        A flex-attention block mask with query length ``num_blocks * block_size``
+        and key length ``ctx_len + num_blocks * block_size``.
+    """
     try:
         from torch.nn.attention.flex_attention import create_block_mask
     except ImportError as exc:
@@ -265,6 +383,17 @@ def build_ar_block_mask(
     tree_mask = tree_info.tree_mask
 
     def mask_mod(b, h, q_idx, kv_idx):
+        """Return whether an AR-tree query may attend to a given key.
+
+        Args:
+            b: Batch index.
+            h: Attention head index or ``None`` for head-independent masks.
+            q_idx: Query tree-token index in ``[0, total_tree_len)``.
+            kv_idx: Key/value index in ``[0, ctx_len + total_tree_len)``.
+
+        Returns:
+            Boolean scalar indicating whether the attention edge is enabled.
+        """
         q_valid = flat_block_valid[b, q_idx]
         invalid_self = (~q_valid) & (kv_idx == (ctx_len + q_idx))
 
@@ -308,6 +437,18 @@ def get_lr(
     lr: float,
     min_lr: float,
 ) -> float:
+    """Compute the scalar learning rate for a warmup-plus-cosine schedule.
+
+    Args:
+        step: Current optimizer step.
+        warmup_steps: Number of linear warmup steps.
+        total_steps: Total optimizer steps in the run.
+        lr: Peak learning rate reached after warmup.
+        min_lr: Minimum learning rate used at the end of cosine decay.
+
+    Returns:
+        Learning rate value for ``step``.
+    """
     if step < warmup_steps:
         return lr * step / max(warmup_steps, 1)
     progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
@@ -328,6 +469,20 @@ class Trainer:
         tree_type: Literal["fixed", "prunable", "block", "branch_off", "every_branch", "loaded"] = "fixed",
         tree_args: dict[str, Any] | None = None,
     ):
+        """Initialize models, dataloaders, optimizer, and training state.
+
+        Args:
+            config: Trainer hyperparameters and runtime options.
+            target: Hugging Face name or path of the frozen target LM.
+            data: Dataset and dataloader configuration.
+            drafter: Drafter checkpoint path or inline config dictionary.
+            tree_type: Tree-construction strategy used by the data pipeline.
+            tree_args: Optional tree-processor arguments such as subtree layout
+                or pruning settings.
+
+        Returns:
+            None. The initializer populates the trainer state in place.
+        """
         self.config = config
         self.target = target
         self.data_config = data
@@ -457,6 +612,17 @@ class Trainer:
         tree_seq_depth: int,
         tree_args: dict[str, Any],
     ):
+        """Instantiate the tree processor used by the dataloaders and trainer.
+
+        Args:
+            tree_type: Tree strategy name such as ``"block"`` or
+                ``"branch_off"``.
+            tree_seq_depth: Number of sequence positions represented per tree.
+            tree_args: Additional processor-specific configuration values.
+
+        Returns:
+            Tree processor instance matching ``tree_type``.
+        """
         if tree_type in {"fixed", "block"}:
             return BlockTreeProcessor(
                 tree_seq_depth=tree_seq_depth,
@@ -481,6 +647,14 @@ class Trainer:
         )
 
     def _init_wandb(self) -> None:
+        """Start or resume the Weights & Biases run on rank zero.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         if self.config.no_wandb:
             return
         import wandb
@@ -500,6 +674,15 @@ class Trainer:
         self.wandb_run_id = self.wandb_run.id
 
     def _log(self, metrics: dict[str, float], step: int) -> None:
+        """Log scalar metrics to the active Weights & Biases run.
+
+        Args:
+            metrics: Mapping from metric names to scalar float values.
+            step: Global training step attached to the log event.
+
+        Returns:
+            None.
+        """
         if self.fabric.is_global_zero and self.wandb_run is not None:
             self.wandb_run.log(metrics, step=step)
 
@@ -510,6 +693,16 @@ class Trainer:
         num_blocks: int,
         device: torch.device,
     ):
+        """Fetch cached tree metadata for a batch shape and device.
+
+        Args:
+            batch_size: Batch dimension used to materialize tree tensors.
+            num_blocks: Number of anchor blocks per sample.
+            device: Device on which the cached tensors must live.
+
+        Returns:
+            Tree-info object produced by ``self.tree_processor.build_tree_info``.
+        """
         device_key = (device.type, -1 if device.index is None else device.index)
         cache_key = (batch_size, num_blocks, device_key[0], device_key[1])
         tree_info = self._tree_info_cache.get(cache_key)
@@ -527,6 +720,27 @@ class Trainer:
         compute_predictions: bool,
         profile: bool = False,
     ) -> dict[str, Any]:
+        """Run the drafter and losses for a slice of anchor blocks.
+
+        Args:
+            batch: Packed batch whose tree tensors have shapes like
+                ``tree_labels`` ``(batch, num_anchors, block_size)`` and
+                ``anchor_positions`` ``(batch, num_anchors)``.
+            target_ctx_features: Target-model context features with shape
+                ``(batch, ctx_len, hidden_dim)`` or the drafter-specific context
+                layout returned by ``extract_ctx_features``.
+            anchor_slice: Slice selecting anchor blocks along the ``num_anchors``
+                dimension.
+            compute_predictions: Whether to produce full-tree argmax predictions
+                for the acceptance proxy.
+            profile: Whether to time mask building, drafter forward, and CE.
+
+        Returns:
+            Dictionary containing scalar loss sums, the integer valid-token
+            count, optional predictions of shape
+            ``(batch, sliced_num_blocks, block_size)``, the sliced
+            ``tree_valid_mask``, and optional timing metrics in seconds.
+        """
         anchor_positions = batch.anchor_positions[:, anchor_slice]
         anchor_valid_mask = batch.anchor_valid_mask[:, anchor_slice]
         if not anchor_valid_mask.any():
@@ -668,6 +882,17 @@ class Trainer:
         tree_token_ids: torch.Tensor,
         tree_info,
     ) -> torch.Tensor:
+        """Replace each non-root tree token by its parent token id.
+
+        Args:
+            tree_token_ids: Token ids with shape ``(batch, num_blocks,
+                block_size)``.
+            tree_info: Tree metadata exposing ``block_size`` and ``parent_idx``.
+
+        Returns:
+            Tensor with the same shape as ``tree_token_ids`` where position ``i``
+            stores the token id of its parent node for all non-root nodes.
+        """
         parent_token_ids = tree_token_ids.clone()
         if tree_info.block_size <= 1:
             return parent_token_ids
@@ -686,6 +911,30 @@ class Trainer:
         compute_predictions: bool,
         profile: bool = False,
     ) -> tuple[torch.Tensor, int, torch.Tensor | None, float]:
+        """Flatten batched token features and compute loss and predictions.
+
+        Args:
+            hidden_states: Hidden states with shape ``(batch, total_tokens,
+                hidden_dim)``.
+            labels: Target token ids with shape ``(batch, total_tokens)``.
+            weights: Per-token loss weights with shape ``(batch, total_tokens)``.
+            valid_mask: Boolean mask selecting loss positions, shape
+                ``(batch, total_tokens)``.
+            prediction_mask: Optional boolean mask selecting prediction
+                positions, shape ``(batch, total_tokens)``. The full argmax is
+                now materialized regardless of this mask and the mask is
+                retained only for call-site compatibility.
+            compute_predictions: Whether to return full argmax predictions over
+                all tree positions.
+            profile: Whether to report elapsed CE time in seconds.
+
+        Returns:
+            Tuple ``(total_loss, valid_count, predictions, ce_time)`` where
+            ``total_loss`` is a scalar weighted loss sum, ``valid_count`` is the
+            number of valid tokens, ``predictions`` is either ``None`` or a
+            tensor of shape ``(batch, total_tokens)``, and ``ce_time`` is a
+            float duration in seconds.
+        """
         ce_start = time.perf_counter() if profile else 0.0
         batch_size, total_tokens, hidden_size = hidden_states.shape
         flat_hidden = hidden_states.reshape(batch_size * total_tokens, hidden_size)
@@ -694,13 +943,12 @@ class Trainer:
         flat_valid = valid_mask.reshape(batch_size * total_tokens)
         if not flat_valid.any():
             return hidden_states.new_zeros(()), 0, None, 0.0
-        flat_prediction_mask = flat_valid if prediction_mask is None else prediction_mask.reshape(batch_size * total_tokens)
         total_loss, valid_count_tensor, predictions = self._loss_and_predictions(
             flat_hidden=flat_hidden,
             flat_labels=flat_labels,
             flat_weights=flat_weights,
             flat_valid=flat_valid,
-            flat_prediction_mask=flat_prediction_mask,
+            flat_prediction_mask=flat_valid if prediction_mask is None else prediction_mask.reshape(batch_size * total_tokens),
             compute_predictions=compute_predictions,
         )
         valid_count = int(valid_count_tensor.item())
@@ -714,6 +962,15 @@ class Trainer:
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute per-token LM-head cross-entropy for this trainer.
+
+        Args:
+            hidden_states: Hidden activations with shape ``(..., hidden_dim)``.
+            labels: Token ids aligned with ``hidden_states.shape[:-1]``.
+
+        Returns:
+            Tensor of per-token cross-entropy losses with shape ``labels.shape``.
+        """
         return compute_linear_cross_entropy(hidden_states, labels, self.target_lm_head)
 
     def _get_acceptance_path_tensors(
@@ -721,6 +978,17 @@ class Trainer:
         *,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Materialize cached root-to-node path tensors for acceptance scoring.
+
+        Args:
+            device: Device on which the cached tensors should reside.
+
+        Returns:
+            Tuple ``(path_indices, path_mask, path_lengths)`` where
+            ``path_indices`` has shape ``(num_nodes, max_path_len)``,
+            ``path_mask`` has the same shape and marks valid entries, and
+            ``path_lengths`` has shape ``(num_nodes,)``.
+        """
         parent_idx = self.tree_processor.parent_idx
         parent_key = tuple(int(idx) for idx in parent_idx.tolist())
         device_key = (device.type, -1 if device.index is None else device.index)
@@ -759,6 +1027,16 @@ class Trainer:
         self,
         batch: PackedBatch,
     ) -> int:
+        """Count non-root tree targets that contribute to training loss.
+
+        Args:
+            batch: Packed batch with ``tree_valid_mask`` of shape
+                ``(batch, num_anchors, block_size)`` and ``anchor_valid_mask`` of
+                shape ``(batch, num_anchors)``.
+
+        Returns:
+            Integer number of valid non-root target positions in the batch.
+        """
         if batch.num_anchors == 0 or batch.tree_valid_mask.numel() == 0:
             return 0
         non_root_mask = self.tree_processor.non_root_mask.to(batch.tree_valid_mask.device).view(1, 1, -1)
@@ -770,6 +1048,14 @@ class Trainer:
         return int(valid_mask.sum().item())
 
     def _should_log_training_metrics_for_step(self, optimizer_step: int) -> bool:
+        """Decide whether training metrics should be logged for a step.
+
+        Args:
+            optimizer_step: One-based optimizer step to evaluate.
+
+        Returns:
+            ``True`` when standard logging is due or profiling is still active.
+        """
         if self.config.log_every > 0 and optimizer_step % self.config.log_every == 0:
             return True
         return self.config.profile_steps > 0 and optimizer_step <= self.config.profile_steps
@@ -778,6 +1064,18 @@ class Trainer:
         self,
         batch: PackedBatch,
     ) -> torch.Tensor:
+        """Run the frozen target LM over context tokens and extract features.
+
+        Args:
+            batch: Packed batch containing ``input_ids``, ``position_ids``,
+                ``document_mask``, and ``context_valid_mask`` with leading shape
+                ``(batch, ctx_len)``.
+
+        Returns:
+            Context features extracted from the target model. The tensor shape is
+            determined by ``self.raw_drafter.extract_ctx_features`` and is
+            aligned to the batch context sequence.
+        """
         with torch.no_grad():
             prefill_mask = self._build_prefill_attention_mask(batch.document_mask, batch.context_valid_mask)
             target_out = self.target_model(
@@ -795,6 +1093,18 @@ class Trainer:
         *,
         compute_acceptance: bool = True,
     ) -> dict[str, Any]:
+        """Run forward, backward, and metric accumulation for one batch.
+
+        Args:
+            batch: Packed batch with context tensors of shape ``(batch, ctx_len)``
+                and tree tensors of shape ``(batch, num_anchors, block_size)``.
+            compute_acceptance: Whether to compute full-tree argmax predictions
+                and the acceptance proxy for this batch.
+
+        Returns:
+            Dictionary containing scalar loss tensors, valid-target count,
+            acceptance aggregates, and optional profiling durations in seconds.
+        """
         batch = batch.to(self.fabric.device)
         if not batch.context_valid_mask.any() or batch.num_anchors == 0:
             zero = torch.zeros((), device=self.fabric.device)
@@ -902,6 +1212,16 @@ class Trainer:
         self,
         batch: PackedBatch,
     ) -> dict[str, Any]:
+        """Evaluate one batch without gradient updates.
+
+        Args:
+            batch: Packed batch with context tensors of shape ``(batch, ctx_len)``
+                and tree tensors of shape ``(batch, num_anchors, block_size)``.
+
+        Returns:
+            Dictionary containing scalar loss tensors, valid-target count,
+            acceptance aggregates, and timing fields in seconds.
+        """
         batch = batch.to(self.fabric.device)
         if not batch.context_valid_mask.any() or batch.num_anchors == 0:
             zero = torch.zeros((), device=self.fabric.device)
@@ -998,15 +1318,35 @@ class Trainer:
         anchor_valid_mask: torch.Tensor,
         tree_valid_mask: torch.Tensor,
     ) -> tuple[float, int]:
+        """Approximate acceptance length from predicted tree tokens.
+
+        Args:
+            predictions: Predicted token ids with shape ``(batch, num_anchors,
+                block_size)``.
+            labels: Reference tree token ids with shape ``(batch, num_anchors,
+                block_size)``.
+            anchor_valid_mask: Boolean anchor validity mask with shape
+                ``(batch, num_anchors)``.
+            tree_valid_mask: Boolean tree-token validity mask with shape
+                ``(batch, num_anchors, block_size)``.
+
+        Returns:
+            Tuple ``(total, count)`` where ``total`` is the summed accepted
+            prefix length across valid anchors plus one extra sampled token per
+            valid anchor, and ``count`` is the number of valid anchors
+            contributing to that sum.
+        """
         if predictions.numel() == 0:
             return 0.0, 0
         primary_indices = self.tree_processor.primary_path_indices.to(predictions.device)
+        valid_mask = anchor_valid_mask.to(torch.bool)
+        count = int(valid_mask.sum().item())
         if primary_indices.numel() <= 1:
-            return 0.0, 0
+            return float(count), count
         target_main_path = labels.index_select(-1, primary_indices)[..., 1:]
         path_indices, path_mask, path_lengths = self._get_acceptance_path_tensors(device=predictions.device)
         if path_mask.shape[-1] == 0:
-            return 0.0, int(anchor_valid_mask.to(torch.bool).sum().item())
+            return float(count), count
 
         gathered_predictions = predictions.unsqueeze(-2).expand(-1, -1, path_indices.shape[0], -1).gather(
             -1,
@@ -1038,13 +1378,19 @@ class Trainer:
         node_matches = node_matches & tree_valid_mask[..., : path_indices.shape[0]]
 
         accepted_depth = (node_matches * path_lengths.view(1, 1, -1)).amax(dim=-1)
-        valid_mask = anchor_valid_mask.to(torch.bool)
         accepted_valid = accepted_depth.masked_select(valid_mask)
-        total = float(accepted_valid.sum().item())
-        count = int(valid_mask.sum().item())
+        total = float(accepted_valid.sum().item()) + float(count)
         return total, count
 
     def fit(self):
+        """Train the drafter across all epochs, logging, evaluating, and saving.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         total_optimizer_steps = max(
             1,
             math.ceil(len(self.train_loader) * self.config.num_epochs / max(self.config.grad_accum_steps, 1)),
@@ -1177,6 +1523,15 @@ class Trainer:
             self.wandb_run.finish()
 
     def save_checkpoint(self, step: int | None = None, tag: str | None = None):
+        """Persist the drafter, optimizer, and trainer state to disk.
+
+        Args:
+            step: Optional step number used in the checkpoint directory name.
+            tag: Optional named directory that overrides the numeric step name.
+
+        Returns:
+            None.
+        """
         if tag is not None:
             checkpoint_dir = self.output_dir / tag
         else:
@@ -1195,6 +1550,15 @@ class Trainer:
             unwrap_model(self.drafter_model).save_pretrained(str(checkpoint_dir / "hf_draft"))
 
     def load_checkpoint(self, checkpoint_path):
+        """Restore the drafter, optimizer, and trainer state from disk.
+
+        Args:
+            checkpoint_path: Directory containing ``fabric_ckpt.pt`` and the HF
+                drafter export.
+
+        Returns:
+            None. The trainer state is updated in place.
+        """
         checkpoint_dir = Path(checkpoint_path)
         ckpt_file = checkpoint_dir / "fabric_ckpt.pt"
         remainder = self.fabric.load(
@@ -1209,6 +1573,15 @@ class Trainer:
 
     @torch.inference_mode()
     def validate(self):
+        """Evaluate the drafter over the validation dataloader.
+
+        Args:
+            None.
+
+        Returns:
+            Dictionary of dataset-level scalar metrics including evaluation loss,
+            auxiliary losses, and mean acceptance length.
+        """
         self.drafter_model.eval()
         total_loss = 0.0
         total_q_loss = 0.0
@@ -1249,6 +1622,14 @@ class Trainer:
 
 
 def build_parser() -> ArgumentParser:
+    """Create the CLI parser for trainer and data configuration.
+
+    Args:
+        None.
+
+    Returns:
+        Argument parser configured with trainer, data, and model arguments.
+    """
     parser = ArgumentParser(description="Train the Tree Flash drafter from Stage 2 HDF5 data.")
     parser.add_class_arguments(TrainerConfig, "trainer")
     parser.add_class_arguments(DataModuleConfig, "data")
@@ -1265,6 +1646,14 @@ def build_parser() -> ArgumentParser:
 
 
 def main() -> None:
+    """Parse CLI arguments, construct the trainer, and start training.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+    """
     parser = build_parser()
     cfg = parser.parse_args()
     trainer_cfg = TrainerConfig(**namespace_to_dict(cfg.trainer))

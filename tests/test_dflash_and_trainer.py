@@ -904,7 +904,7 @@ def test_acceptance_proxy_matches_loop_reference(monkeypatch, tmp_path: Path) ->
                     for depth_idx, tree_idx in enumerate(path)
                 ):
                     accepted = max(accepted, len(path))
-            expected_total += float(accepted)
+            expected_total += float(accepted + 1)
             expected_count += 1
 
     assert total == expected_total
@@ -958,7 +958,7 @@ def test_acceptance_proxy_prefers_best_matching_non_primary_branch(monkeypatch, 
         tree_valid_mask=tree_valid_mask,
     )
 
-    assert total == float(len(branch_path))
+    assert total == float(len(branch_path) + 1)
     assert count == 1
 
 
@@ -1007,7 +1007,7 @@ def test_acceptance_proxy_ignores_invalid_nodes_in_best_branch(monkeypatch, tmp_
         tree_valid_mask=tree_valid_mask,
     )
 
-    assert total == float(len(branch_path) - 1)
+    assert total == float(len(branch_path))
     assert count == 1
 
 
@@ -1056,8 +1056,8 @@ def test_acceptance_proxy_returns_zero_for_degenerate_primary_path(monkeypatch, 
         tree_valid_mask=torch.ones_like(predictions, dtype=torch.bool),
     )
 
-    assert total == 0.0
-    assert count == 0
+    assert total == 1.0
+    assert count == 1
 
 
 def test_loss_and_predictions_match_dense_reference_with_valid_row_compaction(monkeypatch, tmp_path: Path) -> None:
@@ -1089,14 +1089,12 @@ def test_loss_and_predictions_match_dense_reference_with_valid_row_compaction(mo
     flat_labels = labels.reshape(-1)
     flat_weights = weights.reshape(-1)
     flat_valid = valid_mask.reshape(-1)
-    flat_prediction = prediction_mask.reshape(-1)
     logits = trainer.target_lm_head(flat_hidden.to(trainer.target_lm_head.weight.dtype))
     reference_loss = (
         F.cross_entropy(logits[flat_valid].float(), flat_labels[flat_valid], reduction="none")
         * flat_weights[flat_valid]
     ).sum()
-    reference_predictions = torch.full_like(flat_labels, IGNORE_IDX)
-    reference_predictions[flat_prediction] = logits[flat_prediction].argmax(dim=-1)
+    reference_predictions = logits.argmax(dim=-1)
 
     assert valid_count == int(flat_valid.sum().item())
     assert torch.isclose(loss_sum, reference_loss)
@@ -1136,7 +1134,6 @@ def test_loss_and_predictions_skip_prediction_path_when_disabled(monkeypatch, tm
         F.cross_entropy(logits[flat_valid].float(), flat_labels[flat_valid], reduction="none")
         * flat_weights[flat_valid]
     ).sum()
-
     assert valid_count == int(flat_valid.sum().item())
     assert torch.isclose(loss_sum, reference_loss)
     assert predictions is None
