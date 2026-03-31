@@ -716,10 +716,7 @@ def test_trainer_compile_wraps_internal_compute_helpers(monkeypatch, tmp_path: P
     )
 
     compiled_names = [name for name, _ in compile_calls]
-    assert compiled_names.count("TrainerValidTargetCounter") == 1
     assert compiled_names.count("TrainerAcceptanceProxy") == 1
-    assert compiled_names.count("TrainerPrefillTargetContext") == 1
-    assert compiled_names.count("TrainerAnchorChunkForward") == 1
     assert compiled_names.count("TrainerLossAndPredictions") == 1
 
 

@@ -240,6 +240,132 @@ def get_lr(
     return min_lr + (lr - min_lr) * cosine
 
 
+class TrainerLossAndPredictions:
+    def __init__(self, target_lm_head) -> None:
+        self.target_lm_head = target_lm_head
+
+    def _compute_linear_cross_entropy(
+        self,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        weight = self.target_lm_head.weight
+        bias = getattr(self.target_lm_head, "bias", None)
+        hidden_states = hidden_states.to(weight.dtype)
+        if cce_linear_cross_entropy is not None:
+            preferred_impl = "cce" if hidden_states.is_cuda else "torch_compile"
+            try:
+                return cce_linear_cross_entropy(
+                    hidden_states,
+                    weight,
+                    labels,
+                    bias=bias,
+                    reduction="none",
+                    impl=preferred_impl,
+                )
+            except Exception:
+                if preferred_impl != "torch_compile":
+                    try:
+                        return cce_linear_cross_entropy(
+                            hidden_states,
+                            weight,
+                            labels,
+                            bias=bias,
+                            reduction="none",
+                            impl="torch_compile",
+                        )
+                    except Exception:
+                        pass
+
+        logits = self.target_lm_head(hidden_states)
+        return F.cross_entropy(
+            logits.float(),
+            labels,
+            reduction="none",
+        )
+
+    def __call__(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+        weights: torch.Tensor,
+        valid_mask: torch.Tensor,
+        compute_predictions: bool,
+        prediction_chunk_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, total_tokens, hidden_size = hidden_states.shape
+        flat_hidden = hidden_states.reshape(batch_size * total_tokens, hidden_size)
+        flat_labels = labels.reshape(batch_size * total_tokens)
+        flat_weights = weights.reshape(batch_size * total_tokens)
+        flat_valid = valid_mask.reshape(batch_size * total_tokens)
+
+        valid_hidden = flat_hidden[flat_valid]
+        valid_labels = flat_labels[flat_valid]
+        valid_weights = flat_weights[flat_valid]
+        per_token_loss = self._compute_linear_cross_entropy(valid_hidden, valid_labels)
+        total_loss = (per_token_loss * valid_weights).sum()
+        valid_count = flat_valid.sum()
+
+        predictions = torch.empty(0, dtype=torch.long, device=flat_hidden.device)
+        if compute_predictions:
+            predictions = torch.empty(
+                (batch_size * total_tokens,),
+                dtype=torch.long,
+                device=flat_hidden.device,
+            )
+            for start in range(0, flat_hidden.shape[0], prediction_chunk_size):
+                end = min(start + prediction_chunk_size, flat_hidden.shape[0])
+                prediction_logits = self.target_lm_head(
+                    flat_hidden[start:end].to(self.target_lm_head.weight.dtype)
+                )
+                predictions[start:end] = prediction_logits.argmax(dim=-1)
+            predictions = predictions.view(batch_size, total_tokens)
+
+        return total_loss, valid_count, predictions
+
+
+class TrainerAcceptanceProxy:
+    def __call__(
+        self,
+        *,
+        predictions: torch.Tensor,
+        labels: torch.Tensor,
+        anchor_valid_mask: torch.Tensor,
+        tree_valid_mask: torch.Tensor,
+        primary_indices: torch.Tensor,
+        ancestor_mask: torch.Tensor,
+        node_depths: torch.Tensor,
+        node_target_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        comparable_mask = node_target_indices >= 0
+        target_main_path = labels.index_select(-1, primary_indices)
+        target_tree_sd = target_main_path.gather(
+            -1,
+            node_target_indices.clamp(min=0).view(1, 1, -1).expand(
+                predictions.shape[0],
+                predictions.shape[1],
+                -1,
+            ),
+        )
+        local_matches = predictions.eq(target_tree_sd)
+        local_matches = local_matches & tree_valid_mask
+        local_matches = local_matches & comparable_mask.view(1, 1, -1)
+
+        accepted_nodes = (
+            local_matches.unsqueeze(-2)
+            | ~ancestor_mask.view(1, 1, ancestor_mask.shape[0], ancestor_mask.shape[1])
+        ).all(dim=-1)
+        accepted_nodes = accepted_nodes & comparable_mask.view(1, 1, -1)
+
+        accepted_depth = (
+            accepted_nodes.to(node_depths.dtype) * node_depths.view(1, 1, -1)
+        ).amax(dim=-1)
+        valid_mask = anchor_valid_mask.to(torch.bool)
+        accepted_valid = accepted_depth.masked_select(valid_mask)
+        return accepted_valid.sum(), valid_mask.sum()
+
+
 class Trainer:
     tree_processor: Any
 
@@ -270,6 +396,8 @@ class Trainer:
         self._build_prefill_attention_mask = build_prefill_attention_mask
         self._build_drafter_block_mask = build_drafter_block_mask
         self._build_ar_block_mask = build_ar_block_mask
+        self._loss_and_predictions_impl = None
+        self._acceptance_proxy_impl = TrainerAcceptanceProxy()
 
         strategy = "ddp" if config.devices > 1 or config.ddp else "auto"
         self.fabric = Fabric(
@@ -357,6 +485,10 @@ class Trainer:
         self.target_lm_head = self.target_model.get_output_embeddings()
         if self.target_lm_head is None:
             raise ValueError("Target model must expose an output embedding / LM head.")
+        self._loss_and_predictions_impl = TrainerLossAndPredictions(self.target_lm_head)
+        if config.compile and hasattr(torch, "compile"):
+            self._loss_and_predictions_impl = torch.compile(self._loss_and_predictions_impl, dynamic=True)
+            self._acceptance_proxy_impl = torch.compile(self._acceptance_proxy_impl, dynamic=True)
 
         self.train_loader, self.eval_loader = build_dataloaders(
             config=data,
@@ -675,7 +807,7 @@ class Trainer:
 
         noise_embeddings = self.target_embeddings(tree_noise_ids.reshape(batch_size, num_blocks * block_size))
         mask_start = time.perf_counter() if profile else 0.0
-        drafter_mask = build_drafter_block_mask(
+        drafter_mask = self._build_drafter_block_mask(
             anchor_positions=anchor_positions,
             document_mask=batch.document_mask,
             context_valid_mask=batch.context_valid_mask,
@@ -796,36 +928,25 @@ class Trainer:
         profile: bool = False,
     ) -> tuple[torch.Tensor, int, torch.Tensor | None, float]:
         ce_start = time.perf_counter() if profile else 0.0
-        batch_size, total_tokens, hidden_size = hidden_states.shape
-        flat_hidden = hidden_states.reshape(batch_size * total_tokens, hidden_size)
-        flat_labels = labels.reshape(batch_size * total_tokens)
-        flat_weights = weights.reshape(batch_size * total_tokens)
-        flat_valid = valid_mask.reshape(batch_size * total_tokens)
+        _ = prediction_mask
+        flat_valid = valid_mask.reshape(-1)
         if not flat_valid.any():
             return hidden_states.new_zeros(()), 0, None, 0.0
 
-        valid_hidden = flat_hidden[flat_valid]
-        valid_labels = flat_labels[flat_valid]
-        valid_weights = flat_weights[flat_valid]
-        per_token_loss = self._compute_linear_cross_entropy(valid_hidden, valid_labels)
-        total_loss = (per_token_loss * valid_weights).sum()
-        valid_count = int(flat_valid.sum().item())
-        predictions = None
-        if compute_predictions:
-            prediction_chunk_size = self.config.ce_chunk_size or flat_hidden.shape[0]
-            predictions = torch.empty(
-                (batch_size * total_tokens,),
-                dtype=torch.long,
-                device=flat_hidden.device,
-            )
-            with torch.no_grad():
-                for start in range(0, flat_hidden.shape[0], prediction_chunk_size):
-                    end = min(start + prediction_chunk_size, flat_hidden.shape[0])
-                    prediction_logits = self.target_lm_head(
-                        flat_hidden[start:end].to(self.target_lm_head.weight.dtype)
-                    )
-                    predictions[start:end] = prediction_logits.argmax(dim=-1)
-            predictions = predictions.view(batch_size, total_tokens)
+        if self._loss_and_predictions_impl is None:
+            raise RuntimeError("Loss/prediction helper must be initialized before use.")
+
+        prediction_chunk_size = self.config.ce_chunk_size or int(hidden_states.shape[0] * hidden_states.shape[1])
+        total_loss, valid_count_tensor, prediction_tensor = self._loss_and_predictions_impl(
+            hidden_states=hidden_states,
+            labels=labels,
+            weights=weights,
+            valid_mask=valid_mask,
+            compute_predictions=compute_predictions,
+            prediction_chunk_size=prediction_chunk_size,
+        )
+        valid_count = int(valid_count_tensor.item())
+        predictions = prediction_tensor if compute_predictions else None
         ce_time = time.perf_counter() - ce_start if profile else 0.0
         return total_loss, valid_count, predictions, ce_time
 
@@ -834,40 +955,9 @@ class Trainer:
         hidden_states: torch.Tensor,
         labels: torch.Tensor,
     ) -> torch.Tensor:
-        weight = self.target_lm_head.weight
-        bias = getattr(self.target_lm_head, "bias", None)
-        hidden_states = hidden_states.to(weight.dtype)
-        if cce_linear_cross_entropy is not None:
-            preferred_impl = "cce" if hidden_states.is_cuda else "torch_compile"
-            try:
-                return cce_linear_cross_entropy(
-                    hidden_states,
-                    weight,
-                    labels,
-                    bias=bias,
-                    reduction="none",
-                    impl=preferred_impl,
-                )
-            except Exception:
-                if preferred_impl != "torch_compile":
-                    try:
-                        return cce_linear_cross_entropy(
-                            hidden_states,
-                            weight,
-                            labels,
-                            bias=bias,
-                            reduction="none",
-                            impl="torch_compile",
-                        )
-                    except Exception:
-                        pass
-
-        logits = self.target_lm_head(hidden_states)
-        return F.cross_entropy(
-            logits.float(),
-            labels,
-            reduction="none",
-        )
+        if self._loss_and_predictions_impl is None:
+            raise RuntimeError("Loss/prediction helper must be initialized before use.")
+        return self._loss_and_predictions_impl._compute_linear_cross_entropy(hidden_states, labels)
 
     def _get_acceptance_path_tensors(
         self,
@@ -1148,38 +1238,21 @@ class Trainer:
         primary_indices = self.tree_processor.primary_path_indices.to(predictions.device)
         if primary_indices.numel() <= 1:
             return 0.0, 0
-        target_main_path = labels.index_select(-1, primary_indices)
         ancestor_mask, node_depths, node_target_indices = self._get_acceptance_path_tensors(device=predictions.device)
         comparable_mask = node_target_indices >= 0
         if not bool(comparable_mask.any().item()):
             return 0.0, int(anchor_valid_mask.to(torch.bool).sum().item())
-
-        target_tree_sd = target_main_path.gather(
-            -1,
-            node_target_indices.clamp(min=0).view(1, 1, -1).expand(
-                predictions.shape[0],
-                predictions.shape[1],
-                -1,
-            ),
+        total_tensor, count_tensor = self._acceptance_proxy_impl(
+            predictions=predictions,
+            labels=labels,
+            anchor_valid_mask=anchor_valid_mask,
+            tree_valid_mask=tree_valid_mask,
+            primary_indices=primary_indices,
+            ancestor_mask=ancestor_mask,
+            node_depths=node_depths,
+            node_target_indices=node_target_indices,
         )
-        local_matches = predictions.eq(target_tree_sd)
-        local_matches = local_matches & tree_valid_mask
-        local_matches = local_matches & comparable_mask.view(1, 1, -1)
-
-        accepted_nodes = (
-            local_matches.unsqueeze(-2)
-            | ~ancestor_mask.view(1, 1, ancestor_mask.shape[0], ancestor_mask.shape[1])
-        ).all(dim=-1)
-        accepted_nodes = accepted_nodes & comparable_mask.view(1, 1, -1)
-
-        accepted_depth = (
-            accepted_nodes.to(node_depths.dtype) * node_depths.view(1, 1, -1)
-        ).amax(dim=-1)
-        valid_mask = anchor_valid_mask.to(torch.bool)
-        accepted_valid = accepted_depth.masked_select(valid_mask)
-        total = float(accepted_valid.sum().item())
-        count = int(valid_mask.sum().item())
-        return total, count
+        return float(total_tensor.item()), int(count_tensor.item())
 
     def fit(self):
         total_optimizer_steps = max(
