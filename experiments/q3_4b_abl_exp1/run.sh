@@ -84,15 +84,31 @@ MODEL_JSON=$(cat <<MODELEOF
   "use_tree_pos_emb": true,
   "use_additive_tree_pos_bias": true,
   "max_tree_size": 128,
-  "use_q_head": true
+  "use_q_head": false
 }
 MODELEOF
 )
 TREE_JSON=$(cat <<TREEEOF
 {
     "tree_seq_depth": 16,
-    "prune_topk": 16, 
-    "base_tree_type": "block",
+    "base_tree_type": "branch_off",
+    "sub_tree_paths": [
+      "01234567",
+      "01234567",
+      "01234567",
+      "01234567",
+      "01234567",
+      "01234567",
+      "01234567",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+    ]
 }
 TREEEOF
 )
@@ -105,7 +121,7 @@ uv run -m src.trainer \
     --trainer.save_every 2048 --trainer.precision bf16-true --trainer.grad_accum_steps 8 --trainer.num_epochs 6 \
     --trainer.eval_every 2048 --trainer.wandb_run_name $EXPERIMENT_NAME --trainer.checkpoint_path $OUTPUT_DIR/checkpoints \
     --trainer.anchor_chunk_size null --trainer.ce_chunk_size 32768 \
-    --trainer.ddp true --trainer.devices 4 \
+    --trainer.ddp true --trainer.devices 4 --trainer.disable_predictions true \
     --trainer.dev_run false --trainer.verbose false --trainer.compile true 
 
 # EOF

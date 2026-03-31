@@ -434,6 +434,7 @@ def _make_trainer(
     q_loss_lambda: float = 1.0,
     ar_loss_lambda: float = 0.1,
     compile: bool = False,
+    disable_predictions: bool = False,
 ) -> Trainer:
     import src.trainer as trainer_mod
 
@@ -463,6 +464,7 @@ def _make_trainer(
             dev_run=True,
             precision="32-true",
             anchor_chunk_size=anchor_chunk_size,
+            disable_predictions=disable_predictions,
             q_loss_lambda=q_loss_lambda,
             ar_loss_lambda=ar_loss_lambda,
             compile=compile,
@@ -881,6 +883,26 @@ def test_train_batch_reports_acceptance_proxy(monkeypatch, tmp_path: Path) -> No
     assert result["acceptance_count"] == expected_count
 
 
+def test_train_batch_skips_acceptance_proxy_when_predictions_disabled(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+        disable_predictions=True,
+    )
+
+    trainer._acceptance_proxy = lambda **kwargs: (_ for _ in ()).throw(AssertionError("acceptance proxy should not run"))
+
+    result = trainer._train_batch(packed_batch)
+
+    assert result["valid_count"] > 0
+    assert result["acceptance_total"] == 0.0
+    assert result["acceptance_count"] == 0
+
+
 def test_train_batch_acceptance_proxy_is_chunk_invariant(monkeypatch, tmp_path: Path) -> None:
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
@@ -1243,6 +1265,21 @@ def test_train_batch_adds_q_loss_when_q_head_is_present(monkeypatch, tmp_path: P
 
     assert result["q_loss"].item() > 0
     assert torch.isclose(result["loss"], result["ce_loss"] + 0.5 * result["q_loss"])
+
+
+def test_trainer_rejects_disabling_predictions_when_q_head_is_present(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size, with_q_head=True)
+
+    with pytest.raises(ValueError, match="disable_predictions=True.*q_head"):
+        _make_trainer(
+            monkeypatch,
+            tmp_path,
+            anchor_chunk_size=None,
+            batch=packed_batch,
+            with_q_head=True,
+            disable_predictions=True,
+        )
 
 
 def test_train_batch_adds_ar_loss_when_ar_head_is_present(monkeypatch, tmp_path: Path) -> None:
@@ -2244,6 +2281,7 @@ def test_parsers_accept_prunable_tree_type() -> None:
     assert any(action.dest == "eval_data" for action in build_spec_decode_parser()._actions)
     assert any(action.dest == "official_eagle3_model" for action in build_eagle3_eval_parser()._actions)
     assert any(action.dest == "threshold" for action in build_eagle3_eval_parser()._actions)
+    assert any(action.dest == "trainer.disable_predictions" for action in build_trainer_parser()._actions)
     assert eagle3_backend_action.choices == ["upstream", "flex"]
     assert all(action.dest != "trainer.target_attn_implementation" for action in build_trainer_parser()._actions)
     assert all(action.dest != "attn_implementation" for action in build_spec_decode_parser()._actions)
@@ -2332,3 +2370,67 @@ def test_fit_logs_acceptance_proxy_over_full_accumulated_batch(monkeypatch, tmp_
 
     assert acceptance_calls == 2
     assert logged_acceptance == [(1, 2.5)]
+
+
+def test_eval_and_fit_keep_acceptance_metric_at_zero_when_predictions_disabled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+        disable_predictions=True,
+    )
+
+    trainer._acceptance_proxy = lambda **kwargs: (_ for _ in ()).throw(AssertionError("acceptance proxy should not run"))
+    trainer.eval_loader = [packed_batch]
+    trainer.config.eval_batches = 1
+
+    metrics = trainer.validate()
+
+    assert metrics["eval/mean_acceptance_length"] == 0.0
+
+    trainer.config.grad_accum_steps = 2
+    trainer.config.log_every = 1
+    trainer.config.eval_every = 0
+    trainer.config.save_every = 0
+    trainer.config.dev_run = False
+    trainer.train_loader = [packed_batch, packed_batch]
+
+    compute_predictions_calls: list[bool] = []
+    original_forward_anchor_chunk = trainer._forward_anchor_chunk
+
+    def spy_forward_anchor_chunk(
+        batch: PackedBatch,
+        target_ctx_features: torch.Tensor,
+        anchor_slice: slice,
+        *,
+        compute_predictions: bool,
+        profile: bool = False,
+    ) -> dict[str, object]:
+        compute_predictions_calls.append(compute_predictions)
+        return original_forward_anchor_chunk(
+            batch,
+            target_ctx_features,
+            anchor_slice,
+            compute_predictions=compute_predictions,
+            profile=profile,
+        )
+
+    logged_acceptance: list[tuple[int, float]] = []
+
+    def capture_log(metrics: dict[str, float], step: int) -> None:
+        if "train/acceptance_proxy" in metrics:
+            logged_acceptance.append((step, metrics["train/acceptance_proxy"]))
+
+    trainer._forward_anchor_chunk = spy_forward_anchor_chunk
+    trainer._log = capture_log
+
+    trainer.fit()
+
+    assert compute_predictions_calls == [False, False]
+    assert logged_acceptance == [(1, 0.0)]

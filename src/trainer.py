@@ -43,6 +43,7 @@ class TrainerConfig:
     devices: int = 1
     anchor_chunk_size: int | None = None
     ce_chunk_size: int | None = None
+    disable_predictions: bool = False
     q_loss_lambda: float = 1.0
     ar_loss_lambda: float = 0.1
     weight_decay: float = 0.01
@@ -661,6 +662,12 @@ class Trainer:
             raise ValueError("The drafter config must define dflash_config.mask_token_id.")
         self.has_q_head = getattr(self.raw_drafter, "q_head", None) is not None
         self.has_ar_head = getattr(self.raw_drafter, "ar_block", None) is not None
+        self.compute_predictions = not config.disable_predictions
+        if not self.compute_predictions and self.has_q_head:
+            raise ValueError(
+                "trainer.disable_predictions=True is incompatible with a drafter that exposes q_head "
+                "because q-loss targets require drafter predictions."
+            )
         if tree_type == "prunable" and not has_pruning_head(self.raw_drafter):
             raise ValueError(
                 "tree_type='prunable' requires a drafter checkpoint/config with use_q_head=True or use_ar_head=True."
@@ -1523,7 +1530,7 @@ class Trainer:
                 batch,
                 target_ctx_features,
                 slice(start, end),
-                compute_predictions=True,
+                compute_predictions=self.compute_predictions,
                 profile=profile,
             )
             if chunk_result["valid_count"] == 0:
@@ -1638,7 +1645,7 @@ class Trainer:
                 batch,
                 target_ctx_features,
                 slice(start, end),
-                compute_predictions=True,
+                compute_predictions=self.compute_predictions,
                 profile=False,
             )
             total_loss_sum = total_loss_sum + chunk_result["loss_sum"]
