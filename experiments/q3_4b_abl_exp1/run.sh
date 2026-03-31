@@ -91,10 +91,11 @@ MODELEOF
 TREE_JSON=$(cat <<TREEEOF
 {
     "tree_seq_depth": 16,
+    "prune_topk": 16, 
+    "base_tree_type": "block",
 }
 TREEEOF
 )
- # TODO: Make prunable and block tree
 
 uv run -m src.trainer \
     --tree_type prunabl --tree_args "$TREE_JSON" \
