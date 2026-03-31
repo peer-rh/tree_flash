@@ -322,18 +322,35 @@ def build_pruning_scores(
     target_embeddings,
     target_lm_head,
     temperature: float,
+    ar_cache: Cache | None = None,
 ) -> torch.Tensor | None:
     """Score drafted nodes for pruning using the available drafter head."""
     if getattr(raw_drafter, "ar_block", None) is not None:
         parent_token_ids = build_tree_parent_token_ids(tree_token_ids, tree_info)
         parent_embeddings = target_embeddings(parent_token_ids.unsqueeze(0))
+        prefix_position_ids = None
+        use_cache = False
+        pre_len = 0
+        if ar_cache is not None:
+            pre_len = ar_cache.get_seq_length()
+            prefix_position_ids = torch.arange(
+                pre_len,
+                pre_len + target_ctx_features.shape[1],
+                device=backbone_hidden.device,
+            ).unsqueeze(0)
+            use_cache = True
         ar_hidden_states = raw_drafter.build_ar_hidden_states(
             backbone_hidden,
             parent_embeddings,
             target_ctx_features=target_ctx_features,
             tree_info=tree_info,
             position_ids=position_ids,
+            past_key_values=ar_cache,
+            use_cache=use_cache,
+            prefix_position_ids=prefix_position_ids,
         )
+        if ar_cache is not None:
+            ar_cache.crop(pre_len + target_ctx_features.shape[1])
         ar_logits = target_lm_head(ar_hidden_states)[0]
         ar_scores = gather_token_probability(ar_logits, tree_token_ids, temperature)
         ar_scores[0] = 1.0
@@ -357,6 +374,7 @@ def draft_tree(
     tree_processor,
     target_ctx_features,
     drafter_cache: Cache,
+    ar_cache: Cache | None,
     current_root_token: int,
     root_position: int,
     temperature: float,
@@ -369,10 +387,10 @@ def draft_tree(
     noise_ids = torch.full((1, tree_len), raw_drafter.mask_token_id, dtype=torch.long, device=device)
     noise_ids[0, 0] = current_root_token
     noise_embeddings = target_embeddings(noise_ids)
-    position_ids = (tree_info.depth.view(1, -1) + root_position).to(device)
+    tree_position_ids = (tree_info.depth.view(1, -1) + root_position).to(device)
     position_ids = torch.cat([
         torch.arange(pre_len, pre_len + target_ctx_features.shape[1], device=device),
-        position_ids.squeeze(0),
+        tree_position_ids.squeeze(0),
     ], dim=1)
     draft_hidden_states, backbone_hidden = drafter_model(
         hidden_states=noise_embeddings,
@@ -396,10 +414,11 @@ def draft_tree(
         tree_token_ids=tree_token_ids,
         tree_info=tree_info,
         target_ctx_features=target_ctx_features,
-        position_ids=position_ids,
+        position_ids=tree_position_ids,
         target_embeddings=target_embeddings,
         target_lm_head=target_lm_head,
         temperature=temperature,
+        ar_cache=ar_cache,
     )
     return tree_token_ids, draft_logits, draft_token_probs, tree_info, pruning_scores
 
@@ -498,6 +517,7 @@ def speculative_generate_from_ids(
     target_cache = prefill_outputs.past_key_values
     target_ctx_features = raw_drafter.extract_ctx_features(prefill_outputs.hidden_states)
     drafter_cache = DynamicCache()
+    ar_cache = DynamicCache() if getattr(raw_drafter, "ar_block", None) is not None else None
     current_root_token = int(sample_from_logits(prefill_outputs.logits[:, -1, :], temperature)[0].item())
     output_ids = torch.cat(
         [prompt_ids[0], torch.tensor([current_root_token], dtype=torch.long, device=device)],
@@ -529,6 +549,7 @@ def speculative_generate_from_ids(
             target_lm_head=target_lm_head,
             tree_processor=tree_processor,
             drafter_cache=drafter_cache,
+            ar_cache=ar_cache,
             current_root_token=current_root_token,
             root_position=root_position,
             temperature=temperature,

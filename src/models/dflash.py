@@ -309,19 +309,32 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         tree_info: TreeInfo,
         position_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        prefix_position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         ar_inputs = torch.cat([backbone_hidden_states, parent_embeddings], dim=-1)
         ar_hidden_states = self.ar_input_proj(ar_inputs)
-        position_embeddings = self.rotary_emb(ar_hidden_states, position_ids)
+        rotary_position_ids = position_ids
+        if prefix_position_ids is not None:
+            rotary_position_ids = torch.cat([prefix_position_ids, position_ids], dim=1)
+        position_embeddings = self.rotary_emb(ar_hidden_states, rotary_position_ids)
+        cached_prefix_len = 0
+        if past_key_values is not None:
+            cached_prefix_len = int(past_key_values.get_seq_length())
         score_mod = build_ar_score_mod(
             tree_info=tree_info,
-            prefix_len=0 if encoded_target_ctx is None else int(encoded_target_ctx.shape[1]),
+            prefix_len=cached_prefix_len + (0 if encoded_target_ctx is None else int(encoded_target_ctx.shape[1])),
         )
         ar_hidden_states = self.ar_block(
             hidden_states=ar_hidden_states,
             target_hidden=encoded_target_ctx,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            past_key_value=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
             position_embeddings=position_embeddings,
             tree_info=tree_info,
             score_mod=score_mod,
@@ -337,6 +350,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         tree_info: TreeInfo,
         position_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        prefix_position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         if self.ar_input_proj is None or self.ar_block is None or self.ar_output_norm is None:
             raise ValueError("AR head is not enabled on this drafter config.")
@@ -350,6 +367,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 "position_ids must match the first two dimensions of backbone_hidden_states, "
                 f"got {tuple(position_ids.shape)} and {tuple(backbone_hidden_states.shape[:2])}."
             )
+        if prefix_position_ids is not None and prefix_position_ids.ndim != 2:
+            raise ValueError(
+                f"prefix_position_ids must be rank-2 when provided, got shape {tuple(prefix_position_ids.shape)}."
+            )
         encoded_target_ctx = self.encode_target_ctx(target_ctx_features)
         return self._build_ar_hidden_states_from_encoded(
             backbone_hidden_states,
@@ -358,6 +379,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             tree_info=tree_info,
             position_ids=position_ids,
             attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            prefix_position_ids=prefix_position_ids,
         )
 
     def forward(

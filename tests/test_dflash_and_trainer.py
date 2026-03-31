@@ -340,8 +340,21 @@ def _build_fake_trainer_components(
             tree_info,
             position_ids,
             attention_mask=None,
+            past_key_values=None,
+            use_cache=False,
+            cache_position=None,
+            prefix_position_ids=None,
         ):
-            _ = target_ctx_features, tree_info, position_ids, attention_mask
+            _ = (
+                target_ctx_features,
+                tree_info,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                use_cache,
+                cache_position,
+                prefix_position_ids,
+            )
             if self.ar_input_proj is None or self.ar_block is None:
                 raise ValueError("AR head is not enabled")
             return self.ar_block(self.ar_input_proj(torch.cat([backbone_hidden_states, parent_embeddings], dim=-1)))
@@ -1632,6 +1645,86 @@ def test_build_pruning_scores_prefers_ar_head_and_uses_shared_lm_head() -> None:
     assert pruning_scores is not None
     assert pruning_scores.shape == (tree_info.block_size,)
     assert pruning_scores[0].item() == pytest.approx(1.0)
+
+
+def test_build_pruning_scores_uses_and_crops_ar_cache() -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
+    _, _, fake_target_model_cls, fake_drafter_cls, _ = _build_fake_trainer_components(
+        tree_processor.block_size,
+        with_ar_head=True,
+    )
+    raw_drafter = fake_drafter_cls()
+    target_model = fake_target_model_cls()
+    backbone_hidden = torch.randn(1, tree_info.block_size, 16)
+    target_ctx_features = torch.randn(1, 6, 32)
+    tree_token_ids = torch.arange(tree_info.block_size, dtype=torch.long) % 32
+    tree_position_ids = torch.arange(tree_info.block_size, dtype=torch.long).unsqueeze(0)
+    captured: dict[str, object] = {}
+
+    class DummyCache:
+        def __init__(self, seq_len: int):
+            self.seq_len = seq_len
+            self.crop_calls: list[int] = []
+
+        def get_seq_length(self) -> int:
+            return self.seq_len
+
+        def crop(self, new_len: int) -> None:
+            self.crop_calls.append(int(new_len))
+            self.seq_len = int(new_len)
+
+    def fake_build_ar_hidden_states(
+        backbone_hidden_states,
+        parent_embeddings,
+        *,
+        target_ctx_features,
+        tree_info,
+        position_ids,
+        attention_mask=None,
+        past_key_values=None,
+        use_cache=False,
+        cache_position=None,
+        prefix_position_ids=None,
+    ):
+        _ = parent_embeddings, tree_info, attention_mask, cache_position
+        captured["backbone_shape"] = tuple(backbone_hidden_states.shape)
+        captured["target_ctx_shape"] = tuple(target_ctx_features.shape)
+        captured["position_ids"] = position_ids.clone()
+        captured["past_key_values"] = past_key_values
+        captured["use_cache"] = use_cache
+        captured["prefix_position_ids"] = None if prefix_position_ids is None else prefix_position_ids.clone()
+        return backbone_hidden_states
+
+    raw_drafter.build_ar_hidden_states = fake_build_ar_hidden_states
+    ar_cache = DummyCache(seq_len=5)
+
+    pruning_scores = build_pruning_scores(
+        raw_drafter=raw_drafter,
+        backbone_hidden=backbone_hidden,
+        tree_token_ids=tree_token_ids,
+        tree_info=tree_info,
+        target_ctx_features=target_ctx_features,
+        position_ids=tree_position_ids,
+        target_embeddings=target_model.get_input_embeddings(),
+        target_lm_head=target_model.get_output_embeddings(),
+        temperature=0.0,
+        ar_cache=ar_cache,
+    )
+
+    assert pruning_scores is not None
+    assert pruning_scores.shape == (tree_info.block_size,)
+    assert pruning_scores[0].item() == pytest.approx(1.0)
+    assert captured["backbone_shape"] == tuple(backbone_hidden.shape)
+    assert captured["target_ctx_shape"] == tuple(target_ctx_features.shape)
+    assert torch.equal(captured["position_ids"], tree_position_ids)
+    assert captured["past_key_values"] is ar_cache
+    assert captured["use_cache"] is True
+    assert torch.equal(
+        captured["prefix_position_ids"],
+        torch.arange(5, 11, dtype=torch.long).unsqueeze(0),
+    )
+    assert ar_cache.crop_calls == [11]
 
 
 def test_build_prefill_attention_mask_uses_flex_block_mask() -> None:
