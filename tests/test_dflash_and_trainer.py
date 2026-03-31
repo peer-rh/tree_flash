@@ -1290,7 +1290,7 @@ def test_q_loss_respects_non_root_valid_mask(monkeypatch, tmp_path: Path) -> Non
     assert float(chunk_result["q_loss_sum"].item()) == 0.0
 
 
-def test_build_q_targets_uses_token_match_to_main_path(monkeypatch, tmp_path: Path) -> None:
+def test_q_loss_targets_use_drafter_prediction_correctness(monkeypatch, tmp_path: Path) -> None:
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size, with_q_head=True)
     trainer = _make_trainer(
@@ -1300,32 +1300,27 @@ def test_build_q_targets_uses_token_match_to_main_path(monkeypatch, tmp_path: Pa
         batch=packed_batch,
         with_q_head=True,
     )
-    tree_info = trainer._get_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
-    tree_labels = torch.full((1, 1, tree_info.block_size), -100, dtype=torch.long)
-    primary_indices = tree_info.primary_path_indices.tolist()
-    _, _, node_target_indices = trainer._get_acceptance_path_tensors(device=torch.device("cpu"))
-    primary_labels = [11 + idx for idx in range(len(primary_indices))]
-    for target_idx, node_idx in enumerate(primary_indices):
-        tree_labels[0, 0, node_idx] = primary_labels[target_idx]
+    captured_targets: list[torch.Tensor] = []
+    original_bce = F.binary_cross_entropy_with_logits
 
-    non_primary_same_depth = next(
-        node_idx
-        for node_idx in range(tree_info.block_size)
-        if node_idx not in primary_indices and int(node_target_indices[node_idx].item()) == 1
+    def spy_bce(input, target, reduction="mean", **kwargs):
+        captured_targets.append(target.detach().cpu())
+        return original_bce(input, target, reduction=reduction, **kwargs)
+
+    monkeypatch.setattr(F, "binary_cross_entropy_with_logits", spy_bce)
+    target_ctx_features = trainer._prefill_target_context(packed_batch)
+    chunk_result = trainer._forward_anchor_chunk(
+        packed_batch,
+        target_ctx_features,
+        slice(0, packed_batch.num_anchors),
+        compute_predictions=True,
     )
-    non_primary_diff_depth = next(
-        node_idx
-        for node_idx in range(tree_info.block_size)
-        if node_idx not in primary_indices and int(node_target_indices[node_idx].item()) == -1
-    )
-    tree_labels[0, 0, non_primary_same_depth] = primary_labels[1]
-    tree_labels[0, 0, non_primary_diff_depth] = primary_labels[-1] + 1
 
-    q_targets = trainer._build_q_targets(tree_labels=tree_labels, tree_info=tree_info)
-
-    assert q_targets[0, 0, primary_indices[1]].item() == 1.0
-    assert q_targets[0, 0, non_primary_same_depth].item() == 1.0
-    assert q_targets[0, 0, non_primary_diff_depth].item() == 0.0
+    predictions = chunk_result["predictions"]
+    assert predictions is not None
+    expected_q_targets = predictions.eq(packed_batch.tree_labels).reshape(1, -1).to(torch.float32)
+    assert len(captured_targets) == 1
+    assert torch.equal(captured_targets[0], expected_q_targets.cpu())
 
 
 def test_ar_loss_respects_non_root_valid_mask(monkeypatch, tmp_path: Path) -> None:
@@ -2206,7 +2201,7 @@ def test_fit_only_computes_acceptance_for_logged_optimizer_steps(monkeypatch, tm
 
     trainer.fit()
 
-    assert compute_predictions_calls == [False, False, True, True]
+    assert compute_predictions_calls == [True, True, True, True]
 
 
 def test_fit_logs_acceptance_proxy_over_full_accumulated_batch(monkeypatch, tmp_path: Path) -> None:

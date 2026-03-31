@@ -734,10 +734,11 @@ class Trainer:
         )
         q_loss_sum = draft_hidden_states.new_zeros(())
         if self.has_q_head:
-            q_targets = self._build_q_targets(
-                tree_labels=tree_labels,
-                tree_info=tree_info,
-            ).reshape(batch_size, num_blocks * block_size)
+            if predictions is None:
+                raise RuntimeError("Q-head training requires drafter predictions to be computed.")
+            q_targets = predictions.eq(
+                tree_labels.reshape(batch_size, num_blocks * block_size)
+            ).to(torch.float32)
             q_loss = F.binary_cross_entropy_with_logits(
                 q_logits.float(),
                 q_targets,
@@ -782,27 +783,6 @@ class Trainer:
         parent_idx = tree_info.parent_idx.to(tree_token_ids.device)
         parent_token_ids[..., 1:] = tree_token_ids.index_select(-1, parent_idx[1:])
         return parent_token_ids
-
-    def _build_q_targets(
-        self,
-        *,
-        tree_labels: torch.Tensor,
-        tree_info,
-    ) -> torch.Tensor:
-        primary_indices = tree_info.primary_path_indices.to(tree_labels.device)
-        target_main_path = tree_labels.index_select(-1, primary_indices)
-        _, _, node_target_indices = self._get_acceptance_path_tensors(device=tree_labels.device)
-        comparable_mask = node_target_indices >= 0
-        main_path_targets = target_main_path.gather(
-            -1,
-            node_target_indices.clamp(min=0).view(1, 1, -1).expand(
-                tree_labels.shape[0],
-                tree_labels.shape[1],
-                -1,
-            ),
-        )
-        q_targets = tree_labels.eq(main_path_targets) & comparable_mask.view(1, 1, -1)
-        return q_targets.to(torch.float32)
 
     def _chunked_loss_and_predictions(
         self,
@@ -959,8 +939,6 @@ class Trainer:
     def _train_batch(
         self,
         batch: PackedBatch,
-        *,
-        compute_acceptance: bool = True,
     ) -> dict[str, Any]:
         batch = batch.to(self.fabric.device)
         if not batch.context_valid_mask.any() or batch.num_anchors == 0:
@@ -1016,7 +994,7 @@ class Trainer:
                 batch,
                 target_ctx_features,
                 slice(start, end),
-                compute_predictions=compute_acceptance,
+                compute_predictions=True,
                 profile=profile,
             )
             if chunk_result["valid_count"] == 0:
@@ -1225,14 +1203,12 @@ class Trainer:
             for batch in self.train_loader:
                 micro_step += 1
                 is_final_micro = micro_step % self.config.grad_accum_steps == 0
-                upcoming_optimizer_step = optimizer_step + 1
-                compute_acceptance = self._should_log_training_metrics_for_step(upcoming_optimizer_step)
                 sync_context = self.fabric.no_backward_sync(
                     self.drafter_model,
                     enabled=not is_final_micro,
                 )
                 with sync_context:
-                    batch_result = self._train_batch(batch, compute_acceptance=compute_acceptance)
+                    batch_result = self._train_batch(batch)
                     loss = batch_result["loss"]
                 accumulated_loss += float(loss.detach().item())
                 accumulated_q_loss += float(batch_result["q_loss"].detach().item())
