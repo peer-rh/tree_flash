@@ -86,6 +86,7 @@ class EvalSuiteResult:
 
 OFFICIAL_DFLASH_MODELS = {
     "qwen3-8b": "z-lab/Qwen3-8B-DFlash-b16",
+    "qwen3-4b": "z-lab/Qwen3-4B-DFlash-b16",
     "qwen3-coder-30b-a3b": "z-lab/Qwen3-Coder-30B-A3B-DFlash-b16",
     "z-lab/qwen3-8b-dflash-b16": "z-lab/Qwen3-8B-DFlash-b16",
     "z-lab/qwen3-coder-30b-a3b-dflash-b16": "z-lab/Qwen3-Coder-30B-A3B-DFlash-b16",
@@ -93,6 +94,7 @@ OFFICIAL_DFLASH_MODELS = {
 
 OFFICIAL_DFLASH_TARGETS = {
     "z-lab/Qwen3-8B-DFlash-b16": "Qwen/Qwen3-8B",
+    "z-lab/Qwen3-4B-DFlash-b16": "Qwen/Qwen3-4B",
     "z-lab/Qwen3-Coder-30B-A3B-DFlash-b16": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
 }
 
@@ -753,6 +755,19 @@ def get_eval_prompt(sample: dict[str, Any]) -> str:
         raise ValueError("Expected eval dataset samples to contain a non-empty 'turns' field.")
     return "\n\n".join(str(turn) for turn in turns)
 
+
+def build_dflash_sequence_tree_processor(
+    *,
+    block_size: int,
+):
+    """Represent a DFlash block as a single linear chain in the tree decoder."""
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}.")
+    return build_tree_processor(
+        tree_type="block",
+        tree_seq_depth=block_size,
+        sub_tree_paths=[],
+    )
 
 def evaluate_prompt_suite(
     *,

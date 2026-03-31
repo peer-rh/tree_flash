@@ -28,7 +28,7 @@ cd ~/tree_flash
 checkpoint_path="$OUTPUT_DIR/checkpoints"
 mkdir -p $checkpoint_path
 
-TARGET_MODEL="Qwen/Qwen3-4B"
+TARGET_MODEL="Qwen/Qwen3-0.6B"
 MODEL_JSON=$(cat <<MODELEOF
 {
   "architectures": [
@@ -45,23 +45,20 @@ MODEL_JSON=$(cat <<MODELEOF
     "mask_token_id": 151669,
     "target_layer_ids": [
       1,
+      4, 
       9,
       17,
-      25,
-      33
+      25
     ]
   },
   "dtype": "bfloat16",
   "eos_token_id": 151645,
   "head_dim": 128,
   "hidden_act": "silu",
-  "hidden_size": 2560,
+  "hidden_size": 1024,
   "initializer_range": 0.02,
-  "intermediate_size": 9728,
+  "intermediate_size": 3072,
   "layer_types": [
-    "full_attention",
-    "full_attention",
-    "full_attention",
     "full_attention",
     "full_attention"
   ],
@@ -69,7 +66,7 @@ MODEL_JSON=$(cat <<MODELEOF
   "max_window_layers": 5,
   "model_type": "qwen3",
   "num_attention_heads": 32,
-  "num_hidden_layers": 5,
+  "num_hidden_layers": 2,
   "num_key_value_heads": 8,
   "num_target_layers": 36,
   "rms_norm_eps": 1e-06,
@@ -90,7 +87,7 @@ MODELEOF
 )
 TREE_JSON=$(cat <<TREEEOF
 {
-    "tree_seq_depth": 16,
+    "tree_seq_depth": 4,
     "prune_topk": 16, 
     "base_tree_type": "block",
 }
@@ -101,11 +98,10 @@ uv run -m src.trainer \
     --tree_type prunable --tree_args "$TREE_JSON" \
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
-    --data.path ../dflash_2/datasets/q3_4b_100k_stage2.h5 --data.batch_size 4 --data.num_anchors 512 --data.tree_seq_depth 16   \
+    --data.path ../dflash_2/datasets/q3_4b_100k_stage2.h5 --data.batch_size 1 --data.num_anchors 512 --data.tree_seq_depth 16   \
     --trainer.save_every 2048 --trainer.precision bf16-true --trainer.grad_accum_steps 8 --trainer.num_epochs 6 \
     --trainer.eval_every 2048 --trainer.wandb_run_name $EXPERIMENT_NAME --trainer.checkpoint_path $OUTPUT_DIR/checkpoints \
-    --trainer.anchor_chunk_size null --trainer.ce_chunk_size 32768 \
-    --trainer.ddp true --trainer.devices 4 \
-    --trainer.dev_run false --trainer.verbose false --trainer.compile true 
+    --trainer.anchor_chunk_size 256 --trainer.ce_chunk_size 4096 \
+    --trainer.dev_run false --trainer.verbose true --trainer.compile true --trainer.profile_steps 10
 
 # EOF
