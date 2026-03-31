@@ -26,6 +26,8 @@ from src.eagle3_eval import (
 )
 from src.models.dflash import DFlashDraftModel
 from src.spec_decode import (
+    SpecEvalAggregateResult,
+    aggregate_speculative_eval,
     build_parser as build_spec_decode_parser,
     build_pruning_scores,
     build_verifier_score_mod,
@@ -218,6 +220,9 @@ def _build_fake_trainer_components(
 
         def __init__(self, *args, **kwargs):
             self.device = torch.device("cpu")
+            self.global_rank = 0
+            self.local_rank = 0
+            self.world_size = 1
             self.is_global_zero = True
             self.backward_calls: list[float] = []
             type(self).instances.append(self)
@@ -236,6 +241,17 @@ def _build_fake_trainer_components(
 
         def setup_dataloaders(self, *loaders, **kwargs):
             return loaders
+
+        def barrier(self, name=None):
+            return None
+
+        def rank_zero_first(self, local=False):
+            _ = local
+            return nullcontext()
+
+        def all_reduce(self, tensor, reduce_op="sum"):
+            _ = reduce_op
+            return tensor
 
         def no_backward_sync(self, module, enabled):
             return nullcontext()
@@ -437,6 +453,7 @@ def _make_trainer(
             q_loss_lambda=q_loss_lambda,
             ar_loss_lambda=ar_loss_lambda,
             compile=compile,
+            spec_eval_datasets=(),
         ),
         target="fake-target",
         data=DataModuleConfig(
@@ -659,6 +676,7 @@ def test_trainer_smoke_with_fakes(monkeypatch, tmp_path: Path) -> None:
             no_wandb=True,
             dev_run=True,
             precision="32-true",
+            spec_eval_datasets=(),
         ),
         target="fake-target",
         data=DataModuleConfig(
@@ -726,6 +744,7 @@ def test_trainer_real_loader_emits_fixed_packed_row_batches(monkeypatch, tmp_pat
             no_wandb=True,
             precision="32-true",
             dev_run=True,
+            spec_eval_datasets=(),
         ),
         target="fake-target",
         data=DataModuleConfig(
@@ -1271,6 +1290,44 @@ def test_q_loss_respects_non_root_valid_mask(monkeypatch, tmp_path: Path) -> Non
     assert float(chunk_result["q_loss_sum"].item()) == 0.0
 
 
+def test_build_q_targets_uses_token_match_to_main_path(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size, with_q_head=True)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+        with_q_head=True,
+    )
+    tree_info = trainer._get_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
+    tree_labels = torch.full((1, 1, tree_info.block_size), -100, dtype=torch.long)
+    primary_indices = tree_info.primary_path_indices.tolist()
+    _, _, node_target_indices = trainer._get_acceptance_path_tensors(device=torch.device("cpu"))
+    primary_labels = [11 + idx for idx in range(len(primary_indices))]
+    for target_idx, node_idx in enumerate(primary_indices):
+        tree_labels[0, 0, node_idx] = primary_labels[target_idx]
+
+    non_primary_same_depth = next(
+        node_idx
+        for node_idx in range(tree_info.block_size)
+        if node_idx not in primary_indices and int(node_target_indices[node_idx].item()) == 1
+    )
+    non_primary_diff_depth = next(
+        node_idx
+        for node_idx in range(tree_info.block_size)
+        if node_idx not in primary_indices and int(node_target_indices[node_idx].item()) == -1
+    )
+    tree_labels[0, 0, non_primary_same_depth] = primary_labels[1]
+    tree_labels[0, 0, non_primary_diff_depth] = primary_labels[-1] + 1
+
+    q_targets = trainer._build_q_targets(tree_labels=tree_labels, tree_info=tree_info)
+
+    assert q_targets[0, 0, primary_indices[1]].item() == 1.0
+    assert q_targets[0, 0, non_primary_same_depth].item() == 1.0
+    assert q_targets[0, 0, non_primary_diff_depth].item() == 0.0
+
+
 def test_ar_loss_respects_non_root_valid_mask(monkeypatch, tmp_path: Path) -> None:
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size, with_ar_head=True)
@@ -1411,6 +1468,7 @@ def test_trainer_accepts_branch_off_tree_type(monkeypatch, tmp_path: Path) -> No
             checkpoint_path=str(tmp_path / "ckpts"),
             no_wandb=True,
             precision="32-true",
+            spec_eval_datasets=(),
         ),
         target="fake-target",
         data=DataModuleConfig(
@@ -1436,12 +1494,12 @@ def test_trainer_accepts_prunable_tree_type(monkeypatch, tmp_path: Path) -> None
         batch=packed_batch,
         with_q_head=True,
         tree_type="prunable",
-        tree_args={"base_tree_type": "branch_off", "branching_pattern": [[0, 2], [0, 3]], "prune_topk": 2},
+        tree_args={"base_tree_type": "branch_off", "branching_pattern": [[0, 2], [0, 3]], "candidate_tree_size": 2},
     )
 
     assert isinstance(trainer.tree_processor, PrunableTreeProcessor)
     assert trainer.tree_processor.base_tree_type == "branch_off"
-    assert trainer.tree_processor.prune_topk == 2
+    assert trainer.tree_processor.candidate_tree_size == 2
 
 
 def test_trainer_accepts_prunable_tree_type_with_ar_head(monkeypatch, tmp_path: Path) -> None:
@@ -1454,11 +1512,11 @@ def test_trainer_accepts_prunable_tree_type_with_ar_head(monkeypatch, tmp_path: 
         batch=packed_batch,
         with_ar_head=True,
         tree_type="prunable",
-        tree_args={"base_tree_type": "block", "prune_topk": 2},
+        tree_args={"base_tree_type": "block", "candidate_tree_size": 2},
     )
 
     assert isinstance(trainer.tree_processor, PrunableTreeProcessor)
-    assert trainer.tree_processor.prune_topk == 2
+    assert trainer.tree_processor.candidate_tree_size == 2
 
 
 def test_trainer_prunable_requires_q_head(monkeypatch, tmp_path: Path) -> None:
@@ -1472,7 +1530,7 @@ def test_trainer_prunable_requires_q_head(monkeypatch, tmp_path: Path) -> None:
             anchor_chunk_size=None,
             batch=packed_batch,
             tree_type="prunable",
-            tree_args={"base_tree_type": "block", "prune_topk": 1},
+            tree_args={"base_tree_type": "block", "candidate_tree_size": 1},
         )
 
 
@@ -1490,7 +1548,7 @@ def test_prunable_tree_args_validation(monkeypatch, tmp_path: Path) -> None:
             tree_type="prunable",
             tree_args={"base_tree_type": "bad", "prune_topk": 1},
         )
-    with pytest.raises(ValueError, match="prune_topk"):
+    with pytest.raises(ValueError, match="candidate_tree_size"):
         _make_trainer(
             monkeypatch,
             tmp_path / "bad-topk",
@@ -1498,7 +1556,7 @@ def test_prunable_tree_args_validation(monkeypatch, tmp_path: Path) -> None:
             batch=packed_batch,
             with_q_head=True,
             tree_type="prunable",
-            tree_args={"base_tree_type": "block", "prune_topk": -1},
+            tree_args={"base_tree_type": "block", "candidate_tree_size": 0},
         )
 
 
@@ -1513,11 +1571,15 @@ def test_spec_decode_path_helpers_use_tree_structure() -> None:
 
 
 def test_prune_selection_keeps_ancestor_closure() -> None:
-    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2, sub_tree_paths=["0-1", "0-2", "1-3"])
     tree_info = tree_processor.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
-    q_scores = torch.tensor([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.9], dtype=torch.float32)
+    node_correctness_probs = torch.tensor([1.0, 0.2, 0.4, 0.3, 0.9, 0.8, 0.1, 0.7], dtype=torch.float32)
 
-    keep_indices = select_pruned_keep_indices(tree_info=tree_info, q_scores=q_scores, prune_topk=1)
+    keep_indices = select_pruned_keep_indices(
+        tree_info=tree_info,
+        node_correctness_probs=node_correctness_probs,
+        candidate_tree_size=4,
+    )
 
     assert keep_indices == [0, 4, 5, 7]
 
@@ -1526,22 +1588,22 @@ def test_prune_drafted_tree_supports_root_only_and_branch_off_base() -> None:
     base_tree = build_tree_processor(
         tree_type="prunable",
         tree_seq_depth=3,
-        tree_args={"base_tree_type": "branch_off", "branching_pattern": [[0, 2], [0, 3], [0]], "prune_topk": 0},
+        tree_args={"base_tree_type": "branch_off", "branching_pattern": [[0, 2], [0, 3], [0]], "candidate_tree_size": 1},
     )
     assert isinstance(base_tree, PrunableTreeProcessor)
     tree_info = base_tree.build_tree_info(batch_size=1, num_blocks=1, device=torch.device("cpu"))
     tree_token_ids = torch.arange(tree_info.block_size, dtype=torch.long)
     draft_logits = torch.randn(tree_info.block_size, 5)
     draft_token_probs = torch.linspace(1.0, 0.1, steps=tree_info.block_size, dtype=torch.float32)
-    q_scores = torch.linspace(0.0, 1.0, steps=tree_info.block_size, dtype=torch.float32)
+    node_correctness_probs = torch.linspace(0.1, 0.9, steps=tree_info.block_size, dtype=torch.float32)
 
     pruned_tokens, pruned_logits, pruned_probs, pruned_info = prune_drafted_tree(
         tree_token_ids=tree_token_ids,
         draft_logits=draft_logits,
         draft_token_probs=draft_token_probs,
         tree_info=tree_info,
-        q_scores=q_scores,
-        prune_topk=0,
+        node_correctness_probs=node_correctness_probs,
+        candidate_tree_size=1,
     )
 
     assert pruned_info.block_size == 1
@@ -1768,6 +1830,166 @@ def test_evaluate_prompt_suite_and_render_html(monkeypatch) -> None:
     assert "accepted=0" in html
     assert "Prompt one" in html
     assert "Prompt two" in html
+
+
+def test_aggregate_speculative_eval_accumulates_histogram_and_off_main_counts() -> None:
+    dataset = [
+        {"turns": ["Prompt one"]},
+        {"turns": ["Prompt two"]},
+        {"turns": ["Prompt three"]},
+    ]
+    results = [
+        type(
+            "FakeResult",
+            (),
+            {
+                "committed_tokens": 7,
+                "acceptance_lengths": [0, 2, 1],
+                "off_main_path_last_accept_flags": [False, True, True],
+            },
+        )(),
+        type(
+            "FakeResult",
+            (),
+            {
+                "committed_tokens": 5,
+                "acceptance_lengths": [3, 1],
+                "off_main_path_last_accept_flags": [True, False],
+            },
+        )(),
+    ]
+    prompts_seen: list[str] = []
+
+    def generate_fn(*, prompt: str, max_new_tokens: int):
+        _ = max_new_tokens
+        prompts_seen.append(prompt)
+        return results.pop(0)
+
+    aggregate = aggregate_speculative_eval(
+        dataset=dataset,
+        sample_indices=[0, 2],
+        generate_fn=generate_fn,
+        max_new_tokens=8,
+        acceptance_length_max=3,
+    )
+
+    assert prompts_seen == ["Prompt one", "Prompt three"]
+    assert aggregate.total_examples == 2
+    assert aggregate.total_committed_tokens == 12
+    assert aggregate.total_steps == 5
+    assert aggregate.total_acceptance_length == 7
+    assert aggregate.acceptance_length_histogram == [1, 2, 1, 1]
+    assert aggregate.off_main_path_last_accept_count == 3
+    assert aggregate.elapsed_time_sec >= 0.0
+
+
+def test_trainer_validate_includes_speculative_eval_metrics(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+    trainer._run_speculative_eval_suite = lambda: {
+        "spec_eval/gsm8k/throughput_tok_s": 12.5,
+        "spec_eval/gsm8k/avg_acceptance_length": 1.75,
+    }
+
+    metrics = trainer.validate()
+
+    assert "eval/loss" in metrics
+    assert "eval/mean_acceptance_length" in metrics
+    assert metrics["spec_eval/gsm8k/throughput_tok_s"] == 12.5
+    assert metrics["spec_eval/gsm8k/avg_acceptance_length"] == 1.75
+
+
+def test_trainer_spec_eval_sample_indices_are_global_and_deterministic(monkeypatch, tmp_path: Path) -> None:
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+    trainer.config.spec_eval_examples = 16
+    trainer.fabric.world_size = 4
+
+    trainer.fabric.global_rank = 0
+    assert trainer._get_spec_eval_sample_indices(20) == [0, 4, 8, 12]
+
+    trainer.fabric.global_rank = 1
+    assert trainer._get_spec_eval_sample_indices(20) == [1, 5, 9, 13]
+
+    trainer.fabric.global_rank = 3
+    assert trainer._get_spec_eval_sample_indices(10) == [3, 7]
+
+
+def test_trainer_spec_eval_reduces_ddp_metrics(monkeypatch, tmp_path: Path) -> None:
+    import src.spec_decode as spec_decode_mod
+
+    tree_processor = BlockTreeProcessor(tree_seq_depth=2)
+    _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+    )
+    trainer.config.spec_eval_datasets = ("gsm8k",)
+    trainer.fabric.world_size = 2
+    trainer.fabric.global_rank = 0
+    trainer.fabric.is_global_zero = True
+    trainer.wandb_run = object()
+
+    barrier_calls: list[str | None] = []
+    trainer.fabric.barrier = lambda name=None: barrier_calls.append(name)
+
+    sample_indices_seen: list[list[int]] = []
+    trainer._load_spec_eval_dataset = lambda data_name: [{"turns": [f"{data_name}-{idx}"]} for idx in range(32)]
+
+    def fake_aggregate_speculative_eval(**kwargs):
+        sample_indices_seen.append(list(kwargs["sample_indices"]))
+        return SpecEvalAggregateResult(
+            total_examples=8,
+            total_committed_tokens=40,
+            total_steps=4,
+            total_acceptance_length=6,
+            acceptance_length_histogram=[1, 2, 1, 0],
+            off_main_path_last_accept_count=1,
+            elapsed_time_sec=0.25,
+        )
+
+    monkeypatch.setattr(spec_decode_mod, "aggregate_speculative_eval", fake_aggregate_speculative_eval)
+
+    responses = [
+        torch.tensor([16.0, 60.0, 6.0, 8.0, 2.0], dtype=torch.float64),
+        torch.tensor([1.0, 3.0, 2.0, 0.0], dtype=torch.float64),
+        torch.tensor(0.5, dtype=torch.float64),
+    ]
+
+    def fake_all_reduce(tensor, reduce_op="sum"):
+        _ = tensor, reduce_op
+        return responses.pop(0).to(trainer.fabric.device)
+
+    trainer.fabric.all_reduce = fake_all_reduce
+    trainer._build_speculative_eval_html_report = lambda **kwargs: "html-report"
+
+    metrics = trainer._run_speculative_eval_suite()
+
+    assert sample_indices_seen == [[0, 2, 4, 6, 8, 10, 12, 14]]
+    assert barrier_calls == ["spec_eval_gsm8k_start", "spec_eval_gsm8k_end"]
+    assert metrics["spec_eval/gsm8k/examples"] == 16
+    assert metrics["spec_eval/gsm8k/throughput_tok_s"] == pytest.approx(120.0)
+    assert metrics["spec_eval/gsm8k/avg_acceptance_length"] == pytest.approx(8.0 / 6.0)
+    assert metrics["spec_eval/gsm8k/off_main_path_last_accept_pct"] == pytest.approx(100.0 / 3.0)
+    assert metrics["spec_eval/gsm8k/accept_len_count_0"] == 1
+    assert metrics["spec_eval/gsm8k/accept_len_count_1"] == 3
+    assert metrics["spec_eval/gsm8k/accept_len_count_2"] == 2
+    assert metrics["spec_eval/gsm8k/accept_len_count_3"] == 0
+    assert metrics["spec_eval/gsm8k/accepted_extra_tokens_html"] == "html-report"
 
 
 def test_official_dflash_aliases_infer_target_pairing() -> None:

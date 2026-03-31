@@ -500,12 +500,12 @@ def test_prunable_tree_processor_wraps_branch_off_base_tree() -> None:
     tree_processor = PrunableTreeProcessor(
         tree_seq_depth=3,
         base_tree_type="branch_off",
-        prune_topk=2,
+        candidate_tree_size=2,
         sub_tree_paths=SUB_TREE_PATHS,
         branching_pattern=[[0, 2], [0, 3], [0]],
     )
 
-    assert tree_processor.prune_topk == 2
+    assert tree_processor.candidate_tree_size == 2
     assert tree_processor.base_tree_type == "branch_off"
     assert tree_processor.block_size == 6
     assert tree_processor.primary_path_indices.tolist() == [0, 2, 5]

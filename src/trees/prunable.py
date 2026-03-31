@@ -14,7 +14,7 @@ class PrunableTreeProcessor:
         tree_seq_depth: int,
         *,
         base_tree_type: str = "block",
-        prune_topk: int = 0,
+        candidate_tree_size: int = 1,
         branching_pattern: Sequence[Sequence[int]] | None = None,
         sub_tree_paths: Sequence[str] | None = None,
     ) -> None:
@@ -23,12 +23,12 @@ class PrunableTreeProcessor:
                 "prunable tree base_tree_type must be 'block' or 'branch_off', "
                 f"got {base_tree_type!r}."
             )
-        if prune_topk < 0:
-            raise ValueError(f"prune_topk must be >= 0, got {prune_topk}.")
+        if candidate_tree_size <= 0:
+            raise ValueError(f"candidate_tree_size must be > 0, got {candidate_tree_size}.")
 
         self.tree_seq_depth = tree_seq_depth
         self.base_tree_type = base_tree_type
-        self.prune_topk = int(prune_topk)
+        self.candidate_tree_size = int(candidate_tree_size)
         if base_tree_type == "block":
             self.base_tree_processor = BlockTreeProcessor(
                 tree_seq_depth=tree_seq_depth,
@@ -55,6 +55,7 @@ class PrunableTreeProcessor:
         self.non_root_mask = self.base_tree_processor.non_root_mask
         self.primary_path_mask = self.base_tree_processor.primary_path_mask
         self.primary_path_indices = self.base_tree_processor.primary_path_indices
+        self.prune_topk = self.candidate_tree_size
 
     def build_tree_info(
         self,
@@ -80,4 +81,3 @@ class PrunableTreeProcessor:
             anchor_positions=anchor_positions,
             mask_token_id=mask_token_id,
         )
-

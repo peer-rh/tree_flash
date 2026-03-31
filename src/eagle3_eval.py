@@ -192,6 +192,7 @@ def official_eagle3_generate_from_ids(
         continuation_ids=continuation_ids,
         text=tokenizer.decode(output_ids, skip_special_tokens=True),
         acceptance_lengths=[],
+        off_main_path_last_accept_flags=[],
         drafted_tokens=0,
         committed_tokens=int(continuation_ids.numel()),
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
@@ -29,8 +30,20 @@ class SpecDecodeResult:
     continuation_ids: torch.Tensor
     text: str
     acceptance_lengths: list[int]
+    off_main_path_last_accept_flags: list[bool]
     drafted_tokens: int
     committed_tokens: int
+
+
+@dataclass
+class SpecEvalAggregateResult:
+    total_examples: int
+    total_committed_tokens: int
+    total_steps: int
+    total_acceptance_length: int
+    acceptance_length_histogram: list[int]
+    off_main_path_last_accept_count: int
+    elapsed_time_sec: float
 
 
 @dataclass
@@ -126,10 +139,14 @@ def build_tree_processor(
             branching_pattern=tree_args.get("branching_pattern"),
         )
     if tree_type == "prunable":
+        legacy_prune_topk = tree_args.get("prune_topk")
+        candidate_tree_size = tree_args.get("candidate_tree_size")
+        if candidate_tree_size is None:
+            candidate_tree_size = 1 if legacy_prune_topk in {None, 0} else int(legacy_prune_topk)
         return PrunableTreeProcessor(
             tree_seq_depth=tree_seq_depth,
             base_tree_type=tree_args.get("base_tree_type", "block"),
-            prune_topk=int(tree_args.get("prune_topk", 0)),
+            candidate_tree_size=int(candidate_tree_size),
             sub_tree_paths=sub_tree_paths or tree_args.get("sub_tree_paths"),
             branching_pattern=tree_args.get("branching_pattern"),
         )
@@ -210,24 +227,44 @@ def gather_path_indices(
     return list(reversed(path))
 
 
+def _compute_path_correctness_probabilities(
+    *,
+    tree_info: TreeInfo,
+    node_correctness_probs: torch.Tensor,
+) -> torch.Tensor:
+    """Compute expected-depth contribution scores by cumulative ancestor products."""
+    path_probs = torch.zeros_like(node_correctness_probs, dtype=torch.float32)
+    path_probs[0] = 1.0
+    for node_idx in range(1, tree_info.block_size):
+        parent_idx = int(tree_info.parent_idx[node_idx].item())
+        path_probs[node_idx] = path_probs[parent_idx] * node_correctness_probs[node_idx].to(torch.float32)
+    return path_probs
+
+
 def select_pruned_keep_indices(
     *,
     tree_info: TreeInfo,
-    q_scores: torch.Tensor,
-    prune_topk: int,
+    node_correctness_probs: torch.Tensor,
+    candidate_tree_size: int,
 ) -> list[int]:
-    """Keep the best-scoring nodes plus their ancestors for pruning."""
-    if prune_topk < 0:
-        raise ValueError(f"prune_topk must be >= 0, got {prune_topk}.")
-    if prune_topk == 0 or tree_info.block_size <= 1:
+    """Keep the rooted subtree of fixed size that maximizes expected depth."""
+    if candidate_tree_size <= 0:
+        raise ValueError(f"candidate_tree_size must be > 0, got {candidate_tree_size}.")
+    if tree_info.block_size <= 1 or candidate_tree_size == 1:
         return [0]
-
-    num_candidates = tree_info.block_size - 1
-    topk = min(prune_topk, num_candidates)
-    ranked = torch.topk(q_scores[1:], k=topk).indices + 1
-    kept = {0}
-    for node_idx in ranked.tolist():
-        kept.update(gather_path_indices(int(node_idx), tree_info))
+    path_probs = _compute_path_correctness_probabilities(
+        tree_info=tree_info,
+        node_correctness_probs=node_correctness_probs,
+    )
+    ranked_nodes = sorted(
+        range(tree_info.block_size),
+        key=lambda idx: (
+            -float(path_probs[idx].item()),
+            int(tree_info.depth[idx].item()),
+            idx,
+        ),
+    )
+    kept = ranked_nodes[: min(int(candidate_tree_size), tree_info.block_size)]
     return sorted(kept)
 
 
@@ -237,14 +274,14 @@ def prune_drafted_tree(
     draft_logits: torch.Tensor,
     draft_token_probs: torch.Tensor,
     tree_info: TreeInfo,
-    q_scores: torch.Tensor,
-    prune_topk: int,
+    node_correctness_probs: torch.Tensor,
+    candidate_tree_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TreeInfo]:
     """Prune a drafted tree down to a smaller ancestor-closed subset."""
     keep_indices = select_pruned_keep_indices(
         tree_info=tree_info,
-        q_scores=q_scores,
-        prune_topk=prune_topk,
+        node_correctness_probs=node_correctness_probs,
+        candidate_tree_size=candidate_tree_size,
     )
     if len(keep_indices) == tree_info.block_size:
         return tree_token_ids, draft_logits, draft_token_probs, tree_info
@@ -466,6 +503,7 @@ def speculative_generate_from_ids(
     )
     input_len = output_ids.shape[0]
     acceptance_lengths: list[int] = []
+    off_main_path_last_accept_flags: list[bool] = []
     drafted_tokens = 0
     committed_tokens = 1
     eos_token_id = tokenizer.eos_token_id
@@ -504,8 +542,8 @@ def speculative_generate_from_ids(
                 draft_logits=draft_logits,
                 draft_token_probs=draft_token_probs,
                 tree_info=tree_info,
-                q_scores=pruning_scores,
-                prune_topk=tree_processor.prune_topk,
+                node_correctness_probs=pruning_scores,
+                candidate_tree_size=tree_processor.candidate_tree_size,
             )
 
         updated_cache, verifier_logits, tree_ctx_features = verify_tree(
@@ -528,6 +566,7 @@ def speculative_generate_from_ids(
         deepest_idx = choose_deepest_valid_node(accepted_mask, tree_info)
         accepted_path = gather_path_indices(deepest_idx, tree_info)
         acceptance_lengths.append(len(accepted_path) - 1)
+        off_main_path_last_accept_flags.append(not bool(tree_info.primary_path_mask[deepest_idx].item()))
 
         bonus_token = int(sample_from_logits(verifier_logits[deepest_idx].unsqueeze(0), temperature)[0].item())
         committed_path_tokens = tree_token_ids[accepted_path[1:]]
@@ -562,6 +601,7 @@ def speculative_generate_from_ids(
         continuation_ids=continuation_ids,
         text=text,
         acceptance_lengths=acceptance_lengths,
+        off_main_path_last_accept_flags=off_main_path_last_accept_flags,
         drafted_tokens=drafted_tokens,
         committed_tokens=committed_tokens,
     )
@@ -775,6 +815,84 @@ def evaluate_prompt_suite(
     )
 
 
+def aggregate_speculative_eval(
+    *,
+    generate_fn,
+    data_name: str | None = None,
+    dataset: Sequence[dict[str, Any]] | None = None,
+    sample_indices: Sequence[int] | None = None,
+    max_examples: int | None = None,
+    max_new_tokens: int = 256,
+    acceptance_length_max: int | None = None,
+) -> SpecEvalAggregateResult:
+    """Aggregate speculative-decoding metrics over a fixed eval subset."""
+    if dataset is None:
+        if data_name is None:
+            raise ValueError("data_name is required when dataset is not provided.")
+        dataset = load_and_process_eval_dataset(data_name)
+
+    if sample_indices is None:
+        limit = len(dataset) if max_examples is None else min(len(dataset), max_examples)
+        sample_indices = list(range(limit))
+    else:
+        sample_indices = list(sample_indices)
+        if max_examples is not None:
+            sample_indices = sample_indices[:max_examples]
+
+    histogram = [0] * (acceptance_length_max + 1) if acceptance_length_max is not None else []
+    total_examples = 0
+    total_committed_tokens = 0
+    total_steps = 0
+    total_acceptance_length = 0
+    off_main_path_last_accept_count = 0
+
+    start_time = time.perf_counter()
+    for sample_idx in sample_indices:
+        sample = dataset[int(sample_idx)]
+        prompt = get_eval_prompt(sample)
+        result = generate_fn(prompt=prompt, max_new_tokens=max_new_tokens)
+        off_main_flags = getattr(
+            result,
+            "off_main_path_last_accept_flags",
+            [False] * len(result.acceptance_lengths),
+        )
+        if len(off_main_flags) != len(result.acceptance_lengths):
+            raise ValueError(
+                "off_main_path_last_accept_flags must align with acceptance_lengths "
+                f"for sample index {sample_idx}."
+            )
+
+        total_examples += 1
+        total_committed_tokens += int(result.committed_tokens)
+        total_steps += len(result.acceptance_lengths)
+        total_acceptance_length += sum(int(length) for length in result.acceptance_lengths)
+        off_main_path_last_accept_count += sum(bool(flag) for flag in off_main_flags)
+
+        for length in result.acceptance_lengths:
+            accept_length = int(length)
+            if accept_length < 0:
+                raise ValueError(f"acceptance length must be non-negative, got {accept_length}.")
+            if acceptance_length_max is None:
+                if accept_length >= len(histogram):
+                    histogram.extend([0] * (accept_length + 1 - len(histogram)))
+            elif accept_length > acceptance_length_max:
+                raise ValueError(
+                    f"acceptance length {accept_length} exceeds histogram max "
+                    f"{acceptance_length_max}."
+                )
+            histogram[accept_length] += 1
+
+    return SpecEvalAggregateResult(
+        total_examples=total_examples,
+        total_committed_tokens=total_committed_tokens,
+        total_steps=total_steps,
+        total_acceptance_length=total_acceptance_length,
+        acceptance_length_histogram=histogram,
+        off_main_path_last_accept_count=off_main_path_last_accept_count,
+        elapsed_time_sec=time.perf_counter() - start_time,
+    )
+
+
 def render_eval_suite_html(report: EvalSuiteResult) -> str:
     """Render a minimal HTML report with colored token spans."""
     def render_token_spans(tokens: Sequence[ComparedToken]) -> str:
@@ -904,6 +1022,7 @@ def official_dflash_generate_from_ids(
         continuation_ids=continuation_ids,
         text=text,
         acceptance_lengths=[],
+        off_main_path_last_accept_flags=[],
         drafted_tokens=0,
         committed_tokens=int(continuation_ids.numel()),
     )

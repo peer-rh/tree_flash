@@ -2,10 +2,10 @@
 #SBATCH --mail-type=NONE # mail configuration: NONE, BEGIN, END, FAIL, REQUEUE, ALL
 #SBATCH --output=outputs/logs/%j.out # where to store the output (%j is the JOBID), subdirectory "log" must exist
 #SBATCH --error=outputs/logs/%j.err # where to store error messages
-#SBATCH --mem=48G
+#SBATCH --mem=96G
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4
 #SBATCH --time=0-24:00:00
 #CommentSBATCH --gpus-per-task=1
 #CommentSBATCH --nodelist=tikgpu08 # Specify that it should run on this particular node
@@ -21,10 +21,6 @@ echo "In directory: $(pwd)"
 echo "Starting on: $(date)"
 echo "SLURM_JOB_ID: ${SLURM_JOB_ID}"
 
-#ETH_USERNAME=prheinboldt
-# PROJECT_NAME=dflash_2
-#DIRECTORY="/itet-stor/${ETH_USERNAME}/net_scratch/${PROJECT_NAME}"
-
 # uenv run pytorch/v2.9.1:v2 --view=default bash <<'EOF'
 cd ~/tree_flash
 # source venv-2.9/bin/activate
@@ -32,7 +28,7 @@ cd ~/tree_flash
 checkpoint_path="$OUTPUT_DIR/checkpoints"
 mkdir -p $checkpoint_path
 
-TARGET_MODEL="Qwen/Qwen3-0.6B"
+TARGET_MODEL="Qwen/Qwen3-4B"
 MODEL_JSON=$(cat <<MODELEOF
 {
   "architectures": [
@@ -49,20 +45,22 @@ MODEL_JSON=$(cat <<MODELEOF
     "mask_token_id": 151669,
     "target_layer_ids": [
       1,
-      5, 
       9,
       17,
-      25
+      25,
+      33
     ]
   },
   "dtype": "bfloat16",
   "eos_token_id": 151645,
   "head_dim": 128,
   "hidden_act": "silu",
-  "hidden_size": 1024,
+  "hidden_size": 2560,
   "initializer_range": 0.02,
-  "intermediate_size": 3072,
+  "intermediate_size": 9728,
   "layer_types": [
+    "full_attention",
+    "full_attention",
     "full_attention",
     "full_attention",
     "full_attention"
@@ -70,8 +68,8 @@ MODEL_JSON=$(cat <<MODELEOF
   "max_position_embeddings": 40960,
   "max_window_layers": 5,
   "model_type": "qwen3",
-  "num_attention_heads": 16,
-  "num_hidden_layers": 3,
+  "num_attention_heads": 32,
+  "num_hidden_layers": 5,
   "num_key_value_heads": 8,
   "num_target_layers": 36,
   "rms_norm_eps": 1e-06,
@@ -82,11 +80,11 @@ MODEL_JSON=$(cat <<MODELEOF
   "transformers_version": "4.57.3",
   "use_cache": true,
   "use_sliding_window": false,
-  "vocab_size": 151936,
+  "vocab_size": 151936
   "use_tree_pos_emb": true,
   "use_additive_tree_pos_bias": true,
   "max_tree_size": 128,
-  "use_q_head": false
+  "use_q_head": true
 }
 MODELEOF
 )
@@ -96,15 +94,16 @@ TREE_JSON=$(cat <<TREEEOF
 }
 TREEEOF
 )
+ # TODO: Make prunable and block tree
 
 uv run -m src.trainer \
-    --tree_type block --tree_args "$TREE_JSON" \
+    --tree_type prunabl --tree_args "$TREE_JSON" \
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
-    --data.path ../dflash_2/datasets/q3_4b_100k_stage2.h5 --data.batch_size 1 --data.num_anchors 512 --data.tree_seq_depth 16   \
+    --data.path ../dflash_2/datasets/q3_4b_100k_stage2.h5 --data.batch_size 4 --data.num_anchors 512 --data.tree_seq_depth 16   \
     --trainer.save_every 2048 --trainer.precision bf16-true --trainer.grad_accum_steps 8 --trainer.num_epochs 6 \
     --trainer.eval_every 2048 --trainer.wandb_run_name $EXPERIMENT_NAME --trainer.checkpoint_path $OUTPUT_DIR/checkpoints \
-    --trainer.anchor_chunk_size 256 --trainer.ce_chunk_size 8192 \
-    --trainer.dev_run false --trainer.verbose true --trainer.compile true --trainer.profile_steps 10 \
+    --trainer.anchor_chunk_size null --trainer.ce_chunk_size 32768 \
+    --trainer.dev_run false --trainer.verbose false --trainer.compile true 
 
 # EOF

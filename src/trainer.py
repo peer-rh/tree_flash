@@ -55,6 +55,9 @@ class TrainerConfig:
     wandb_run_name: str | None = None
     no_wandb: bool = False
     resume_from: str | None = None
+    spec_eval_examples: int = 16
+    spec_eval_datasets: tuple[str, ...] = ("humaneval", "gsm8k", "alpaca")
+    spec_eval_max_new_tokens: int = 1024
 
 
 def unwrap_model(module):
@@ -259,6 +262,7 @@ class Trainer:
         self.wandb_run = None
         self.wandb_run_id: str | None = None
         self._tree_info_cache: dict[tuple[int, int, str, int], Any] = {}
+        self._spec_eval_dataset_cache: dict[str, Any] = {}
         self._acceptance_path_cache: dict[
             tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], str, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -390,10 +394,14 @@ class Trainer:
                 branching_pattern=tree_args.get("branching_pattern"),
             )
         if tree_type == "prunable":
+            legacy_prune_topk = tree_args.get("prune_topk")
+            candidate_tree_size = tree_args.get("candidate_tree_size")
+            if candidate_tree_size is None:
+                candidate_tree_size = 1 if legacy_prune_topk in {None, 0} else int(legacy_prune_topk)
             return PrunableTreeProcessor(
                 tree_seq_depth=tree_seq_depth,
                 base_tree_type=tree_args.get("base_tree_type", "block"),
-                prune_topk=int(tree_args.get("prune_topk", 0)),
+                candidate_tree_size=int(candidate_tree_size),
                 sub_tree_paths=tree_args.get("sub_tree_paths"),
                 branching_pattern=tree_args.get("branching_pattern"),
             )
@@ -420,9 +428,185 @@ class Trainer:
         )
         self.wandb_run_id = self.wandb_run.id
 
-    def _log(self, metrics: dict[str, float], step: int) -> None:
+    def _log(self, metrics: dict[str, Any], step: int) -> None:
         if self.fabric.is_global_zero and self.wandb_run is not None:
             self.wandb_run.log(metrics, step=step)
+
+    def _all_reduce_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        reduce_op: str = "sum",
+    ) -> torch.Tensor:
+        all_reduce = getattr(self.fabric, "all_reduce", None)
+        if all_reduce is None or getattr(self.fabric, "world_size", 1) <= 1:
+            return tensor
+        return all_reduce(tensor, reduce_op=reduce_op)
+
+    def _barrier(self, name: str | None = None) -> None:
+        barrier = getattr(self.fabric, "barrier", None)
+        if barrier is None:
+            return
+        try:
+            barrier(name=name)
+        except TypeError:
+            barrier()
+
+    def _rank_zero_first_context(self):
+        rank_zero_first = getattr(self.fabric, "rank_zero_first", None)
+        if rank_zero_first is None:
+            return nullcontext()
+        return rank_zero_first(local=True)
+
+    def _spec_eval_acceptance_length_max(self) -> int:
+        depth = getattr(self.tree_processor, "depth", None)
+        if depth is None or depth.numel() == 0:
+            return max(self.data_config.tree_seq_depth, 0)
+        return int(depth.max().item())
+
+    def _build_wandb_histogram(self, counts: list[int]):
+        if self.wandb_run is None or not self.fabric.is_global_zero:
+            return None
+        total = sum(int(count) for count in counts)
+        if total <= 0:
+            return None
+        import wandb
+
+        values: list[int] = []
+        for accept_length, count in enumerate(counts):
+            values.extend([accept_length] * int(count))
+        return wandb.Histogram(values)
+
+    def _build_wandb_html(self, html: str):
+        if self.wandb_run is None or not self.fabric.is_global_zero:
+            return None
+        import wandb
+
+        return wandb.Html(html, inject=False)
+
+    def _load_spec_eval_dataset(self, data_name: str):
+        if data_name not in self._spec_eval_dataset_cache:
+            from .data import load_and_process_eval_dataset
+
+            with self._rank_zero_first_context():
+                self._spec_eval_dataset_cache[data_name] = load_and_process_eval_dataset(data_name)
+        return self._spec_eval_dataset_cache[data_name]
+
+    def _get_spec_eval_sample_indices(self, dataset_size: int) -> list[int]:
+        sample_count = min(max(self.config.spec_eval_examples, 0), dataset_size)
+        rank = int(getattr(self.fabric, "global_rank", 0))
+        world_size = max(int(getattr(self.fabric, "world_size", 1)), 1)
+        return list(range(sample_count))[rank::world_size]
+
+    @torch.inference_mode()
+    def _build_speculative_eval_html_report(
+        self,
+        *,
+        data_name: str,
+        generate_fn,
+    ):
+        if self.wandb_run is None or not self.fabric.is_global_zero:
+            return None
+
+        from .spec_decode import evaluate_prompt_suite, render_eval_suite_html
+
+        report = evaluate_prompt_suite(
+            data_name=data_name,
+            tokenizer=self.tokenizer,
+            generate_fn=generate_fn,
+            max_examples=self.config.spec_eval_examples,
+            max_new_tokens=self.config.spec_eval_max_new_tokens,
+        )
+        return self._build_wandb_html(render_eval_suite_html(report))
+
+    @torch.inference_mode()
+    def _run_speculative_eval_suite(self) -> dict[str, Any]:
+        if not self.config.spec_eval_datasets or self.config.spec_eval_examples <= 0:
+            return {}
+
+        from .spec_decode import aggregate_speculative_eval, speculative_generate
+
+        metrics: dict[str, Any] = {}
+        acceptance_length_max = self._spec_eval_acceptance_length_max()
+
+        for data_name in self.config.spec_eval_datasets:
+            dataset = self._load_spec_eval_dataset(data_name)
+            sample_indices = self._get_spec_eval_sample_indices(len(dataset))
+
+            def generate_fn(*, prompt: str, max_new_tokens: int):
+                return speculative_generate(
+                    target_model=self.target_model,
+                    drafter_model=self.drafter_model,
+                    tokenizer=self.tokenizer,
+                    prompt=prompt,
+                    tree_processor=self.tree_processor,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                )
+
+            self._barrier(name=f"spec_eval_{data_name}_start")
+            local_result = aggregate_speculative_eval(
+                dataset=dataset,
+                sample_indices=sample_indices,
+                generate_fn=generate_fn,
+                max_new_tokens=self.config.spec_eval_max_new_tokens,
+                acceptance_length_max=acceptance_length_max,
+            )
+            self._barrier(name=f"spec_eval_{data_name}_end")
+
+            local_counts = torch.tensor(
+                [
+                    float(local_result.total_examples),
+                    float(local_result.total_committed_tokens),
+                    float(local_result.total_steps),
+                    float(local_result.total_acceptance_length),
+                    float(local_result.off_main_path_last_accept_count),
+                ],
+                dtype=torch.float64,
+                device=self.fabric.device,
+            )
+            global_counts = self._all_reduce_tensor(local_counts, reduce_op="sum")
+            local_hist = torch.tensor(
+                local_result.acceptance_length_histogram,
+                dtype=torch.float64,
+                device=self.fabric.device,
+            )
+            global_hist = self._all_reduce_tensor(local_hist, reduce_op="sum")
+            local_elapsed = torch.tensor(
+                float(local_result.elapsed_time_sec),
+                dtype=torch.float64,
+                device=self.fabric.device,
+            )
+            global_elapsed = self._all_reduce_tensor(local_elapsed, reduce_op="max")
+
+            total_examples = int(round(float(global_counts[0].item())))
+            total_committed_tokens = float(global_counts[1].item())
+            total_steps = int(round(float(global_counts[2].item())))
+            total_acceptance_length = float(global_counts[3].item())
+            off_main_path_last_accept_count = float(global_counts[4].item())
+            elapsed_time = max(float(global_elapsed.item()), 1e-8)
+            hist_counts = [int(round(value)) for value in global_hist.detach().cpu().tolist()]
+
+            prefix = f"spec_eval/{data_name}"
+            metrics[f"{prefix}/examples"] = total_examples
+            metrics[f"{prefix}/throughput_tok_s"] = total_committed_tokens / elapsed_time
+            metrics[f"{prefix}/avg_acceptance_length"] = total_acceptance_length / max(total_steps, 1)
+            metrics[f"{prefix}/off_main_path_last_accept_pct"] = (
+                100.0 * off_main_path_last_accept_count / max(total_steps, 1)
+            )
+            for accept_length, count in enumerate(hist_counts):
+                metrics[f"{prefix}/accept_len_count_{accept_length}"] = count
+            histogram = self._build_wandb_histogram(hist_counts)
+            if histogram is not None:
+                metrics[f"{prefix}/accept_len_histogram"] = histogram
+            html_report = self._build_speculative_eval_html_report(
+                data_name=data_name,
+                generate_fn=generate_fn,
+            )
+            if html_report is not None:
+                metrics[f"{prefix}/accepted_extra_tokens_html"] = html_report
+
+        return metrics
 
     def _get_tree_info(
         self,
@@ -550,7 +734,10 @@ class Trainer:
         )
         q_loss_sum = draft_hidden_states.new_zeros(())
         if self.has_q_head:
-            q_targets = tree_cum_probs.reshape(batch_size, num_blocks * block_size).to(torch.float32)
+            q_targets = self._build_q_targets(
+                tree_labels=tree_labels,
+                tree_info=tree_info,
+            ).reshape(batch_size, num_blocks * block_size)
             q_loss = F.binary_cross_entropy_with_logits(
                 q_logits.float(),
                 q_targets,
@@ -595,6 +782,27 @@ class Trainer:
         parent_idx = tree_info.parent_idx.to(tree_token_ids.device)
         parent_token_ids[..., 1:] = tree_token_ids.index_select(-1, parent_idx[1:])
         return parent_token_ids
+
+    def _build_q_targets(
+        self,
+        *,
+        tree_labels: torch.Tensor,
+        tree_info,
+    ) -> torch.Tensor:
+        primary_indices = tree_info.primary_path_indices.to(tree_labels.device)
+        target_main_path = tree_labels.index_select(-1, primary_indices)
+        _, _, node_target_indices = self._get_acceptance_path_tensors(device=tree_labels.device)
+        comparable_mask = node_target_indices >= 0
+        main_path_targets = target_main_path.gather(
+            -1,
+            node_target_indices.clamp(min=0).view(1, 1, -1).expand(
+                tree_labels.shape[0],
+                tree_labels.shape[1],
+                -1,
+            ),
+        )
+        q_targets = tree_labels.eq(main_path_targets) & comparable_mask.view(1, 1, -1)
+        return q_targets.to(torch.float32)
 
     def _chunked_loss_and_predictions(
         self,
@@ -1172,16 +1380,39 @@ class Trainer:
             if batch_idx >= self.config.eval_batches:
                 break
             batch_result = self._eval_batch(batch)
-            total_loss += float(batch_result["loss"].item()) * max(batch_result["valid_count"], 1)
-            total_q_loss += float(batch_result["q_loss"].item()) * max(batch_result["valid_count"], 1)
-            total_ar_loss += float(batch_result["ar_loss"].item()) * max(batch_result["valid_count"], 1)
-            total_valid += batch_result["valid_count"]
-            total_acceptance += batch_result["acceptance_total"]
-            total_acceptance_count += batch_result["acceptance_count"]
+            valid_count = int(batch_result["valid_count"])
+            total_loss += float(batch_result["loss"].item()) * valid_count
+            total_q_loss += float(batch_result["q_loss"].item()) * valid_count
+            total_ar_loss += float(batch_result["ar_loss"].item()) * valid_count
+            total_valid += valid_count
+            total_acceptance += float(batch_result["acceptance_total"])
+            total_acceptance_count += int(batch_result["acceptance_count"])
             if self.config.dev_run:
                 break
 
-        self.drafter_model.train()
+        reduced = self._all_reduce_tensor(
+            torch.tensor(
+                [
+                    total_loss,
+                    total_q_loss,
+                    total_ar_loss,
+                    float(total_valid),
+                    total_acceptance,
+                    float(total_acceptance_count),
+                ],
+                dtype=torch.float64,
+                device=self.fabric.device,
+            ),
+            reduce_op="sum",
+        )
+        total_loss = float(reduced[0].item())
+        total_q_loss = float(reduced[1].item())
+        total_ar_loss = float(reduced[2].item())
+        total_valid = int(round(float(reduced[3].item())))
+        total_acceptance = float(reduced[4].item())
+        total_acceptance_count = int(round(float(reduced[5].item())))
+
+        metrics: dict[str, Any]
         if total_valid == 0:
             eval_loss = 0.0
             eval_q_loss = 0.0
@@ -1191,12 +1422,15 @@ class Trainer:
             eval_q_loss = total_q_loss / total_valid
             eval_ar_loss = total_ar_loss / total_valid
         mean_acceptance = total_acceptance / max(total_acceptance_count, 1)
-        return {
+        metrics = {
             "eval/loss": eval_loss,
             "eval/q_loss": eval_q_loss,
             "eval/ar_loss": eval_ar_loss,
             "eval/mean_acceptance_length": mean_acceptance,
         }
+        metrics.update(self._run_speculative_eval_suite())
+        self.drafter_model.train()
+        return metrics
 
 
 def build_parser() -> ArgumentParser:
