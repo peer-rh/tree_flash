@@ -17,6 +17,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from transformers.cache_utils import Cache
 
 from ..trees import TreeInfo
+from ..trees.relation_ids import RELATION_VOCAB_SIZE
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
@@ -68,7 +69,13 @@ def build_ar_score_mod(
         valid_tree = (tree_kv >= 0) & (tree_kv < block_size)
         q_idx = Q.clamp(0, block_size - 1)
         kv_idx = tree_kv.clamp(0, block_size - 1)
-        legal_tree = valid_tree & tree_mask[q_idx, kv_idx]
+        if tree_mask.ndim == 2:
+            legal_tree = valid_tree & tree_mask[q_idx, kv_idx]
+        else:
+            q_block = Q // block_size
+            kv_block = tree_kv // block_size
+            same_tree = q_block == kv_block
+            legal_tree = valid_tree & same_tree & tree_mask[B, q_block, q_idx, kv_idx]
         return torch.where(is_prefix | legal_tree, score, torch.full_like(score, float("-inf")))
 
     return score_mod
@@ -103,7 +110,7 @@ class Qwen3DFlashAttention(nn.Module):
         if not hasattr(config, "use_additive_tree_pos_bias"):
             config.use_additive_tree_pos_bias = False
         if config.use_additive_tree_pos_bias:
-            self.tree_pos_bias = nn.Embedding(64, config.num_attention_heads)
+            self.tree_pos_bias = nn.Embedding(RELATION_VOCAB_SIZE, config.num_attention_heads)
             self.tree_pos_bias.weight.data.zero_()
 
     def forward(

@@ -50,7 +50,8 @@ from src.trainer import (
     build_parser as build_trainer_parser,
     build_prefill_attention_mask,
 )
-from src.trees import BlockTreeProcessor, PrunableTreeProcessor
+from src.trees import BlockTreeProcessor, PrunableTreeProcessor, VarTreeProcessor
+from src.trees.relation_ids import RELATION_VOCAB_SIZE, relation_id_for_child_rank, relation_id_for_parent_rank
 
 
 def _require_flex_attention() -> None:
@@ -482,6 +483,28 @@ def _make_trainer(
     )
 
 
+def _build_fake_vartree_batch() -> PackedBatch:
+    batch = PackedBatch(
+        input_ids=torch.tensor([[1, 2, 3, 4, 5, 6, 0, 0]], dtype=torch.long),
+        position_ids=torch.tensor([[0, 1, 2, 3, 4, 5, 0, 0]], dtype=torch.long),
+        document_mask=torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]], dtype=torch.long),
+        context_valid_mask=torch.tensor([[True, True, True, True, True, True, False, False]]),
+        anchor_positions=torch.tensor([[2, 3]], dtype=torch.long),
+        anchor_document_ids=torch.tensor([[1, 1]], dtype=torch.long),
+        anchor_valid_mask=torch.tensor([[True, True]], dtype=torch.bool),
+        tree_labels=torch.tensor([[[21, 22, 31, 23], [22, 23, 24, IGNORE_IDX]]], dtype=torch.long),
+        tree_noise_ids=torch.tensor([[[21, 255, 255, 255], [22, 255, 255, 255]]], dtype=torch.long),
+        tree_position_ids=torch.tensor([[[2, 3, 3, 4], [3, 4, 5, 0]]], dtype=torch.long),
+        tree_cum_probs=torch.tensor([[[1.0, 0.6, 0.4, 0.42], [1.0, 1.0, 1.0, 0.0]]], dtype=torch.float32),
+        tree_valid_mask=torch.tensor([[[True, True, True, True], [True, True, True, False]]], dtype=torch.bool),
+        tree_parent_indices=torch.tensor([[[-1, 0, 0, 1], [-1, 0, 1, -1]]], dtype=torch.long),
+        tree_depths=torch.tensor([[[0, 1, 1, 2], [0, 1, 2, 0]]], dtype=torch.long),
+        tree_node_ranks=torch.tensor([[[0, 1, 2, 3], [0, 0, 0, 0]]], dtype=torch.long),
+        tree_primary_path_mask=torch.tensor([[[True, True, False, True], [True, True, True, False]]], dtype=torch.bool),
+    )
+    return batch
+
+
 def test_dflash_forward_shapes() -> None:
     _require_flex_attention()
     Qwen3Config = pytest.importorskip("transformers.models.qwen3.modeling_qwen3").Qwen3Config
@@ -518,6 +541,30 @@ def test_dflash_forward_shapes() -> None:
     )
     assert final_hidden.shape == hidden_states.shape
     assert backbone_hidden.shape == hidden_states.shape
+
+
+def test_dflash_tree_bias_vocab_tracks_relation_ids() -> None:
+    _require_flex_attention()
+    Qwen3Config = pytest.importorskip("transformers.models.qwen3.modeling_qwen3").Qwen3Config
+    config = Qwen3Config(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=64,
+    )
+    config.num_target_layers = 2
+    config.block_size = 8
+    config.max_tree_size = 8
+    config.dflash_config = {"mask_token_id": 1, "target_layer_ids": [0, 1]}
+    config._attn_implementation = "flex_attention"
+    config.use_additive_tree_pos_bias = True
+
+    model = DFlashDraftModel(config)
+
+    assert model.layers[0].self_attn.tree_pos_bias.num_embeddings == RELATION_VOCAB_SIZE
 
 
 def test_dflash_forward_exposes_backbone_for_q_head() -> None:
@@ -1561,6 +1608,40 @@ def test_trainer_accepts_prunable_tree_type_with_ar_head(monkeypatch, tmp_path: 
     assert trainer.tree_processor.candidate_tree_size == 2
 
 
+def test_trainer_accepts_vartree_type_and_builds_dynamic_tree_info(monkeypatch, tmp_path: Path) -> None:
+    packed_batch = _build_fake_vartree_batch()
+    trainer = _make_trainer(
+        monkeypatch,
+        tmp_path,
+        anchor_chunk_size=None,
+        batch=packed_batch,
+        tree_type="vartree",
+    )
+
+    assert isinstance(trainer.tree_processor, VarTreeProcessor)
+    tree_info = trainer._get_tree_info(
+        batch_size=packed_batch.batch_size,
+        num_blocks=packed_batch.num_anchors,
+        device=torch.device("cpu"),
+        batch=packed_batch,
+        anchor_slice=slice(0, packed_batch.num_anchors),
+    )
+    assert tree_info.parent_idx.shape == (1, 2, 4)
+    assert tree_info.tree_mask.shape == (1, 2, 4, 4)
+    assert tree_info.primary_path_indices[0, 0].tolist() == [0, 1, 3, -1]
+
+    target_ctx_features = trainer._prefill_target_context(packed_batch.to(trainer.fabric.device))
+    result = trainer._forward_anchor_chunk(
+        packed_batch.to(trainer.fabric.device),
+        target_ctx_features,
+        slice(0, packed_batch.num_anchors),
+        compute_predictions=True,
+    )
+    assert result["valid_count"] == 5
+    assert result["predictions"] is not None
+    assert result["predictions"].shape == packed_batch.tree_labels.shape
+
+
 def test_trainer_prunable_requires_q_head(monkeypatch, tmp_path: Path) -> None:
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size)
@@ -2276,7 +2357,9 @@ def test_parsers_accept_prunable_tree_type() -> None:
     eagle3_backend_action = next(action for action in build_eagle3_eval_parser()._actions if action.dest == "backend")
 
     assert "prunable" in trainer_tree_action.choices
+    assert "vartree" in trainer_tree_action.choices
     assert "prunable" in spec_tree_action.choices
+    assert "vartree" not in spec_tree_action.choices
     assert any(action.dest == "official_dflash_model" for action in build_spec_decode_parser()._actions)
     assert any(action.dest == "eval_data" for action in build_spec_decode_parser()._actions)
     assert any(action.dest == "official_eagle3_model" for action in build_eagle3_eval_parser()._actions)

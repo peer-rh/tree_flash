@@ -6,9 +6,38 @@ import pytest
 
 torch = pytest.importorskip("torch")
 h5py = pytest.importorskip("h5py")
+np = pytest.importorskip("numpy")
 
-from src.data import DataModuleConfig, PackedBatchCollator, Stage2Dataset, build_dataloaders
-from src.trees import BlockTreeProcessor, BranchOffTreeProcessor, PrunableTreeProcessor, subset_tree_info
+from data_pipeline.stage2_v2 import (
+    GeneratedAnchorTree,
+    GeneratedSequenceTree,
+    SequenceTreeNode,
+    flush_stage2_v2_hdf5,
+    initialize_stage2_v2_hdf5,
+)
+from src.data import (
+    DataModuleConfig,
+    PackedBatchCollator,
+    Stage2Dataset,
+    Stage2V2Dataset,
+    build_dataloaders,
+)
+from src.trees import (
+    BlockTreeProcessor,
+    BranchOffTreeProcessor,
+    PrunableTreeProcessor,
+    VarTreeProcessor,
+    subset_tree_info,
+)
+from src.trees.relation_ids import (
+    REL_ANCESTOR,
+    REL_DESCENDANT,
+    REL_OTHER,
+    REL_SIBLING,
+    relation_id_for_child_rank,
+    relation_id_for_parent_rank,
+    relation_id_for_sibling_ranks,
+)
 
 
 SUB_TREE_PATHS = ["0-1", "0-2", "1-3"]
@@ -91,6 +120,87 @@ def _write_stage2_fixture_many(path: Path) -> None:
                 sub_trees[row] = [token, token + 10, token + 11, token + 12]
                 probs[row] = [0.8, 0.5, 0.25, 0.2]
                 row += 1
+
+
+def _write_stage2_v2_fixture(path: Path) -> None:
+    attrs = {
+        "format_version": "stage2_v2",
+        "attn_implementation": "flex_attention",
+        "alpha": 0.2,
+        "max_anchors_per_sequence": 4,
+        "num_attend_tokens_per_anchor": 2,
+        "child_coverage_alpha": 0.8,
+        "model_name_or_path": "fake",
+        "tokenizer_name_or_path": "fake",
+    }
+    sequence = GeneratedSequenceTree(
+        record_idx=0,
+        main_path_ids=[11, 12, 21, 22, 23, 24],
+        response_start_position=2,
+        anchors=[
+            GeneratedAnchorTree(
+                anchor_main_path_position=2,
+                anchor_next_token_prob=0.3,
+                nodes=[
+                    SequenceTreeNode(
+                        token_id=-1,
+                        parent_index=-1,
+                        depth=0,
+                        local_prob=1.0,
+                        path_prob=1.0,
+                        rank=0,
+                        main_path_position=-1,
+                        is_main_path=False,
+                        child_indices=[1, 2],
+                    ),
+                    SequenceTreeNode(
+                        token_id=22,
+                        parent_index=0,
+                        depth=1,
+                        local_prob=0.6,
+                        path_prob=0.6,
+                        rank=1,
+                        main_path_position=3,
+                        is_main_path=True,
+                        child_indices=[3, 1],
+                    ),
+                    SequenceTreeNode(
+                        token_id=31,
+                        parent_index=0,
+                        depth=1,
+                        local_prob=0.4,
+                        path_prob=0.4,
+                        rank=2,
+                        main_path_position=-1,
+                        is_main_path=False,
+                        child_indices=[-1, 0],
+                    ),
+                    SequenceTreeNode(
+                        token_id=23,
+                        parent_index=1,
+                        depth=2,
+                        local_prob=0.7,
+                        path_prob=0.42,
+                        rank=1,
+                        main_path_position=4,
+                        is_main_path=True,
+                        child_indices=[-1, 0],
+                    ),
+                ],
+            ),
+        ],
+    )
+    with h5py.File(path, "w") as hf:
+        initialize_stage2_v2_hdf5(hf, prob_dtype=np.float32, attrs=attrs)
+        flush_stage2_v2_hdf5(
+            hf,
+            [sequence],
+            n_sequences_written=0,
+            n_main_path_ids_written=0,
+            n_anchors_written=0,
+            n_nodes_written=0,
+            prob_dtype=np.float32,
+        )
 
 
 def test_stage2_dataset_reads_offsets_and_rows(tmp_path: Path) -> None:
@@ -509,3 +619,98 @@ def test_prunable_tree_processor_wraps_branch_off_base_tree() -> None:
     assert tree_processor.base_tree_type == "branch_off"
     assert tree_processor.block_size == 6
     assert tree_processor.primary_path_indices.tolist() == [0, 2, 5]
+
+
+def test_vartree_processor_builds_dynamic_relations() -> None:
+    tree_processor = VarTreeProcessor()
+    tree_info = tree_processor.build_tree_info_from_batch(
+        tree_parent_indices=torch.tensor([[[-1, 0, 0, 1, -1]]], dtype=torch.long),
+        tree_depths=torch.tensor([[[0, 1, 1, 2, 0]]], dtype=torch.long),
+        tree_node_ranks=torch.tensor([[[0, 1, 2, 9, 0]]], dtype=torch.long),
+        tree_position_ids=torch.tensor([[[2, 3, 3, 4, 0]]], dtype=torch.long),
+        tree_valid_mask=torch.tensor([[[True, True, True, True, False]]], dtype=torch.bool),
+        tree_primary_path_mask=torch.tensor([[[True, True, False, True, False]]], dtype=torch.bool),
+    )
+
+    assert tree_info.parent_idx.shape == (1, 1, 5)
+    assert tree_info.tree_mask.shape == (1, 1, 5, 5)
+    assert tree_info.non_root_mask.tolist() == [[[False, True, True, True, False]]]
+    assert tree_info.primary_path_indices.tolist() == [[[0, 1, 3, -1, -1]]]
+    assert tree_info.tree_mask[0, 0, 3].tolist() == [True, True, False, True, False]
+    assert int(tree_info.relation_map[0, 0, 1, 2].item()) == relation_id_for_sibling_ranks(1, 2)
+    assert int(tree_info.relation_map[0, 0, 2, 1].item()) == relation_id_for_sibling_ranks(2, 1)
+    assert int(tree_info.relation_map[0, 0, 3, 1].item()) == relation_id_for_parent_rank(8)
+    assert int(tree_info.relation_map[0, 0, 1, 3].item()) == relation_id_for_child_rank(8)
+    assert int(tree_info.relation_map[0, 0, 3, 0].item()) == REL_ANCESTOR
+    assert int(tree_info.relation_map[0, 0, 0, 3].item()) == REL_DESCENDANT
+    assert int(tree_info.relation_map[0, 0, 4, 0].item()) == REL_OTHER
+
+
+def test_vartree_processor_encodes_direct_edge_ranks() -> None:
+    tree_processor = VarTreeProcessor()
+    tree_info = tree_processor.build_tree_info_from_batch(
+        tree_parent_indices=torch.tensor([[[-1, 0, 0]]], dtype=torch.long),
+        tree_depths=torch.tensor([[[0, 1, 1]]], dtype=torch.long),
+        tree_node_ranks=torch.tensor([[[0, 1, 2]]], dtype=torch.long),
+        tree_position_ids=torch.tensor([[[2, 3, 3]]], dtype=torch.long),
+        tree_valid_mask=torch.tensor([[[True, True, True]]], dtype=torch.bool),
+        tree_primary_path_mask=torch.tensor([[[True, True, False]]], dtype=torch.bool),
+    )
+
+    assert int(tree_info.relation_map[0, 0, 1, 0].item()) == relation_id_for_parent_rank(1)
+    assert int(tree_info.relation_map[0, 0, 0, 1].item()) == relation_id_for_child_rank(1)
+    assert int(tree_info.relation_map[0, 0, 2, 0].item()) == relation_id_for_parent_rank(2)
+    assert int(tree_info.relation_map[0, 0, 0, 2].item()) == relation_id_for_child_rank(2)
+
+
+def test_vartree_processor_falls_back_to_generic_sibling_for_unknown_rank() -> None:
+    tree_processor = VarTreeProcessor()
+    tree_info = tree_processor.build_tree_info_from_batch(
+        tree_parent_indices=torch.tensor([[[-1, 0, 0]]], dtype=torch.long),
+        tree_depths=torch.tensor([[[0, 1, 1]]], dtype=torch.long),
+        tree_node_ranks=torch.tensor([[[0, 0, 2]]], dtype=torch.long),
+        tree_position_ids=torch.tensor([[[2, 3, 3]]], dtype=torch.long),
+        tree_valid_mask=torch.tensor([[[True, True, True]]], dtype=torch.bool),
+        tree_primary_path_mask=torch.tensor([[[True, True, False]]], dtype=torch.bool),
+    )
+
+    assert int(tree_info.relation_map[0, 0, 1, 2].item()) == REL_SIBLING
+
+
+def test_stage2_v2_dataset_and_collator_emit_dynamic_tree_metadata(tmp_path: Path) -> None:
+    stage2_v2_path = tmp_path / "stage2_v2.h5"
+    _write_stage2_v2_fixture(stage2_v2_path)
+
+    dataset = Stage2V2Dataset(stage2_v2_path)
+    assert len(dataset) == 1
+
+    _, eval_loader = build_dataloaders(
+        config=DataModuleConfig(
+            path=str(stage2_v2_path),
+            eval_path=str(stage2_v2_path),
+            batch_size=1,
+            pack_length=16,
+            num_anchors=2,
+            training_tree_size=4,
+            shuffle=False,
+            drop_last=False,
+        ),
+        tree_processor=VarTreeProcessor(),
+        mask_token_id=99,
+        pad_token_id=0,
+    )
+    batch = next(iter(eval_loader))
+
+    assert batch.anchor_positions.tolist() == [[2, 3]]
+    assert batch.tree_parent_indices is not None
+    assert batch.tree_depths is not None
+    assert batch.tree_node_ranks is not None
+    assert batch.tree_primary_path_mask is not None
+    assert batch.tree_labels.shape == (1, 2, 4)
+    assert batch.tree_labels[0, 0].tolist() == [21, 22, 23, 24]
+    assert batch.tree_parent_indices[0, 0].tolist() == [-1, 0, 1, 2]
+    assert batch.tree_node_ranks[0, 0].tolist() == [0, 1, 0, 0]
+    assert batch.tree_primary_path_mask[0, 0].tolist() == [True, True, True, True]
+    assert batch.tree_parent_indices[0, 1].tolist() == [-1, 0, 1, -1]
+    assert batch.tree_node_ranks[0, 1].tolist() == [0, 0, 0, 0]
+    assert batch.tree_valid_mask[0, 1].tolist() == [True, True, True, False]

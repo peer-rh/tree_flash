@@ -4,6 +4,7 @@
 #SBATCH --error=outputs/logs/%j.err # where to store error messages
 #SBATCH --mem=96G
 #SBATCH --nodes=1
+#SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:4
 #SBATCH --time=0-24:00:00
