@@ -7,6 +7,10 @@ from pathlib import Path
 
 import h5py
 from transformers import AutoTokenizer
+import sys
+
+sys.setrecursionlimit(10000)
+
 
 
 @dataclass(frozen=True)
