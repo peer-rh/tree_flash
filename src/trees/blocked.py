@@ -6,14 +6,15 @@ from typing import Sequence
 import torch
 
 from data_pipeline.stage2 import DEFAULT_SUB_TREE_PATHS, IGNORE_IDX, SubTreeInfo
-
-REL_SELF = 0
-REL_PARENT = 1
-REL_CHILD = 2
-REL_SIBLING = 3
-REL_ANCESTOR = 4
-REL_DESCENDANT = 5
-REL_OTHER = 6
+from .relation_ids import (
+    REL_ANCESTOR,
+    REL_CHILD,
+    REL_DESCENDANT,
+    REL_OTHER,
+    REL_PARENT,
+    REL_SELF,
+    REL_SIBLING,
+)
 
 
 def _build_layout_vectorization_tensors(

@@ -1312,7 +1312,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--child-coverage-alpha",
         type=float,
-        default=0.8,
+        default=0.95,
         help="Keep children until cumulative local probability mass reaches this threshold.",
     )
     parser.add_argument(
@@ -1338,7 +1338,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--logit-chunk-size",
         type=int,
-        default=128,
+        default=0,
         help="Project at most this many positions through the LM head at once; <= 0 disables chunking.",
     )
     parser.add_argument("--compile", action="store_true", help="Compile supported flex-attention helpers.")

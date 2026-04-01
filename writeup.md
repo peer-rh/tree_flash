@@ -6,6 +6,7 @@
     - We store them as 'prompt' and 'response'
 - Stage 2 then generates alternative continuation trees
     - We select all response positions $x_t$, where $p_T(x_{t+1} | x_{1:t}) <= \alpha$. This ensures the alternative continuations trees capture the model's behaviour (In practice we limit the total number of trees)
+        - We still make it so that every token has children so that $alpha$ prob. space is covered. Only some might not get chosen as branch-off-positions if we have to many of these positions
     - For all 'branch-off positions' $x_t$ we do the following:
         - Let $T = \{x_t\}$
         - Add all tokes $x^{(i)}_{t+1}$ to $T$, where $(i)$ is the rank in the prob. ordering, s.t $p(x_{t+1}) sum_i p(x^{(i)}_{t+1}) \geq alpha$ and $x^{(i)}_{t+1} \neq x_{t+1}$
@@ -38,8 +39,10 @@
             - `child-{k}` & `parent-k`, where the $k$ refers to the rank of the child
             - `sibling-{i}-{j}` where $i,j$ are the respective ranks
             - `unrelated`
+        - We also have the prune-head which is a linear layer which predicts the probability that this token is correct
     3. We do cross entropy from this tree to the actual tree labels 
         - We weight this loss based on the path probability of each token, i.e the path probabilities multiplied from $x_t$ to this token
+        - The prune head gets trained with BCE on whether this token is equal to it's label
     
 
 ## Inference

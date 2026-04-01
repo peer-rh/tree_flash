@@ -152,6 +152,8 @@ def build_tree_processor(
             sub_tree_paths=sub_tree_paths or tree_args.get("sub_tree_paths"),
             branching_pattern=tree_args.get("branching_pattern"),
         )
+    if tree_type in {"var", "vartree"}:
+        raise NotImplementedError("tree_type='vartree' is training-only and not implemented for speculative decoding.")
     raise NotImplementedError(
         f"tree_type={tree_type!r} is not implemented for speculative decoding."
     )

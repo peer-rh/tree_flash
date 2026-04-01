@@ -16,7 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .data import DataModuleConfig, PackedBatch, build_dataloaders
 from .models import DFlashDraftModel
-from .trees import BlockTreeProcessor, BranchOffTreeProcessor, PrunableTreeProcessor
+from .trees import BlockTreeProcessor, BranchOffTreeProcessor, PrunableTreeProcessor, VarTreeProcessor
 
 try:
     from cut_cross_entropy import linear_cross_entropy as cce_linear_cross_entropy
@@ -315,12 +315,16 @@ def build_ar_block_mask(
         same_tree = q_block == kv_block
         q_tree_idx = q_idx % block_size
         kv_tree_idx = tree_idx % block_size
+        if tree_mask.ndim == 2:
+            local_tree_ok = tree_mask[q_tree_idx, kv_tree_idx]
+        else:
+            local_tree_ok = tree_mask[b, q_block, q_tree_idx, kv_tree_idx]
         tree_ok = (
             (~in_ctx)
             & q_valid
             & same_tree
             & flat_block_valid[b, tree_idx]
-            & tree_mask[q_tree_idx, kv_tree_idx]
+            & local_tree_ok
         )
         return invalid_self | ctx_ok | tree_ok
 
@@ -561,7 +565,7 @@ class Trainer:
         target: str,
         data: DataModuleConfig,
         drafter: dict[str, Any] | str,
-        tree_type: Literal["fixed", "prunable", "block", "branch_off", "every_branch", "loaded"] = "fixed",
+        tree_type: Literal["fixed", "prunable", "block", "branch_off", "every_branch", "loaded", "var", "vartree"] = "fixed",
         tree_args: dict[str, Any] | None = None,
     ):
         """Initialize the trainer, models, loaders, caches, and optimizer.
@@ -758,8 +762,10 @@ class Trainer:
                 sub_tree_paths=tree_args.get("sub_tree_paths"),
                 branching_pattern=tree_args.get("branching_pattern"),
             )
+        if tree_type in {"var", "vartree"}:
+            return VarTreeProcessor()
         raise NotImplementedError(
-            f"tree_type={tree_type!r} is not implemented. Use 'block', 'branch_off', or 'prunable'."
+            f"tree_type={tree_type!r} is not implemented. Use 'block', 'branch_off', 'prunable', or 'vartree'."
         )
 
     def _init_wandb(self) -> None:
@@ -1067,6 +1073,8 @@ class Trainer:
         batch_size: int,
         num_blocks: int,
         device: torch.device,
+        batch: PackedBatch | None = None,
+        anchor_slice: slice | None = None,
     ):
         """Fetch cached per-layout tree metadata for a batch shape and device.
 
@@ -1080,6 +1088,24 @@ class Trainer:
             ``relation_map = (batch_size, num_blocks, block_size, block_size)``
             and ``tree_position_ids = (batch_size, num_blocks, block_size)``.
         """
+        if isinstance(self.tree_processor, VarTreeProcessor):
+            if batch is None or anchor_slice is None:
+                raise ValueError("VarTree requires the current batch and anchor slice.")
+            if (
+                batch.tree_parent_indices is None
+                or batch.tree_depths is None
+                or batch.tree_node_ranks is None
+                or batch.tree_primary_path_mask is None
+            ):
+                raise ValueError("VarTree batches must provide dynamic tree structure tensors.")
+            return self.tree_processor.build_tree_info_from_batch(
+                tree_parent_indices=batch.tree_parent_indices[:, anchor_slice].to(device),
+                tree_depths=batch.tree_depths[:, anchor_slice].to(device),
+                tree_node_ranks=batch.tree_node_ranks[:, anchor_slice].to(device),
+                tree_position_ids=batch.tree_position_ids[:, anchor_slice].to(device),
+                tree_valid_mask=batch.tree_valid_mask[:, anchor_slice].to(device),
+                tree_primary_path_mask=batch.tree_primary_path_mask[:, anchor_slice].to(device),
+            )
         device_key = (device.type, -1 if device.index is None else device.index)
         cache_key = (batch_size, num_blocks, device_key[0], device_key[1])
         tree_info = self._tree_info_cache.get(cache_key)
@@ -1125,6 +1151,7 @@ class Trainer:
                 "ar_loss_sum": target_ctx_features.new_zeros(()),
                 "valid_count": 0,
                 "predictions": None,
+                "tree_info": None,
                 "mask_time": 0.0,
                 "drafter_time": 0.0,
                 "ce_time": 0.0,
@@ -1137,12 +1164,17 @@ class Trainer:
         tree_valid_mask = batch.tree_valid_mask[:, anchor_slice]
 
         batch_size, num_blocks, block_size = tree_labels.shape
-        tree_info = self._get_tree_info(batch_size=batch_size, num_blocks=num_blocks, device=tree_labels.device)
-        valid_mask = (
-            tree_valid_mask
-            & tree_info.non_root_mask.view(1, 1, -1)
-            & anchor_valid_mask.unsqueeze(-1)
+        tree_info = self._get_tree_info(
+            batch_size=batch_size,
+            num_blocks=num_blocks,
+            device=tree_labels.device,
+            batch=batch,
+            anchor_slice=anchor_slice,
         )
+        non_root_mask = tree_info.non_root_mask
+        if non_root_mask.ndim == 1:
+            non_root_mask = non_root_mask.view(1, 1, -1)
+        valid_mask = tree_valid_mask & non_root_mask & anchor_valid_mask.unsqueeze(-1)
         flat_valid_mask = valid_mask.reshape(batch_size, num_blocks * block_size)
         if not flat_valid_mask.any():
             return {
@@ -1151,6 +1183,7 @@ class Trainer:
                 "ar_loss_sum": target_ctx_features.new_zeros(()),
                 "valid_count": 0,
                 "predictions": None,
+                "tree_info": tree_info,
                 "tree_valid_mask": tree_valid_mask,
                 "mask_time": 0.0,
                 "drafter_time": 0.0,
@@ -1250,6 +1283,7 @@ class Trainer:
             "ar_loss_sum": ar_loss_sum,
             "valid_count": valid_count,
             "predictions": predictions,
+            "tree_info": tree_info,
             "tree_valid_mask": tree_valid_mask,
             "mask_time": mask_time,
             "drafter_time": drafter_time,
@@ -1277,7 +1311,13 @@ class Trainer:
         if tree_info.block_size <= 1:
             return parent_token_ids
         parent_idx = tree_info.parent_idx.to(tree_token_ids.device)
-        parent_token_ids[..., 1:] = tree_token_ids.index_select(-1, parent_idx[1:])
+        if parent_idx.ndim == 1:
+            parent_token_ids[..., 1:] = tree_token_ids.index_select(-1, parent_idx[1:])
+            return parent_token_ids
+        gather_idx = parent_idx.clamp(min=0)
+        gathered = tree_token_ids.gather(-1, gather_idx)
+        valid_parent = parent_idx >= 0
+        parent_token_ids = torch.where(valid_parent, gathered, parent_token_ids)
         return parent_token_ids
 
     def _chunked_loss_and_predictions(
@@ -1411,7 +1451,10 @@ class Trainer:
         """
         if batch.num_anchors == 0 or batch.tree_valid_mask.numel() == 0:
             return 0
-        non_root_mask = self.tree_processor.non_root_mask.to(batch.tree_valid_mask.device).view(1, 1, -1)
+        if batch.tree_parent_indices is not None:
+            non_root_mask = batch.tree_parent_indices.to(batch.tree_valid_mask.device) >= 0
+        else:
+            non_root_mask = self.tree_processor.non_root_mask.to(batch.tree_valid_mask.device).view(1, 1, -1)
         valid_mask = (
             batch.tree_valid_mask
             & non_root_mask
@@ -1542,12 +1585,15 @@ class Trainer:
             drafter_time += chunk_result["drafter_time"]
             ce_time += chunk_result["ce_time"]
             if chunk_result["predictions"] is not None:
-                acceptance_chunk_total, acceptance_chunk_count = self._acceptance_proxy(
-                    predictions=chunk_result["predictions"],
-                    labels=batch.tree_labels[:, start:end],
-                    anchor_valid_mask=batch.anchor_valid_mask[:, start:end],
-                    tree_valid_mask=chunk_result["tree_valid_mask"],
-                )
+                acceptance_kwargs = {
+                    "predictions": chunk_result["predictions"],
+                    "labels": batch.tree_labels[:, start:end],
+                    "anchor_valid_mask": batch.anchor_valid_mask[:, start:end],
+                    "tree_valid_mask": chunk_result["tree_valid_mask"],
+                }
+                if isinstance(self.tree_processor, VarTreeProcessor):
+                    acceptance_kwargs["tree_info"] = chunk_result["tree_info"]
+                acceptance_chunk_total, acceptance_chunk_count = self._acceptance_proxy(**acceptance_kwargs)
                 acceptance_total += acceptance_chunk_total
                 acceptance_count += acceptance_chunk_count
             scaled_chunk_loss = (
@@ -1655,12 +1701,15 @@ class Trainer:
             drafter_time += chunk_result["drafter_time"]
             ce_time += chunk_result["ce_time"]
             if chunk_result["predictions"] is not None:
-                acceptance_chunk_total, acceptance_chunk_count = self._acceptance_proxy(
-                    predictions=chunk_result["predictions"],
-                    labels=batch.tree_labels[:, start:end],
-                    anchor_valid_mask=batch.anchor_valid_mask[:, start:end],
-                    tree_valid_mask=chunk_result["tree_valid_mask"],
-                )
+                acceptance_kwargs = {
+                    "predictions": chunk_result["predictions"],
+                    "labels": batch.tree_labels[:, start:end],
+                    "anchor_valid_mask": batch.anchor_valid_mask[:, start:end],
+                    "tree_valid_mask": chunk_result["tree_valid_mask"],
+                }
+                if isinstance(self.tree_processor, VarTreeProcessor):
+                    acceptance_kwargs["tree_info"] = chunk_result["tree_info"]
+                acceptance_chunk_total, acceptance_chunk_count = self._acceptance_proxy(**acceptance_kwargs)
                 acceptance_total += acceptance_chunk_total
                 acceptance_count += acceptance_chunk_count
 
@@ -1689,6 +1738,7 @@ class Trainer:
         labels: torch.Tensor,
         anchor_valid_mask: torch.Tensor,
         tree_valid_mask: torch.Tensor,
+        tree_info=None,
     ) -> tuple[float, int]:
         """Compute a scalar acceptance proxy from predicted tree tokens.
 
@@ -1706,6 +1756,56 @@ class Trainer:
         """
         if predictions.numel() == 0:
             return 0.0, 0
+        if isinstance(self.tree_processor, VarTreeProcessor):
+            if tree_info is None:
+                raise ValueError("VarTree acceptance proxy requires per-batch tree_info.")
+            total = 0.0
+            count = 0
+            batch_size, num_blocks, block_size = predictions.shape
+            parent_idx = tree_info.parent_idx
+            depth = tree_info.depth
+            primary_path_indices = tree_info.primary_path_indices
+            for batch_idx in range(batch_size):
+                for block_idx in range(num_blocks):
+                    if not bool(anchor_valid_mask[batch_idx, block_idx]):
+                        continue
+                    count += 1
+                    primary_keep = primary_path_indices[batch_idx, block_idx]
+                    primary_keep = primary_keep[primary_keep >= 0]
+                    if primary_keep.numel() <= 1:
+                        continue
+                    target_main = labels[batch_idx, block_idx].index_select(0, primary_keep)
+                    depth_to_target_idx = {
+                        int(depth[batch_idx, block_idx, node_idx].item()): primary_offset
+                        for primary_offset, node_idx in enumerate(primary_keep.tolist())
+                    }
+                    accepted = 0
+                    for node_idx in range(block_size):
+                        if not bool(tree_valid_mask[batch_idx, block_idx, node_idx]):
+                            continue
+                        node_depth = int(depth[batch_idx, block_idx, node_idx].item())
+                        target_idx = depth_to_target_idx.get(node_depth)
+                        if target_idx is None:
+                            continue
+                        cur = node_idx
+                        path_ok = True
+                        while cur >= 0:
+                            if not bool(tree_valid_mask[batch_idx, block_idx, cur]):
+                                path_ok = False
+                                break
+                            cur_depth = int(depth[batch_idx, block_idx, cur].item())
+                            target_cur_idx = depth_to_target_idx.get(cur_depth)
+                            if target_cur_idx is None:
+                                path_ok = False
+                                break
+                            if int(predictions[batch_idx, block_idx, cur].item()) != int(target_main[target_cur_idx].item()):
+                                path_ok = False
+                                break
+                            cur = int(parent_idx[batch_idx, block_idx, cur].item())
+                        if path_ok:
+                            accepted = max(accepted, node_depth)
+                    total += float(accepted)
+            return total, count
         primary_indices = self.tree_processor.primary_path_indices.to(predictions.device)
         if primary_indices.numel() <= 1:
             return 0.0, 0
@@ -1992,7 +2092,7 @@ def build_parser() -> ArgumentParser:
         "--tree_type",
         type=str,
         default="block",
-        choices=["block", "branch_off", "prunable"],
+        choices=["block", "branch_off", "prunable", "var", "vartree"],
     )
     parser.add_argument("--tree_args", type=dict, default=None)
     return parser

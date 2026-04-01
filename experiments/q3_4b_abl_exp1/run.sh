@@ -4,6 +4,7 @@
 #SBATCH --error=outputs/logs/%j.err # where to store error messages
 #SBATCH --mem=96G
 #SBATCH --nodes=1
+#SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:4
 #SBATCH --time=0-24:00:00
@@ -113,7 +114,7 @@ TREE_JSON=$(cat <<TREEEOF
 TREEEOF
 )
 
-uv run -m src.trainer \
+srun uv run -m src.trainer \
     --tree_type prunable --tree_args "$TREE_JSON" \
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
