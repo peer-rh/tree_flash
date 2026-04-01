@@ -15,20 +15,23 @@ class VisualTreeNode:
     token_id: int
     display_token_id: int
     parent_index: int
-    depth: int
     position_id: int
     rank: int
     path_prob: float
     child_indices: tuple[int, ...]
+    source: str
+    main_path_position: int | None = None
+    anchor_index: int | None = None
+    anchor_main_path_position: int | None = None
+    stored_node_index: int | None = None
 
 
 @dataclass(frozen=True)
 class LoadedStage2V2Tree:
     input_path: str
     sequence_index: int
-    anchor_index: int
     record_idx: int
-    anchor_main_path_position: int
+    response_start_position: int
     tokenizer_name_or_path: str
     nodes: tuple[VisualTreeNode, ...]
 
@@ -63,19 +66,10 @@ def _format_token_text(tokenizer, token_id: int) -> str:
     return text.replace(" ", "·").replace("\n", "↵\n").replace("\t", "⇥")
 
 
-def _child_map(parent_indices: list[int]) -> dict[int, list[int]]:
-    children: dict[int, list[int]] = {idx: [] for idx in range(len(parent_indices))}
-    for idx, parent_idx in enumerate(parent_indices):
-        if parent_idx >= 0:
-            children.setdefault(parent_idx, []).append(idx)
-    return children
-
-
 def load_stage2_v2_tree(
     input_path: str | Path,
     *,
     sequence_index: int = 0,
-    anchor_index: int = 0,
     tokenizer_name_or_path: str | None = None,
 ) -> LoadedStage2V2Tree:
     path = Path(input_path)
@@ -88,58 +82,119 @@ def load_stage2_v2_tree(
         if sequence_index < 0 or sequence_index >= num_sequences:
             raise IndexError(f"sequence_index {sequence_index} is out of range for {num_sequences} sequences.")
 
-        seq_anchor_offsets = hf["sequence_anchor_offsets"]
-        anchor_start = int(seq_anchor_offsets[sequence_index])
-        anchor_end = int(seq_anchor_offsets[sequence_index + 1])
-        num_anchors = anchor_end - anchor_start
-        if anchor_index < 0 or anchor_index >= num_anchors:
-            raise IndexError(f"anchor_index {anchor_index} is out of range for {num_anchors} anchors.")
-
-        anchor_table_index = anchor_start + anchor_index
-        anchor_main_path_position = int(hf["anchor_main_path_positions"][anchor_table_index])
-
         main_offsets = hf["main_path_offsets"]
         main_start = int(main_offsets[sequence_index])
         main_end = int(main_offsets[sequence_index + 1])
-        main_path_ids = hf["main_path_ids"][main_start:main_end].tolist()
-        if anchor_main_path_position < 0 or anchor_main_path_position >= len(main_path_ids):
-            raise ValueError(
-                f"anchor_main_path_position {anchor_main_path_position} is out of range for main path length {len(main_path_ids)}."
-            )
+        main_path_ids = [int(value) for value in hf["main_path_ids"][main_start:main_end].tolist()]
+        if not main_path_ids:
+            raise ValueError("Selected sequence has an empty main path.")
 
+        seq_anchor_offsets = hf["sequence_anchor_offsets"]
+        anchor_start = int(seq_anchor_offsets[sequence_index])
+        anchor_end = int(seq_anchor_offsets[sequence_index + 1])
         node_offsets = hf["anchor_node_offsets"]
-        node_start = int(node_offsets[anchor_table_index])
-        node_end = int(node_offsets[anchor_table_index + 1])
-        token_ids = hf["node_token_ids"][node_start:node_end].tolist()
-        parent_indices = hf["node_parent_indices"][node_start:node_end].tolist()
-        depths = hf["node_depths"][node_start:node_end].tolist()
-        path_probs = hf["node_path_probs"][node_start:node_end].tolist()
-        ranks = hf["node_ranks"][node_start:node_end].tolist()
 
-        if not token_ids:
-            raise ValueError("Selected anchor contains no stored nodes.")
+        nodes: list[VisualTreeNode] = []
+        main_node_indices: dict[int, int] = {}
+        child_lists: dict[int, list[int]] = {}
 
-        children = _child_map([int(value) for value in parent_indices])
-        nodes = []
-        anchor_token_id = int(main_path_ids[anchor_main_path_position])
-        for idx, token_id in enumerate(token_ids):
-            parent_index = int(parent_indices[idx])
-            depth = int(depths[idx])
-            rank = int(ranks[idx])
-            path_prob = float(path_probs[idx])
-            child_indices = tuple(children.get(idx, []))
-            display_token_id = anchor_token_id if int(token_id) < 0 else int(token_id)
+        for position_id, token_id in enumerate(main_path_ids):
+            index = len(nodes)
+            main_node_indices[position_id] = index
+            child_lists[index] = []
             nodes.append(
                 VisualTreeNode(
-                    index=idx,
-                    token_id=int(token_id),
-                    display_token_id=display_token_id,
-                    parent_index=parent_index,
-                    depth=depth,
-                    position_id=anchor_main_path_position + depth,
-                    rank=rank,
-                    path_prob=path_prob,
-                    child_indices=child_indices,
+                    index=index,
+                    token_id=token_id,
+                    display_token_id=token_id,
+                    parent_index=index - 1 if index > 0 else -1,
+                    position_id=position_id,
+                    rank=0,
+                    path_prob=1.0,
+                    child_indices=(),
+                    source="main",
+                    main_path_position=position_id,
+                )
+            )
+
+        for idx in range(1, len(nodes)):
+            child_lists[idx - 1].append(idx)
+
+        for anchor_index, anchor_table_index in enumerate(range(anchor_start, anchor_end)):
+            anchor_main_path_position = int(hf["anchor_main_path_positions"][anchor_table_index])
+            if anchor_main_path_position < 0 or anchor_main_path_position >= len(main_path_ids):
+                raise ValueError(
+                    f"anchor_main_path_position {anchor_main_path_position} is out of range for main path length {len(main_path_ids)}."
+                )
+
+            node_start = int(node_offsets[anchor_table_index])
+            node_end = int(node_offsets[anchor_table_index + 1])
+            token_ids = [int(value) for value in hf["node_token_ids"][node_start:node_end].tolist()]
+            parent_indices = [int(value) for value in hf["node_parent_indices"][node_start:node_end].tolist()]
+            depths = [int(value) for value in hf["node_depths"][node_start:node_end].tolist()]
+            path_probs = [float(value) for value in hf["node_path_probs"][node_start:node_end].tolist()]
+            ranks = [int(value) for value in hf["node_ranks"][node_start:node_end].tolist()]
+
+            if not token_ids:
+                continue
+
+            anchor_node_indices: dict[int, int] = {}
+            for stored_node_index in range(1, len(token_ids)):
+                combined_index = len(nodes)
+                anchor_node_indices[stored_node_index] = combined_index
+                child_lists[combined_index] = []
+                parent_index = parent_indices[stored_node_index]
+                if parent_index == 0:
+                    combined_parent_index = main_node_indices[anchor_main_path_position]
+                else:
+                    combined_parent_index = anchor_node_indices[parent_index]
+                nodes.append(
+                    VisualTreeNode(
+                        index=combined_index,
+                        token_id=token_ids[stored_node_index],
+                        display_token_id=token_ids[stored_node_index],
+                        parent_index=combined_parent_index,
+                        position_id=anchor_main_path_position + depths[stored_node_index],
+                        rank=ranks[stored_node_index],
+                        path_prob=path_probs[stored_node_index],
+                        child_indices=(),
+                        source="anchor",
+                        anchor_index=anchor_index,
+                        anchor_main_path_position=anchor_main_path_position,
+                        stored_node_index=stored_node_index,
+                    )
+                )
+                child_lists[combined_parent_index].append(combined_index)
+
+        def child_sort_key(child_index: int) -> tuple[int, int, int, int]:
+            child = nodes[child_index]
+            if child.source == "main":
+                return (0, child.main_path_position or 0, 0, child.index)
+            return (
+                1,
+                child.anchor_main_path_position or 0,
+                child.rank,
+                child.stored_node_index or child.index,
+            )
+
+        updated_nodes = []
+        for node in nodes:
+            children = sorted(child_lists[node.index], key=child_sort_key)
+            updated_nodes.append(
+                VisualTreeNode(
+                    index=node.index,
+                    token_id=node.token_id,
+                    display_token_id=node.display_token_id,
+                    parent_index=node.parent_index,
+                    position_id=node.position_id,
+                    rank=node.rank,
+                    path_prob=node.path_prob,
+                    child_indices=tuple(children),
+                    source=node.source,
+                    main_path_position=node.main_path_position,
+                    anchor_index=node.anchor_index,
+                    anchor_main_path_position=node.anchor_main_path_position,
+                    stored_node_index=node.stored_node_index,
                 )
             )
 
@@ -150,46 +205,34 @@ def load_stage2_v2_tree(
         return LoadedStage2V2Tree(
             input_path=str(path),
             sequence_index=sequence_index,
-            anchor_index=anchor_index,
             record_idx=int(hf["record_idx"][sequence_index]),
-            anchor_main_path_position=anchor_main_path_position,
+            response_start_position=int(hf["response_start_positions"][sequence_index]),
             tokenizer_name_or_path=resolved_tokenizer,
-            nodes=tuple(nodes),
+            nodes=tuple(updated_nodes),
         )
 
 
-def _sorted_child_indices(nodes: tuple[VisualTreeNode, ...]) -> dict[int, list[int]]:
-    ordered: dict[int, list[int]] = {}
-    for node in nodes:
-        children = list(node.child_indices)
-        children.sort(key=lambda idx: (nodes[idx].rank, idx))
-        ordered[node.index] = children
-    return ordered
-
-
 def _assign_x_slots(nodes: tuple[VisualTreeNode, ...]) -> dict[int, float]:
-    sorted_children = _sorted_child_indices(nodes)
     root_candidates = [node.index for node in nodes if node.parent_index < 0]
     if len(root_candidates) != 1:
         raise ValueError(f"Expected exactly one root node, found {len(root_candidates)}.")
-    root_idx = root_candidates[0]
 
     x_slots: dict[int, float] = {}
     next_leaf_slot = 0
 
-    def visit(node_idx: int) -> float:
+    def visit(node_index: int) -> float:
         nonlocal next_leaf_slot
-        children = sorted_children[node_idx]
+        children = list(nodes[node_index].child_indices)
         if not children:
             slot = float(next_leaf_slot)
             next_leaf_slot += 1
         else:
-            child_slots = [visit(child_idx) for child_idx in children]
+            child_slots = [visit(child_index) for child_index in children]
             slot = sum(child_slots) / len(child_slots)
-        x_slots[node_idx] = slot
+        x_slots[node_index] = slot
         return slot
 
-    visit(root_idx)
+    visit(root_candidates[0])
     return x_slots
 
 
@@ -199,7 +242,9 @@ def _rank_color(rank: int) -> str:
     return RANK_COLORS[(rank - 1) % len(RANK_COLORS)]
 
 
-def _probability_opacity(path_prob: float) -> float:
+def _probability_opacity(path_prob: float, *, source: str) -> float:
+    if source == "main":
+        return 0.95
     clamped = min(max(float(path_prob), 0.0), 1.0)
     return 0.2 + 0.75 * (clamped ** 0.5)
 
@@ -208,6 +253,9 @@ def render_stage2_v2_tree_html(tree: LoadedStage2V2Tree, tokenizer) -> str:
     x_slots = _assign_x_slots(tree.nodes)
     min_position_id = min(node.position_id for node in tree.nodes)
     max_position_id = max(node.position_id for node in tree.nodes)
+    num_anchor_nodes = sum(1 for node in tree.nodes if node.source == "anchor")
+    num_main_nodes = sum(1 for node in tree.nodes if node.source == "main")
+    num_anchors = len({node.anchor_index for node in tree.nodes if node.anchor_index is not None})
 
     node_width = 152
     node_height = 38
@@ -228,7 +276,7 @@ def render_stage2_v2_tree_html(tree: LoadedStage2V2Tree, tokenizer) -> str:
                 "y_top": y_top,
                 "token_text": token_text,
                 "fill": _rank_color(node.rank),
-                "opacity": _probability_opacity(node.path_prob),
+                "opacity": _probability_opacity(node.path_prob, source=node.source),
             }
         )
 
@@ -261,19 +309,24 @@ def render_stage2_v2_tree_html(tree: LoadedStage2V2Tree, tokenizer) -> str:
                 [
                     f"node_index: {node.index}",
                     f"token_id: {node.token_id}",
-                    f"display_token_id: {node.display_token_id}",
                     f"rank: {node.rank}",
                     f"path_prob: {node.path_prob:.6f}",
                     f"position_id: {node.position_id}",
-                    f"depth: {node.depth}",
+                    f"source: {node.source}",
                     f"parent_index: {node.parent_index}",
+                    (
+                        f"anchor_index: {node.anchor_index}"
+                        if node.anchor_index is not None
+                        else f"main_path_position: {node.main_path_position}"
+                    ),
                 ]
             )
         )
         node_parts.append(
             (
-                f'<g class="tree-node rank-{node.rank}" data-node-index="{node.index}" '
-                f'data-rank="{node.rank}" data-prob="{node.path_prob:.6f}" data-position-id="{node.position_id}">'
+                f'<g class="tree-node {node.source}-node rank-{node.rank}" data-node-index="{node.index}" '
+                f'data-source="{node.source}" data-rank="{node.rank}" data-prob="{node.path_prob:.6f}" '
+                f'data-position-id="{node.position_id}">'
                 f"<title>{tooltip}</title>"
                 f'<rect x="{x_center - node_width / 2:.1f}" y="{y_top:.1f}" '
                 f'width="{node_width}" height="{node_height}" rx="12" ry="12" '
@@ -289,10 +342,12 @@ def render_stage2_v2_tree_html(tree: LoadedStage2V2Tree, tokenizer) -> str:
     metadata_items = [
         ("Input", tree.input_path),
         ("Sequence", str(tree.sequence_index)),
-        ("Anchor", str(tree.anchor_index)),
         ("Record", str(tree.record_idx)),
-        ("Anchor Position", str(tree.anchor_main_path_position)),
+        ("Response Start", str(tree.response_start_position)),
         ("Tokenizer", tree.tokenizer_name_or_path),
+        ("Main Nodes", str(num_main_nodes)),
+        ("Anchor Nodes", str(num_anchor_nodes)),
+        ("Anchors", str(num_anchors)),
     ]
     metadata_html = "".join(
         f'<li><span class="meta-label">{html.escape(label)}:</span> {html.escape(value)}</li>'
@@ -303,7 +358,7 @@ def render_stage2_v2_tree_html(tree: LoadedStage2V2Tree, tokenizer) -> str:
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Stage 2 v2 Tree</title>
+  <title>Stage 2 v2 Sequence Tree</title>
   <style>
     :root {{
       color-scheme: light;
@@ -337,7 +392,7 @@ def render_stage2_v2_tree_html(tree: LoadedStage2V2Tree, tokenizer) -> str:
       padding: 0;
       list-style: none;
       display: grid;
-      grid-template-columns: repeat(3, minmax(180px, auto));
+      grid-template-columns: repeat(4, minmax(160px, auto));
       gap: 6px 18px;
       font-size: 13px;
     }}
@@ -362,9 +417,9 @@ def render_stage2_v2_tree_html(tree: LoadedStage2V2Tree, tokenizer) -> str:
 </head>
 <body>
   <div class="panel">
-    <h1>Stage 2 v2 Tree</h1>
+    <h1>Stage 2 v2 Sequence Tree</h1>
     <ul class="meta">{metadata_html}</ul>
-    <p class="note">Synthetic root nodes display the anchor token as their visible label; exact stored ids remain in the node tooltip.</p>
+    <p class="note">The full sequence backbone is rendered together with every anchor subtree. Y position is the sequence position id.</p>
     <svg xmlns="http://www.w3.org/2000/svg" width="{svg_width}" height="{svg_height}" viewBox="0 0 {svg_width} {svg_height}">
       {''.join(edge_parts)}
       {''.join(node_parts)}
@@ -380,13 +435,11 @@ def write_stage2_v2_tree_html(
     output_path: str | Path,
     *,
     sequence_index: int = 0,
-    anchor_index: int = 0,
     tokenizer_name_or_path: str | None = None,
 ) -> Path:
     tree = load_stage2_v2_tree(
         input_path,
         sequence_index=sequence_index,
-        anchor_index=anchor_index,
         tokenizer_name_or_path=tokenizer_name_or_path,
     )
     tokenizer = AutoTokenizer.from_pretrained(tree.tokenizer_name_or_path)
@@ -398,10 +451,9 @@ def write_stage2_v2_tree_html(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Render a raw Stage 2 v2 anchor tree as standalone HTML.")
+    parser = argparse.ArgumentParser(description="Render a raw Stage 2 v2 sequence tree as standalone HTML.")
     parser.add_argument("--input", required=True, help="Path to a Stage 2 v2 HDF5 file.")
     parser.add_argument("--sequence-index", type=int, default=0, help="Zero-based sequence index.")
-    parser.add_argument("--anchor-index", type=int, default=0, help="Zero-based anchor index within the sequence.")
     parser.add_argument("--output", required=True, help="Output HTML path.")
     parser.add_argument(
         "--tokenizer",
@@ -418,10 +470,9 @@ def main() -> None:
         args.input,
         args.output,
         sequence_index=args.sequence_index,
-        anchor_index=args.anchor_index,
         tokenizer_name_or_path=args.tokenizer,
     )
-    print(f"Wrote Stage 2 v2 tree visualization to {output_path}")
+    print(f"Wrote Stage 2 v2 sequence tree visualization to {output_path}")
 
 
 if __name__ == "__main__":

@@ -84,6 +84,45 @@ def _write_visualizer_fixture(path: Path) -> None:
                     ),
                 ],
             ),
+            GeneratedAnchorTree(
+                anchor_main_path_position=3,
+                anchor_next_token_prob=0.5,
+                nodes=[
+                    SequenceTreeNode(
+                        token_id=-1,
+                        parent_index=-1,
+                        depth=0,
+                        local_prob=1.0,
+                        path_prob=1.0,
+                        rank=0,
+                        main_path_position=-1,
+                        is_main_path=False,
+                        child_indices=[1, 2],
+                    ),
+                    SequenceTreeNode(
+                        token_id=23,
+                        parent_index=0,
+                        depth=1,
+                        local_prob=0.8,
+                        path_prob=0.8,
+                        rank=1,
+                        main_path_position=4,
+                        is_main_path=True,
+                        child_indices=[-1, 0],
+                    ),
+                    SequenceTreeNode(
+                        token_id=44,
+                        parent_index=0,
+                        depth=1,
+                        local_prob=0.2,
+                        path_prob=0.2,
+                        rank=2,
+                        main_path_position=-1,
+                        is_main_path=False,
+                        child_indices=[-1, 0],
+                    ),
+                ],
+            ),
         ],
     )
     with h5py.File(path, "w") as hf:
@@ -99,23 +138,28 @@ def _write_visualizer_fixture(path: Path) -> None:
         )
 
 
-def test_load_stage2_v2_tree_extracts_positions_and_probs(tmp_path: Path) -> None:
+def test_load_stage2_v2_tree_includes_backbone_and_all_anchor_nodes(tmp_path: Path) -> None:
     fixture_path = tmp_path / "stage2_v2_visualizer.h5"
     _write_visualizer_fixture(fixture_path)
 
-    tree = vis_mod.load_stage2_v2_tree(fixture_path, sequence_index=0, anchor_index=0)
+    tree = vis_mod.load_stage2_v2_tree(fixture_path, sequence_index=0)
 
     assert tree.record_idx == 7
-    assert tree.anchor_main_path_position == 2
+    assert tree.response_start_position == 2
     assert tree.tokenizer_name_or_path == "fake-tokenizer"
-    assert [node.parent_index for node in tree.nodes] == [-1, 0, 0, 1]
-    assert [node.position_id for node in tree.nodes] == [2, 3, 3, 4]
-    assert [node.rank for node in tree.nodes] == [0, 1, 2, 1]
-    assert [node.display_token_id for node in tree.nodes] == [21, 22, 31, 23]
-    assert [node.path_prob for node in tree.nodes] == pytest.approx([1.0, 0.6, 0.4, 0.42], rel=1e-6)
+    assert len(tree.nodes) == 10
+    assert sum(1 for node in tree.nodes if node.source == "main") == 5
+    assert sum(1 for node in tree.nodes if node.source == "anchor") == 5
+    assert [node.position_id for node in tree.nodes[:5]] == [0, 1, 2, 3, 4]
+    assert [node.token_id for node in tree.nodes[:5]] == [11, 12, 21, 22, 23]
+    assert [node.parent_index for node in tree.nodes[:5]] == [-1, 0, 1, 2, 3]
+    assert [node.token_id for node in tree.nodes[5:]] == [22, 31, 23, 23, 44]
+    assert [node.position_id for node in tree.nodes[5:]] == [3, 3, 4, 4, 4]
+    assert [node.rank for node in tree.nodes[5:]] == [1, 2, 1, 1, 2]
+    assert [node.path_prob for node in tree.nodes[5:]] == pytest.approx([0.6, 0.4, 0.42, 0.8, 0.2], rel=1e-6)
 
 
-def test_render_stage2_v2_tree_html_contains_metadata_and_token_labels(tmp_path: Path, monkeypatch) -> None:
+def test_render_stage2_v2_tree_html_contains_main_path_and_branch_tokens(tmp_path: Path, monkeypatch) -> None:
     fixture_path = tmp_path / "stage2_v2_visualizer.h5"
     _write_visualizer_fixture(fixture_path)
 
@@ -138,17 +182,21 @@ def test_render_stage2_v2_tree_html_contains_metadata_and_token_labels(tmp_path:
     monkeypatch.setattr(vis_mod, "AutoTokenizer", FakeTokenizer)
 
     output_path = tmp_path / "tree.html"
-    written = vis_mod.write_stage2_v2_tree_html(fixture_path, output_path, sequence_index=0, anchor_index=0)
+    written = vis_mod.write_stage2_v2_tree_html(fixture_path, output_path, sequence_index=0)
 
     assert written == output_path
     html_text = output_path.read_text(encoding="utf-8")
-    assert "Stage 2 v2 Tree" in html_text
+    assert "Stage 2 v2 Sequence Tree" in html_text
     assert str(fixture_path) in html_text
     assert "fake-tokenizer" in html_text
-    assert 'data-rank="1"' in html_text
+    assert "Main Nodes" in html_text
+    assert "Anchor Nodes" in html_text
+    assert "Anchors" in html_text
+    assert 'data-source="main"' in html_text
+    assert 'data-source="anchor"' in html_text
     assert 'data-position-id="4"' in html_text
-    assert 'data-prob="0.420000"' in html_text
+    assert 'data-prob="0.800000"' in html_text
+    assert "tok11" in html_text
     assert "tok21" in html_text
-    assert "tok22" in html_text
     assert "tok31" in html_text
-    assert "token_id: -1" in html_text
+    assert "tok44" in html_text
