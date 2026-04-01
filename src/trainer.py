@@ -72,10 +72,22 @@ def unwrap_model(module):
         ``_orig_mod`` are peeled off when present.
     """
     raw = module
-    if hasattr(raw, "_forward_module"):
-        raw = raw._forward_module
-    if hasattr(raw, "_orig_mod"):
-        raw = raw._orig_mod
+    seen_ids: set[int] = set()
+    while True:
+        raw_id = id(raw)
+        if raw_id in seen_ids:
+            break
+        seen_ids.add(raw_id)
+
+        next_raw = None
+        for attr in ("_forward_module", "module", "_orig_mod"):
+            candidate = getattr(raw, attr, None)
+            if candidate is not None:
+                next_raw = candidate
+                break
+        if next_raw is None:
+            break
+        raw = next_raw
     return raw
 
 
