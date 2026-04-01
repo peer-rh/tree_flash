@@ -14,7 +14,8 @@ The core idea is:
    - the synthetic root corresponds to "continue from main-path position t"
    - the true next token on the main path is always stored
    - additional children are stored in descending probability order until the
-     retained local child mass reaches ``child_coverage_alpha``
+     retained local child mass reaches ``child_coverage_alpha`` or
+     ``max_children_per_node`` children have been written
    - the next node to expand is chosen by highest cumulative ``path_prob``,
      i.e. the probability of reaching that node by a random walk from the
      anchor root
@@ -366,6 +367,7 @@ def _select_children_for_storage(
     sorted_token_probs: torch.Tensor,
     coverage_alpha: float,
     forced_child: tuple[int, int] | None,
+    max_children_per_parent: int,
 ) -> list[tuple[int, float, int, bool, int]]:
     """Choose which children of a parent should be written to the tree.
 
@@ -375,11 +377,17 @@ def _select_children_for_storage(
        node.
     2. Walk the verifier candidates in descending probability order and keep
        adding unseen children until the retained local child mass reaches
-       ``coverage_alpha``.
+       ``coverage_alpha`` or ``max_children_per_parent`` children have been
+       stored.
 
     The returned tuples contain:
       ``(token_id, local_prob, rank, is_main_path, main_path_position)``.
     """
+
+    if max_children_per_parent <= 0:
+        raise ValueError(
+            f"max_children_per_parent must be positive, got {max_children_per_parent}."
+        )
 
     selected: list[tuple[int, float, int, bool, int]] = []
     selected_ids: set[int] = set()
@@ -403,6 +411,8 @@ def _select_children_for_storage(
         )
         selected_ids.add(int(forced_token_id))
         cumulative_prob += float(forced_prob)
+        if len(selected) >= max_children_per_parent:
+            return selected
 
     for rank_idx, token_id in enumerate(sorted_token_ids.tolist(), start=1):
         token_id = int(token_id)
@@ -412,7 +422,7 @@ def _select_children_for_storage(
         selected.append((token_id, prob, rank_idx, False, IGNORE_IDX))
         selected_ids.add(token_id)
         cumulative_prob += prob
-        if cumulative_prob >= float(coverage_alpha):
+        if len(selected) >= max_children_per_parent or cumulative_prob >= float(coverage_alpha):
             break
 
     if not selected and sorted_token_ids.numel() > 0:
@@ -435,6 +445,7 @@ def _append_children_to_tree(
     sorted_token_ids: torch.Tensor,
     sorted_token_probs: torch.Tensor,
     child_coverage_alpha: float,
+    max_children_per_parent: int,
 ) -> None:
     """Materialize one parent's selected children and queue them for expansion.
 
@@ -449,6 +460,7 @@ def _append_children_to_tree(
         sorted_token_probs=sorted_token_probs,
         coverage_alpha=child_coverage_alpha,
         forced_child=forced_child,
+        max_children_per_parent=max_children_per_parent,
     )
 
     parent_path_prob = state.nodes[parent_idx].path_prob
@@ -518,6 +530,7 @@ def build_anchor_tree_from_candidate_provider(
     root_sorted_token_ids: Sequence[int],
     root_sorted_token_probs: Sequence[float],
     candidate_provider: Callable[[SequenceTreeNode], tuple[Sequence[int], Sequence[float]]],
+    max_children_per_parent: int = 8,
 ) -> GeneratedAnchorTree:
     """Pure helper used by tests to exercise the branching policy.
 
@@ -538,6 +551,7 @@ def build_anchor_tree_from_candidate_provider(
         sorted_token_ids=torch.as_tensor(root_sorted_token_ids, dtype=torch.long),
         sorted_token_probs=torch.as_tensor(root_sorted_token_probs, dtype=torch.float32),
         child_coverage_alpha=child_coverage_alpha,
+        max_children_per_parent=max_children_per_parent,
     )
     while state.frontier and state.expanded_token_nodes < num_attend_tokens_per_anchor:
         _, _, node_idx = heapq.heappop(state.frontier)
@@ -553,6 +567,7 @@ def build_anchor_tree_from_candidate_provider(
             sorted_token_ids=torch.as_tensor(child_token_ids, dtype=torch.long),
             sorted_token_probs=torch.as_tensor(child_probs, dtype=torch.float32),
             child_coverage_alpha=child_coverage_alpha,
+            max_children_per_parent=max_children_per_parent,
         )
     return finalize_anchor_tree(state)
 
@@ -590,7 +605,6 @@ def _build_dynamic_flex_block_mask(
 
     def mask_mod(b, h, q_idx, kv_idx):
         q_valid = query_valid_mask[b, q_idx]
-        invalid_self = (~q_valid) & (kv_idx == (ctx_len + q_idx))
 
         in_ctx = kv_idx < ctx_len
         ctx_idx = kv_idx.clamp(0, ctx_clamp_max)
@@ -606,7 +620,7 @@ def _build_dynamic_flex_block_mask(
             & tree_key_valid_mask[b, tree_idx]
             & tree_can_attend[b, q_idx, tree_idx]
         )
-        return invalid_self | ctx_ok | tree_ok
+        return ctx_ok | tree_ok
 
     return create_block_mask(
         mask_mod,
@@ -792,117 +806,182 @@ def _ancestor_node_indices(state: AnchorTreeState, node_idx: int) -> set[int]:
     return ancestors
 
 
-@torch.inference_mode()
-def _generate_sequence_trees_with_verifier(
+def _dummy_anchor_position_for_row(
+    *,
+    valid_tokens_row: torch.Tensor,
+    preferred_anchor_positions: Sequence[int],
+) -> int:
+    """Pick an in-range fallback position for dummy batch slots."""
+
+    row_len = int(valid_tokens_row.numel())
+    if row_len <= 0:
+        return 0
+    for position in preferred_anchor_positions:
+        position = int(position)
+        if 0 <= position < row_len:
+            return position
+    valid_positions = torch.nonzero(valid_tokens_row, as_tuple=False).squeeze(-1)
+    if valid_positions.numel() > 0:
+        return int(valid_positions[0].item())
+    return 0
+
+
+def _generate_sequence_trees_with_verifier_batch(
     *,
     model,
     runtime: Stage2V2Runtime | None,
     input_ids: torch.Tensor,
     valid_tokens: torch.Tensor,
     document_mask: torch.Tensor,
-    main_path_ids: Sequence[int],
-    response_start_position: int,
-    anchor_positions: list[int],
-    anchor_next_token_probs: list[float],
+    main_path_ids_per_row: Sequence[Sequence[int]],
+    response_start_positions: Sequence[int],
+    anchor_positions_per_row: Sequence[list[int]],
+    anchor_next_token_probs_per_row: Sequence[list[float]],
     hidden_states: torch.Tensor,
     kv_cache,
     logit_chunk_size: int,
     num_attend_tokens_per_anchor: int,
     child_coverage_alpha: float,
+    max_children_per_node: int,
     profile: dict[str, float] | None = None,
-) -> list[GeneratedAnchorTree]:
-    """Grow all anchor-local trees for a single sequence using the verifier.
+) -> list[list[GeneratedAnchorTree]]:
+    """Grow anchor-local trees for a padded batch of sequences."""
 
-    The algorithm is:
-
-    1. Score each anchor root from the main-path hidden state.
-    2. Insert the root's forced main-path child plus enough alternative children
-       to reach ``child_coverage_alpha`` local mass.
-    3. Repeatedly pop the frontier node with highest ``path_prob`` from each
-       anchor tree, batch those nodes together, score them with the verifier,
-       and append their children.
-    4. Stop expanding an anchor once it has expanded
-       ``num_attend_tokens_per_anchor`` token nodes.
-    """
-
-    if not anchor_positions:
-        return []
+    batch_size = int(input_ids.shape[0])
+    if not (
+        len(main_path_ids_per_row)
+        == len(response_start_positions)
+        == len(anchor_positions_per_row)
+        == len(anchor_next_token_probs_per_row)
+        == batch_size
+    ):
+        raise ValueError("Per-row Stage 2 v2 metadata must match the input batch size.")
 
     device = input_ids.device
     lm_head = model.get_output_embeddings()
     if lm_head is None:
         raise ValueError("Model must expose output embeddings via get_output_embeddings().")
-    main_path_ids = [int(token_id) for token_id in main_path_ids]
-    root_hidden_states = hidden_states.index_select(
-        1,
-        torch.as_tensor(anchor_positions, dtype=torch.long, device=device),
-    ).squeeze(0)
-    root_sorted_ids, root_sorted_probs = _score_hidden_states_with_candidates(
-        root_hidden_states,
-        lm_head,
-        logit_chunk_size=logit_chunk_size,
-        profile=profile,
-    )
 
-    states = [
-        _empty_anchor_tree(
-            anchor_main_path_position=anchor_position,
-            anchor_next_token_prob=anchor_prob,
-            main_path_ids=main_path_ids,
-            response_start_position=response_start_position,
+    states_per_row: list[list[AnchorTreeState]] = []
+    root_row_indices: list[int] = []
+    root_anchor_positions: list[int] = []
+    root_targets: list[tuple[int, int]] = []
+    for row_idx, (main_path_ids_row, response_start_position, anchor_positions, anchor_probs) in enumerate(
+        zip(
+            main_path_ids_per_row,
+            response_start_positions,
+            anchor_positions_per_row,
+            anchor_next_token_probs_per_row,
+            strict=True,
         )
-        for anchor_position, anchor_prob in zip(anchor_positions, anchor_next_token_probs, strict=True)
-    ]
-    for tree_id, state in enumerate(states):
-        _append_children_to_tree(
-            state,
-            parent_idx=0,
-            sorted_token_ids=root_sorted_ids[tree_id],
-            sorted_token_probs=root_sorted_probs[tree_id],
-            child_coverage_alpha=child_coverage_alpha,
-        )
+    ):
+        row_states = [
+            _empty_anchor_tree(
+                anchor_main_path_position=anchor_position,
+                anchor_next_token_prob=anchor_prob,
+                main_path_ids=[int(token_id) for token_id in main_path_ids_row],
+                response_start_position=response_start_position,
+            )
+            for anchor_position, anchor_prob in zip(anchor_positions, anchor_probs, strict=True)
+        ]
+        states_per_row.append(row_states)
+        for tree_id, anchor_position in enumerate(anchor_positions):
+            root_row_indices.append(row_idx)
+            root_anchor_positions.append(int(anchor_position))
+            root_targets.append((row_idx, tree_id))
 
-    cached_tree_meta: list[tuple[int, int]] = []
+    if root_targets:
+        root_hidden_states = hidden_states[
+            torch.as_tensor(root_row_indices, dtype=torch.long, device=device),
+            torch.as_tensor(root_anchor_positions, dtype=torch.long, device=device),
+        ]
+        root_sorted_ids, root_sorted_probs = _score_hidden_states_with_candidates(
+            root_hidden_states,
+            lm_head,
+            logit_chunk_size=logit_chunk_size,
+            profile=profile,
+        )
+        for root_idx, (row_idx, tree_id) in enumerate(root_targets):
+            _append_children_to_tree(
+                states_per_row[row_idx][tree_id],
+                parent_idx=0,
+                sorted_token_ids=root_sorted_ids[root_idx],
+                sorted_token_probs=root_sorted_probs[root_idx],
+                child_coverage_alpha=child_coverage_alpha,
+                max_children_per_parent=max_children_per_node,
+            )
+
+    cached_tree_meta: list[list[tuple[int, int] | None]] = [[] for _ in range(batch_size)]
+    cached_slot_count = 0
     use_flex = getattr(getattr(model, "config", None), "_attn_implementation", None) == "flex_attention"
     base_model_forward = runtime.base_model_forward if runtime is not None else model.base_model
 
     while True:
-        selected: list[tuple[int, int]] = []
-        for tree_id, state in enumerate(states):
-            if state.expanded_token_nodes >= num_attend_tokens_per_anchor:
-                continue
-            while state.frontier:
-                _, _, node_idx = heapq.heappop(state.frontier)
-                if not state.nodes[node_idx].expanded:
-                    selected.append((tree_id, node_idx))
-                    break
-        if not selected:
+        selected_per_row: list[list[tuple[int, int]]] = []
+        for row_states in states_per_row:
+            row_selected: list[tuple[int, int]] = []
+            for tree_id, state in enumerate(row_states):
+                if state.expanded_token_nodes >= num_attend_tokens_per_anchor:
+                    continue
+                while state.frontier:
+                    _, _, node_idx = heapq.heappop(state.frontier)
+                    if not state.nodes[node_idx].expanded:
+                        row_selected.append((tree_id, node_idx))
+                        break
+            selected_per_row.append(row_selected)
+
+        q_count = max((len(row_selected) for row_selected in selected_per_row), default=0)
+        if q_count == 0:
             break
 
-        # Batch one frontier expansion step across all currently selected anchor
-        # trees. Each query corresponds to exactly one tree node that is about to
-        # be expanded.
-        q_count = len(selected)
-        query_ids = torch.empty((1, q_count), dtype=torch.long, device=device)
-        query_positions = torch.empty((1, q_count), dtype=torch.long, device=device)
-        query_anchor_positions = torch.empty((1, q_count), dtype=torch.long, device=device)
-        query_valid_mask = torch.ones((1, q_count), dtype=torch.bool, device=device)
+        total_tree_keys = cached_slot_count + q_count
+        query_ids = torch.zeros((batch_size, q_count), dtype=torch.long, device=device)
+        query_positions = torch.zeros((batch_size, q_count), dtype=torch.long, device=device)
+        query_anchor_positions = torch.zeros((batch_size, q_count), dtype=torch.long, device=device)
+        query_valid_mask = torch.zeros((batch_size, q_count), dtype=torch.bool, device=device)
+        tree_can_attend = torch.zeros((batch_size, q_count, total_tree_keys), dtype=torch.bool, device=device)
+        tree_key_valid_mask = torch.zeros((batch_size, total_tree_keys), dtype=torch.bool, device=device)
 
-        total_tree_keys = len(cached_tree_meta) + q_count
-        tree_can_attend = torch.zeros((1, q_count, total_tree_keys), dtype=torch.bool, device=device)
-        tree_key_valid_mask = torch.ones((1, total_tree_keys), dtype=torch.bool, device=device)
+        for row_idx, row_selected in enumerate(selected_per_row):
+            fallback_anchor_position = _dummy_anchor_position_for_row(
+                valid_tokens_row=valid_tokens[row_idx],
+                preferred_anchor_positions=(
+                    anchor_positions_per_row[row_idx]
+                    or [response_start_positions[row_idx]]
+                ),
+            )
+            fallback_token_id = int(input_ids[row_idx, fallback_anchor_position].item())
 
-        for query_idx, (tree_id, node_idx) in enumerate(selected):
-            state = states[tree_id]
-            node = state.nodes[node_idx]
-            query_ids[0, query_idx] = node.token_id
-            query_positions[0, query_idx] = state.anchor_main_path_position + node.depth
-            query_anchor_positions[0, query_idx] = state.anchor_main_path_position
-            ancestors = _ancestor_node_indices(state, node_idx)
-            for key_idx, (cached_tree_id, cached_node_idx) in enumerate(cached_tree_meta):
-                if cached_tree_id == tree_id and cached_node_idx in ancestors:
-                    tree_can_attend[0, query_idx, key_idx] = True
-            tree_can_attend[0, query_idx, len(cached_tree_meta) + query_idx] = True
+            for key_idx, cached_meta in enumerate(cached_tree_meta[row_idx]):
+                if cached_meta is not None:
+                    tree_key_valid_mask[row_idx, key_idx] = True
+
+            for query_idx in range(q_count):
+                query_ids[row_idx, query_idx] = fallback_token_id
+                query_positions[row_idx, query_idx] = fallback_anchor_position
+                query_anchor_positions[row_idx, query_idx] = fallback_anchor_position
+                if query_idx >= len(row_selected):
+                    continue
+
+                tree_id, node_idx = row_selected[query_idx]
+                state = states_per_row[row_idx][tree_id]
+                node = state.nodes[node_idx]
+                query_valid_mask[row_idx, query_idx] = True
+                query_ids[row_idx, query_idx] = int(node.token_id)
+                query_positions[row_idx, query_idx] = int(state.anchor_main_path_position + node.depth)
+                query_anchor_positions[row_idx, query_idx] = int(state.anchor_main_path_position)
+
+                ancestors = _ancestor_node_indices(state, node_idx)
+                for key_idx, cached_meta in enumerate(cached_tree_meta[row_idx]):
+                    if cached_meta is None:
+                        continue
+                    cached_tree_id, cached_node_idx = cached_meta
+                    if cached_tree_id == tree_id and cached_node_idx in ancestors:
+                        tree_can_attend[row_idx, query_idx, key_idx] = True
+
+                current_key_idx = cached_slot_count + query_idx
+                tree_can_attend[row_idx, query_idx, current_key_idx] = True
+                tree_key_valid_mask[row_idx, current_key_idx] = True
 
         mask_start = time.perf_counter()
         attention_mask = _build_single_sequence_attention_mask(
@@ -928,27 +1007,81 @@ def _generate_sequence_trees_with_verifier(
             use_cache=True,
         )
         new_hidden_states, kv_cache = _extract_hidden_and_cache(base_out)
+        real_hidden_states = new_hidden_states[query_valid_mask]
         child_sorted_ids, child_sorted_probs = _score_hidden_states_with_candidates(
-            new_hidden_states.squeeze(0),
+            real_hidden_states,
             lm_head,
             logit_chunk_size=logit_chunk_size,
             profile=profile,
         )
 
-        for query_idx, (tree_id, node_idx) in enumerate(selected):
-            state = states[tree_id]
-            state.nodes[node_idx].expanded = True
-            state.expanded_token_nodes += 1
-            _append_children_to_tree(
-                state,
-                parent_idx=node_idx,
-                sorted_token_ids=child_sorted_ids[query_idx],
-                sorted_token_probs=child_sorted_probs[query_idx],
-                child_coverage_alpha=child_coverage_alpha,
-            )
-            cached_tree_meta.append((tree_id, node_idx))
+        real_query_idx = 0
+        for row_idx, row_selected in enumerate(selected_per_row):
+            cache_step_entries: list[tuple[int, int] | None] = []
+            for query_idx in range(q_count):
+                if query_idx >= len(row_selected):
+                    cache_step_entries.append(None)
+                    continue
 
-    return [finalize_anchor_tree(state) for state in states]
+                tree_id, node_idx = row_selected[query_idx]
+                state = states_per_row[row_idx][tree_id]
+                state.nodes[node_idx].expanded = True
+                state.expanded_token_nodes += 1
+                _append_children_to_tree(
+                    state,
+                    parent_idx=node_idx,
+                    sorted_token_ids=child_sorted_ids[real_query_idx],
+                    sorted_token_probs=child_sorted_probs[real_query_idx],
+                    child_coverage_alpha=child_coverage_alpha,
+                    max_children_per_parent=max_children_per_node,
+                )
+                real_query_idx += 1
+                cache_step_entries.append((tree_id, node_idx))
+            cached_tree_meta[row_idx].extend(cache_step_entries)
+        cached_slot_count += q_count
+
+    return [[finalize_anchor_tree(state) for state in row_states] for row_states in states_per_row]
+
+
+def _generate_sequence_trees_with_verifier(
+    *,
+    model,
+    runtime: Stage2V2Runtime | None,
+    input_ids: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    document_mask: torch.Tensor,
+    main_path_ids: Sequence[int],
+    response_start_position: int,
+    anchor_positions: list[int],
+    anchor_next_token_probs: list[float],
+    hidden_states: torch.Tensor,
+    kv_cache,
+    logit_chunk_size: int,
+    num_attend_tokens_per_anchor: int,
+    child_coverage_alpha: float,
+    max_children_per_node: int = 8,
+    profile: dict[str, float] | None = None,
+) -> list[GeneratedAnchorTree]:
+    """Backward-compatible single-sequence wrapper over the batched generator."""
+
+    return _generate_sequence_trees_with_verifier_batch(
+        model=model,
+        runtime=runtime,
+        input_ids=input_ids,
+        valid_tokens=valid_tokens,
+        document_mask=document_mask,
+        main_path_ids_per_row=[main_path_ids],
+        response_start_positions=[response_start_position],
+        anchor_positions_per_row=[anchor_positions],
+        anchor_next_token_probs_per_row=[anchor_next_token_probs],
+        hidden_states=hidden_states,
+        kv_cache=kv_cache,
+        logit_chunk_size=logit_chunk_size,
+        num_attend_tokens_per_anchor=num_attend_tokens_per_anchor,
+        child_coverage_alpha=child_coverage_alpha,
+        max_children_per_node=max_children_per_node,
+        profile=profile,
+    )[0]
 
 
 def initialize_stage2_v2_hdf5(
@@ -1289,6 +1422,118 @@ def merge_stage2_v2_parts(
     return n_sequences_written, n_main_written, n_anchor_written, n_node_written
 
 
+def _generate_sequences_for_pending_batch(
+    *,
+    pending: Sequence[tuple[int, list[int], list[int]]],
+    model,
+    runtime: Stage2V2Runtime | None,
+    pad_token_id: int,
+    device: torch.device,
+    alpha: float,
+    max_anchors_per_sequence: int,
+    logit_chunk_size: int,
+    num_attend_tokens_per_anchor: int,
+    child_coverage_alpha: float,
+    max_children_per_node: int,
+    profile: dict[str, float] | None = None,
+) -> list[GeneratedSequenceTree]:
+    """Generate Stage 2 v2 sequence trees for one padded pending batch."""
+
+    if not pending:
+        return []
+
+    build_batch_start = time.perf_counter()
+    batch = build_batch(
+        [(prompt_ids, response_ids) for _, prompt_ids, response_ids in pending],
+        pad_token_id,
+        device,
+    )
+    _accumulate_profile(profile, "build_batch_s", build_batch_start)
+
+    input_ids = batch["input_ids"]
+    valid_tokens = batch["document_mask"] >= 0
+    is_response = batch["is_response"]
+    document_mask = batch["document_mask"]
+
+    base_model_forward = runtime.base_model_forward if runtime is not None else model.base_model
+    base_out = _run_base_model_forward(
+        base_model_forward,
+        profile=profile,
+        profile_key="initial_forward_s",
+        input_ids=input_ids,
+        attention_mask=valid_tokens.long(),
+        use_cache=True,
+    )
+    hidden_states, kv_cache = _extract_hidden_and_cache(base_out)
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        raise ValueError("Model must expose output embeddings via get_output_embeddings().")
+    next_token_probs = _compute_next_token_stats(
+        hidden_states=hidden_states,
+        input_ids=input_ids,
+        valid_tokens=valid_tokens,
+        lm_head=lm_head,
+        logit_chunk_size=logit_chunk_size,
+        profile=profile,
+    )
+
+    main_path_ids_per_row: list[list[int]] = []
+    response_start_positions: list[int] = []
+    anchor_positions_per_row: list[list[int]] = []
+    anchor_probs_per_row: list[list[float]] = []
+    for row_idx, (_, prompt_ids, response_ids) in enumerate(pending):
+        response_start_position = len(prompt_ids)
+        main_path_ids = [int(token_id) for token_id in (prompt_ids + response_ids)]
+        anchor_positions, anchor_probs = _select_anchor_positions_for_sequence(
+            is_response=is_response[row_idx],
+            valid_tokens=valid_tokens[row_idx],
+            next_token_probs=next_token_probs[row_idx],
+            alpha=alpha,
+            max_anchors_per_sequence=max_anchors_per_sequence,
+        )
+        main_path_ids_per_row.append(main_path_ids)
+        response_start_positions.append(response_start_position)
+        anchor_positions_per_row.append(anchor_positions)
+        anchor_probs_per_row.append(anchor_probs)
+
+    anchors_per_row = _generate_sequence_trees_with_verifier_batch(
+        model=model,
+        runtime=runtime,
+        input_ids=input_ids,
+        valid_tokens=valid_tokens,
+        document_mask=document_mask,
+        main_path_ids_per_row=main_path_ids_per_row,
+        response_start_positions=response_start_positions,
+        anchor_positions_per_row=anchor_positions_per_row,
+        anchor_next_token_probs_per_row=anchor_probs_per_row,
+        hidden_states=hidden_states,
+        kv_cache=kv_cache,
+        logit_chunk_size=logit_chunk_size,
+        num_attend_tokens_per_anchor=num_attend_tokens_per_anchor,
+        child_coverage_alpha=child_coverage_alpha,
+        max_children_per_node=max_children_per_node,
+        profile=profile,
+    )
+
+    sequences: list[GeneratedSequenceTree] = []
+    for (record_idx, _, _), main_path_ids, response_start_position, anchors in zip(
+        pending,
+        main_path_ids_per_row,
+        response_start_positions,
+        anchors_per_row,
+        strict=True,
+    ):
+        sequences.append(
+            GeneratedSequenceTree(
+                record_idx=int(record_idx),
+                main_path_ids=main_path_ids,
+                response_start_position=int(response_start_position),
+                anchors=anchors,
+            )
+        )
+    return sequences
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI parser for Stage 2 v2 dataset generation."""
 
@@ -1315,6 +1560,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.95,
         help="Keep children until cumulative local probability mass reaches this threshold.",
+    )
+    parser.add_argument(
+        "--max-children-per-node",
+        type=int,
+        default=8,
+        help="Maximum children stored for any parent, including the forced main-path child.",
     )
     parser.add_argument(
         "--attn-implementation",
@@ -1431,6 +1682,7 @@ def main() -> None:
             "max_anchors_per_sequence": int(args.max_anchors_per_sequence),
             "num_attend_tokens_per_anchor": int(args.num_attend_tokens_per_anchor),
             "child_coverage_alpha": float(args.child_coverage_alpha),
+            "max_children_per_node": int(args.max_children_per_node),
             "model_name_or_path": args.model,
             "tokenizer_name_or_path": args.model,
         }
@@ -1472,68 +1724,22 @@ def main() -> None:
                 if len(pending) < args.batch_size:
                     continue
 
-                for record_idx, prompt_ids, response_ids in pending:
-                    print(record_idx)
-                    build_batch_start = time.perf_counter()
-                    batch = build_batch([(prompt_ids, response_ids)], tokenizer.pad_token_id, ctx.device)
-                    _accumulate_profile(timings, "build_batch_s", build_batch_start)
-                    input_ids = batch["input_ids"]
-                    valid_tokens = batch["document_mask"] >= 0
-                    is_response = batch["is_response"]
-                    response_start_position = len(prompt_ids)
-
-                    base_out = _run_base_model_forward(
-                        runtime.base_model_forward,
-                        profile=timings,
-                        profile_key="initial_forward_s",
-                        input_ids=input_ids,
-                        attention_mask=valid_tokens.long(),
-                        use_cache=True,
-                    )
-                    hidden_states, kv_cache = _extract_hidden_and_cache(base_out)
-                    lm_head = model.get_output_embeddings()
-                    if lm_head is None:
-                        raise ValueError("Model must expose output embeddings via get_output_embeddings().")
-                    next_token_probs = _compute_next_token_stats(
-                        hidden_states=hidden_states,
-                        input_ids=input_ids,
-                        valid_tokens=valid_tokens,
-                        lm_head=lm_head,
-                        logit_chunk_size=args.logit_chunk_size,
-                        profile=timings,
-                    )
-                    anchor_positions, anchor_probs = _select_anchor_positions_for_sequence(
-                        is_response=is_response[0],
-                        valid_tokens=valid_tokens[0],
-                        next_token_probs=next_token_probs[0],
-                        alpha=args.alpha,
-                        max_anchors_per_sequence=args.max_anchors_per_sequence,
-                    )
-                    anchors = _generate_sequence_trees_with_verifier(
+                sequence_buf.extend(
+                    _generate_sequences_for_pending_batch(
+                        pending=pending,
                         model=model,
                         runtime=runtime,
-                        input_ids=input_ids,
-                        valid_tokens=valid_tokens,
-                        document_mask=batch["document_mask"],
-                        main_path_ids=prompt_ids + response_ids,
-                        response_start_position=response_start_position,
-                        anchor_positions=anchor_positions,
-                        anchor_next_token_probs=anchor_probs,
-                        hidden_states=hidden_states,
-                        kv_cache=kv_cache,
+                        pad_token_id=tokenizer.pad_token_id,
+                        device=ctx.device,
+                        alpha=args.alpha,
+                        max_anchors_per_sequence=args.max_anchors_per_sequence,
                         logit_chunk_size=args.logit_chunk_size,
                         num_attend_tokens_per_anchor=args.num_attend_tokens_per_anchor,
                         child_coverage_alpha=args.child_coverage_alpha,
+                        max_children_per_node=args.max_children_per_node,
                         profile=timings,
                     )
-                    sequence_buf.append(
-                        GeneratedSequenceTree(
-                            record_idx=record_idx,
-                            main_path_ids=[int(token_id) for token_id in (prompt_ids + response_ids)],
-                            response_start_position=response_start_position,
-                            anchors=anchors,
-                        )
-                    )
+                )
 
                 pending.clear()
                 batch_count += 1
@@ -1569,64 +1775,22 @@ def main() -> None:
                     timings.clear()
 
             if pending:
-                for record_idx, prompt_ids, response_ids in pending:
-                    batch = build_batch([(prompt_ids, response_ids)], tokenizer.pad_token_id, ctx.device)
-                    input_ids = batch["input_ids"]
-                    valid_tokens = batch["document_mask"] >= 0
-                    is_response = batch["is_response"]
-                    response_start_position = len(prompt_ids)
-                    base_out = _run_base_model_forward(
-                        runtime.base_model_forward,
-                        profile=timings,
-                        profile_key="initial_forward_s",
-                        input_ids=input_ids,
-                        attention_mask=valid_tokens.long(),
-                        use_cache=True,
-                    )
-                    hidden_states, kv_cache = _extract_hidden_and_cache(base_out)
-                    lm_head = model.get_output_embeddings()
-                    if lm_head is None:
-                        raise ValueError("Model must expose output embeddings via get_output_embeddings().")
-                    next_token_probs = _compute_next_token_stats(
-                        hidden_states=hidden_states,
-                        input_ids=input_ids,
-                        valid_tokens=valid_tokens,
-                        lm_head=lm_head,
-                        logit_chunk_size=args.logit_chunk_size,
-                        profile=timings,
-                    )
-                    anchor_positions, anchor_probs = _select_anchor_positions_for_sequence(
-                        is_response=is_response[0],
-                        valid_tokens=valid_tokens[0],
-                        next_token_probs=next_token_probs[0],
-                        alpha=args.alpha,
-                        max_anchors_per_sequence=args.max_anchors_per_sequence,
-                    )
-                    anchors = _generate_sequence_trees_with_verifier(
+                sequence_buf.extend(
+                    _generate_sequences_for_pending_batch(
+                        pending=pending,
                         model=model,
                         runtime=runtime,
-                        input_ids=input_ids,
-                        valid_tokens=valid_tokens,
-                        document_mask=batch["document_mask"],
-                        main_path_ids=prompt_ids + response_ids,
-                        response_start_position=response_start_position,
-                        anchor_positions=anchor_positions,
-                        anchor_next_token_probs=anchor_probs,
-                        hidden_states=hidden_states,
-                        kv_cache=kv_cache,
+                        pad_token_id=tokenizer.pad_token_id,
+                        device=ctx.device,
+                        alpha=args.alpha,
+                        max_anchors_per_sequence=args.max_anchors_per_sequence,
                         logit_chunk_size=args.logit_chunk_size,
                         num_attend_tokens_per_anchor=args.num_attend_tokens_per_anchor,
                         child_coverage_alpha=args.child_coverage_alpha,
+                        max_children_per_node=args.max_children_per_node,
                         profile=timings,
                     )
-                    sequence_buf.append(
-                        GeneratedSequenceTree(
-                            record_idx=record_idx,
-                            main_path_ids=[int(token_id) for token_id in (prompt_ids + response_ids)],
-                            response_start_position=response_start_position,
-                            anchors=anchors,
-                        )
-                    )
+                )
 
             n_sequences_written, n_main_written, n_anchor_written, n_node_written = flush_stage2_v2_hdf5(
                 hf,
