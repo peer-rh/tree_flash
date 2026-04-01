@@ -21,9 +21,9 @@ echo "In directory: $(pwd)"
 echo "Starting on: $(date)"
 echo "SLURM_JOB_ID: ${SLURM_JOB_ID}"
 
-# uenv run pytorch/v2.9.1:v2 --view=default bash <<'EOF'
+uenv run pytorch/v2.9.1:v2 --view=default bash <<'EOF'
 cd ~/tree_flash
-# source venv-2.9/bin/activate
+source venv-2.9/bin/activate
 
 checkpoint_path="$OUTPUT_DIR/checkpoints"
 mkdir -p $checkpoint_path
@@ -113,7 +113,7 @@ TREE_JSON=$(cat <<TREEEOF
 TREEEOF
 )
 
-uv run -m src.trainer \
+python -m src.trainer \
     --tree_type prunable --tree_args "$TREE_JSON" \
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
@@ -124,4 +124,4 @@ uv run -m src.trainer \
     --trainer.ddp true --trainer.devices 4 --trainer.disable_predictions true \
     --trainer.dev_run false --trainer.verbose false --trainer.compile true 
 
-# EOF
+EOF

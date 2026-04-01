@@ -5,3 +5,6 @@ datasets
 .pytest_cache
 /experiments/**/outputs/
 checkpoints
+data
+outputs
+venv-2.9
