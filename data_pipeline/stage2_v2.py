@@ -792,6 +792,7 @@ def _ancestor_node_indices(state: AnchorTreeState, node_idx: int) -> set[int]:
     return ancestors
 
 
+@torch.inference_mode()
 def _generate_sequence_trees_with_verifier(
     *,
     model,
@@ -1368,6 +1369,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@torch.inference_mode()
 def main() -> None:
     """CLI entrypoint for Stage 2 v2 generation."""
 
