@@ -378,6 +378,71 @@ class TreeFlashTrainer:
         valid_mask = batch.tree_valid_mask & non_root_mask & batch.anchor_valid_mask.unsqueeze(-1)
         return int(valid_mask.sum().item())
 
+    def _get_target_decoder_layers(self):
+        """Return the frozen target decoder layers when the model layout is known."""
+        raw_target = unwrap_model(self.target_model)
+
+        decoder = None
+        get_decoder = getattr(raw_target, "get_decoder", None)
+        if callable(get_decoder):
+            decoder = get_decoder()
+        if decoder is None:
+            decoder = getattr(raw_target, "model", None)
+        if decoder is None:
+            base_model = getattr(raw_target, "base_model", None)
+            decoder = getattr(base_model, "model", None) if base_model is not None else None
+
+        layers = getattr(decoder, "layers", None)
+        return layers
+
+    def _prefill_target_context_selected_layers(
+        self,
+        batch: PackedBatch,
+        prefill_mask,
+    ) -> torch.Tensor | None:
+        """Capture only the verifier layers requested by the drafter, when possible."""
+        target_layer_ids = getattr(self.raw_drafter, "target_layer_ids", None)
+        if not target_layer_ids:
+            return None
+
+        decoder_layers = self._get_target_decoder_layers()
+        if decoder_layers is None:
+            return None
+
+        layer_ids = [int(layer_id) for layer_id in target_layer_ids]
+        if any(layer_id < 0 or layer_id >= len(decoder_layers) for layer_id in layer_ids):
+            return None
+
+        captured_states: dict[int, torch.Tensor] = {}
+        hook_handles = []
+
+        def make_hook(layer_idx: int):
+            def hook(_module, _inputs, output):
+                hidden_states = output[0] if isinstance(output, tuple) else output
+                captured_states[layer_idx] = hidden_states
+
+            return hook
+
+        for layer_idx in sorted(set(layer_ids)):
+            hook_handles.append(decoder_layers[layer_idx].register_forward_hook(make_hook(layer_idx)))
+
+        raw_target = unwrap_model(self.target_model)
+        try:
+            raw_target(
+                input_ids=batch.input_ids,
+                attention_mask=prefill_mask,
+                position_ids=batch.position_ids,
+                output_hidden_states=False,
+                use_cache=False,
+            )
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+
+        if any(layer_idx not in captured_states for layer_idx in layer_ids):
+            return None
+        return torch.cat([captured_states[layer_idx] for layer_idx in layer_ids], dim=-1)
+
     def _prefill_target_context(self, batch: PackedBatch) -> torch.Tensor:
         """Prefill the frozen target on packed context tokens.
 
@@ -386,6 +451,10 @@ class TreeFlashTrainer:
         """
         with torch.no_grad():
             prefill_mask = self._build_prefill_attention_mask(batch.document_mask, batch.context_valid_mask)
+            selected_ctx_features = self._prefill_target_context_selected_layers(batch, prefill_mask)
+            if selected_ctx_features is not None:
+                return selected_ctx_features
+
             target_out = self.target_model(
                 input_ids=batch.input_ids,
                 attention_mask=prefill_mask,
@@ -458,7 +527,7 @@ class TreeFlashTrainer:
         mask_time = time.perf_counter() - mask_start if profile else 0.0
 
         drafter_start = time.perf_counter() if profile else 0.0
-        draft_hidden_states, _, q_logits, _ = self.drafter_model(
+        draft_hidden_states, _, q_logits = self.drafter_model(
             hidden_states=noise_embeddings,
             position_ids=position_ids,
             tree_info=tree_info,
