@@ -1301,12 +1301,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-column", default="prompt", help="Dataset column containing prompt text")
     parser.add_argument("--response-column", default="response", help="Dataset column containing response text")
     parser.add_argument("--output", required=True, help="Output HDF5 path")
-    parser.add_argument("--alpha", type=float, default=0.2, help="Anchor-selection threshold on p(x_{t+1}|x_{1:t}).")
+    parser.add_argument("--alpha", type=float, default=0.9, help="Anchor-selection threshold on p(x_{t+1}|x_{1:t}).")
     parser.add_argument("--max-anchors-per-sequence", type=int, default=512, help="Maximum anchors kept per sequence.")
     parser.add_argument(
         "--num-attend-tokens-per-anchor",
         type=int,
-        default=8,
+        default=16,
         help="Maximum non-root token nodes to expand per anchor.",
     )
     parser.add_argument(
@@ -1471,6 +1471,7 @@ def main() -> None:
                     continue
 
                 for record_idx, prompt_ids, response_ids in pending:
+                    print(record_idx)
                     build_batch_start = time.perf_counter()
                     batch = build_batch([(prompt_ids, response_ids)], tokenizer.pad_token_id, ctx.device)
                     _accumulate_profile(timings, "build_batch_s", build_batch_start)
