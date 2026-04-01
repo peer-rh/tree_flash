@@ -1573,6 +1573,107 @@ def test_trainer_accepts_branch_off_tree_type(monkeypatch, tmp_path: Path) -> No
     assert trainer.tree_processor.primary_path_indices.tolist() == [0, 2, 5]
 
 
+def test_trainer_disables_fabric_sampler_injection_for_packed_batch_loaders(monkeypatch, tmp_path: Path) -> None:
+    import src.trainer as trainer_mod
+
+    captured: dict[str, object] = {}
+
+    class FakeFabric:
+        def __init__(self, *args, **kwargs):
+            self.device = torch.device("cpu")
+            self.global_rank = 1
+            self.local_rank = 1
+            self.world_size = 4
+            self.is_global_zero = True
+
+        def launch(self):
+            return None
+
+        def seed_everything(self, seed):
+            torch.manual_seed(seed)
+
+        def to_device(self, module):
+            return module
+
+        def setup(self, model, optimizer):
+            return model, optimizer
+
+        def setup_dataloaders(self, *loaders, **kwargs):
+            captured["setup_dataloaders_kwargs"] = kwargs
+            return loaders
+
+    class FakeTokenizer:
+        pad_token_id = 0
+        eos_token_id = 0
+        pad_token = "<pad>"
+        eos_token = "<pad>"
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+    class FakeTargetModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(32, 8)
+            self.lm_head = nn.Linear(8, 32, bias=False)
+            self.config = type("Cfg", (), {"pad_token_id": 0})()
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    class FakeDrafter(nn.Module):
+        mask_token_id = 1
+
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8)
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+    def fake_build_dataloaders(**kwargs):
+        captured["build_dataloaders_kwargs"] = kwargs
+        return [], []
+
+    monkeypatch.setattr(trainer_mod, "Fabric", FakeFabric)
+    monkeypatch.setattr(trainer_mod, "AutoTokenizer", FakeTokenizer)
+    monkeypatch.setattr(trainer_mod, "AutoModelForCausalLM", FakeTargetModel)
+    monkeypatch.setattr(trainer_mod, "DFlashDraftModel", FakeDrafter)
+    monkeypatch.setattr(trainer_mod, "build_dataloaders", fake_build_dataloaders)
+
+    Trainer(
+        config=TrainerConfig(
+            checkpoint_path=str(tmp_path / "ckpts"),
+            no_wandb=True,
+            precision="32-true",
+            spec_eval_datasets=(),
+        ),
+        target="fake-target",
+        data=DataModuleConfig(
+            path="unused.h5",
+            batch_size=1,
+            tree_seq_depth=2,
+        ),
+        drafter="fake-drafter",
+    )
+
+    assert captured["build_dataloaders_kwargs"]["num_replicas"] == 4
+    assert captured["build_dataloaders_kwargs"]["rank"] == 1
+    assert captured["setup_dataloaders_kwargs"] == {
+        "move_to_device": False,
+        "use_distributed_sampler": False,
+    }
+
+
 def test_trainer_accepts_prunable_tree_type(monkeypatch, tmp_path: Path) -> None:
     tree_processor = BlockTreeProcessor(tree_seq_depth=2)
     _, _, _, _, packed_batch = _build_fake_trainer_components(tree_processor.block_size, with_q_head=True)

@@ -42,10 +42,11 @@
         - We also have the prune-head which is a linear layer which predicts the probability that this token is correct
     3. We do cross entropy from this tree to the actual tree labels 
         - We weight this loss based on the path probability of each token, i.e the path probabilities multiplied from $x_t$ to this token
-        - The prune head gets trained with BCE on whether this token is equal to it's label
+        - The prune head gets trained with BCE on whether it and it's ancestors are equal to the main path starting from $x_t$ (so kind-off an acceptance proxy)
+        - We use focal loss so that deep tokens also get a decent representation
     
 
 ## Inference
 - We draft a tree of size `tree-inference-size` and shape/relation-map `inference-tree` using the drafter
-- We prune this tree (TODO)
+- We prune this tree using the prune head predictions to a size of `candidate-tree-size`
 - We then verify the tree with the target model and keep the longest accepted sequence

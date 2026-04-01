@@ -17,6 +17,7 @@ from data_pipeline.stage2_v2 import (
 )
 from src.data import (
     DataModuleConfig,
+    FixedPackedBatchSampler,
     PackedBatchCollator,
     Stage2Dataset,
     Stage2V2Dataset,
@@ -333,6 +334,34 @@ def test_eval_loader_is_deterministic_across_iterations(tmp_path: Path) -> None:
     assert len(first_pass) == len(second_pass)
     assert torch.equal(first_pass[0].input_ids, second_pass[0].input_ids)
     assert torch.equal(first_pass[0].anchor_positions, second_pass[0].anchor_positions)
+
+
+def test_fixed_packed_batch_sampler_shards_batches_across_replicas() -> None:
+    base_kwargs = dict(
+        sample_lengths=[6, 4, 6, 4, 6],
+        pack_length=10,
+        packed_batch_size=2,
+        shuffle=False,
+        drop_last=False,
+        seed=0,
+        persistent_state=False,
+    )
+    global_sampler = FixedPackedBatchSampler(**base_kwargs)
+    kwargs = dict(
+        **base_kwargs,
+        num_replicas=2,
+    )
+    rank0 = FixedPackedBatchSampler(rank=0, **kwargs)
+    rank1 = FixedPackedBatchSampler(rank=1, **kwargs)
+
+    global_batches = list(iter(global_sampler))
+    rank0_batches = list(iter(rank0))
+    rank1_batches = list(iter(rank1))
+
+    assert global_batches == [[0, 1, 2], [3, 4, 0]]
+    assert len(rank0_batches) == len(rank1_batches) == 1
+    assert rank0_batches == [global_batches[0]]
+    assert rank1_batches == [global_batches[1]]
 
 
 def test_train_collator_samples_valid_anchors_at_row_level(tmp_path: Path) -> None:

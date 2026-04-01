@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 import h5py
 import torch
-from torch.utils.data import BatchSampler, DataLoader, Dataset, Subset, random_split
+from torch.utils.data import BatchSampler, DataLoader, Dataset, SequentialSampler, Subset, random_split
 from datasets import load_dataset, Features, Sequence, Value
 
 from data_pipeline.stage2 import IGNORE_IDX
@@ -490,15 +490,28 @@ class FixedPackedBatchSampler(BatchSampler):
         drop_last: bool,
         seed: int,
         persistent_state: bool,
+        num_replicas: int = 1,
+        rank: int = 0,
     ) -> None:
         if packed_batch_size <= 0:
             raise ValueError(f"packed_batch_size must be positive, got {packed_batch_size}.")
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be positive, got {num_replicas}.")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}.")
+        super().__init__(
+            sampler=SequentialSampler(range(len(sample_lengths))),
+            batch_size=packed_batch_size,
+            drop_last=drop_last,
+        )
         self.pack_length = pack_length
         self.packed_batch_size = packed_batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.seed = seed
         self.persistent_state = persistent_state
+        self.num_replicas = num_replicas
+        self.rank = rank
         self._rng = random.Random(seed)
         self._next_uid = 0
         self._pending: list[tuple[int, int]] = []
@@ -600,6 +613,20 @@ class FixedPackedBatchSampler(BatchSampler):
             emitted_batches = [[] for _ in range(batch_count)]
         return emitted_batches, next_pending, order, cursor, next_uid
 
+    def _shard_batches(self, emitted_batches: list[list[int]]) -> list[list[int]]:
+        if self.num_replicas == 1:
+            return emitted_batches
+        if not emitted_batches:
+            return []
+
+        remainder = len(emitted_batches) % self.num_replicas
+        if remainder != 0:
+            if self.drop_last:
+                emitted_batches = emitted_batches[: len(emitted_batches) - remainder]
+            else:
+                emitted_batches = emitted_batches + emitted_batches[: self.num_replicas - remainder]
+        return emitted_batches[self.rank :: self.num_replicas]
+
     def __iter__(self):
         if self.persistent_state:
             order = self._order.copy()
@@ -627,7 +654,7 @@ class FixedPackedBatchSampler(BatchSampler):
             self._order = next_order
             self._cursor = next_cursor
             self._next_uid = next_uid
-        for batch in emitted_batches:
+        for batch in self._shard_batches(emitted_batches):
             yield batch
 
     def __len__(self) -> int:
@@ -652,7 +679,7 @@ class FixedPackedBatchSampler(BatchSampler):
             rng=sim_rng,
             collect_batches=False,
         )
-        return len(batches)
+        return len(self._shard_batches(batches))
 
 
 def _dataset_total_lengths(dataset: Dataset) -> list[int]:
@@ -1092,6 +1119,8 @@ def build_dataloaders(
     tree_processor: TreeProcessorProtocol,
     mask_token_id: int,
     pad_token_id: int,
+    num_replicas: int = 1,
+    rank: int = 0,
 ) -> tuple[DataLoader, DataLoader]:
     format_version = _stage2_v2_detect_format(config.path)
     if format_version == "stage2_v2":
@@ -1174,6 +1203,8 @@ def build_dataloaders(
         drop_last=config.drop_last,
         seed=config.seed,
         persistent_state=True,
+        num_replicas=num_replicas,
+        rank=rank,
     )
     eval_batch_sampler = FixedPackedBatchSampler(
         sample_lengths=eval_lengths,
@@ -1183,6 +1214,8 @@ def build_dataloaders(
         drop_last=config.drop_last,
         seed=config.seed,
         persistent_state=False,
+        num_replicas=num_replicas,
+        rank=rank,
     )
     loader_kwargs = {
         "num_workers": config.num_workers,

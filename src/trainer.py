@@ -707,11 +707,14 @@ class Trainer:
             tree_processor=self.tree_processor,
             mask_token_id=self.mask_token_id,
             pad_token_id=self.pad_token_id,
+            num_replicas=max(int(getattr(self.fabric, "world_size", 1)), 1),
+            rank=int(getattr(self.fabric, "global_rank", 0)),
         )
         self.train_loader, self.eval_loader = self.fabric.setup_dataloaders(
             self.train_loader,
             self.eval_loader,
             move_to_device=False,
+            use_distributed_sampler=False,
         )
 
         if config.resume_from:
