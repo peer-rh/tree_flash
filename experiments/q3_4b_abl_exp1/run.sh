@@ -91,34 +91,33 @@ MODELEOF
 )
 TREE_JSON=$(cat <<TREEEOF
 {
-    "tree_seq_depth": 16,
-    "base_tree_type": "branch_off",
-    "sub_tree_paths": [
-      "01234567",
-      "01234567",
-      "01234567",
-      "01234567",
-      "01234567",
-      "01234567",
-      "01234567",
-      "0",
-      "0",
-      "0",
-      "0",
-      "0",
-      "0",
-      "0",
-      "0",
+    "tree_seq_depth": 15,
+    "branching_pattern": [
+      [0,1,2,3,4,5,6,7],
+      [0,1,2,3,4,5,6,7],
+      [0,1,2,3,4,5,6,7],
+      [0,1,2,3,4,5,6,7],
+      [0,1,2,3,4,5,6,7],
+      [0,1,2,3,4,5,6,7],
+      [0,1,2,3,4,5,6,7],
+      [0],
+      [0],
+      [0],
+      [0],
+      [0],
+      [0],
+      [0],
+      [0],
     ]
 }
 TREEEOF
 )
 
 python -m src.trainer \
-    --tree_type prunable --tree_args "$TREE_JSON" \
+    --tree_type branch_off --tree_args "$TREE_JSON" \
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
-    --data.path ../dflash_2/datasets/q3_4b_100k_stage2.h5 --data.batch_size 4 --data.num_anchors 512 --data.tree_seq_depth 16   \
+    --data.path /capstor/store/cscs/2go/go60/prheinbo/q3_4b_stage2.h5 --data.batch_size 4 --data.num_anchors 512 --data.tree_seq_depth 15   \
     --trainer.save_every 2048 --trainer.precision bf16-true --trainer.grad_accum_steps 8 --trainer.num_epochs 6 \
     --trainer.eval_every 2048 --trainer.wandb_run_name $EXPERIMENT_NAME --trainer.checkpoint_path $OUTPUT_DIR/checkpoints \
     --trainer.anchor_chunk_size null --trainer.ce_chunk_size 32768 \
