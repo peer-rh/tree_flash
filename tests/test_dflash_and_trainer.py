@@ -49,6 +49,7 @@ from src.trainer import (
     build_ar_block_mask,
     build_parser as build_trainer_parser,
     build_prefill_attention_mask,
+    unwrap_model,
 )
 from src.trees import BlockTreeProcessor, PrunableTreeProcessor, VarTreeProcessor
 from src.trees.relation_ids import RELATION_VOCAB_SIZE, relation_id_for_child_rank, relation_id_for_parent_rank
@@ -1672,6 +1673,127 @@ def test_trainer_disables_fabric_sampler_injection_for_packed_batch_loaders(monk
         "move_to_device": False,
         "use_distributed_sampler": False,
     }
+
+
+def test_unwrap_model_recurses_through_fabric_and_ddp_wrappers() -> None:
+    leaf = nn.Linear(4, 4)
+
+    class OrigWrapper:
+        def __init__(self, wrapped):
+            self._orig_mod = wrapped
+
+    class DDPWrapper:
+        def __init__(self, wrapped):
+            self.module = wrapped
+
+    class FabricWrapper:
+        def __init__(self, wrapped):
+            self._forward_module = wrapped
+
+    wrapped = FabricWrapper(DDPWrapper(OrigWrapper(leaf)))
+
+    assert unwrap_model(wrapped) is leaf
+
+
+def test_trainer_unwraps_ddp_wrapped_drafter_after_fabric_setup(monkeypatch, tmp_path: Path) -> None:
+    import src.trainer as trainer_mod
+
+    class WrappedModule:
+        def __init__(self, wrapped):
+            self.module = wrapped
+
+        def __getattr__(self, name):
+            return getattr(self.module, name)
+
+    class FakeFabric:
+        def __init__(self, *args, **kwargs):
+            self.device = torch.device("cpu")
+            self.global_rank = 0
+            self.local_rank = 0
+            self.world_size = 2
+            self.is_global_zero = True
+
+        def launch(self):
+            return None
+
+        def seed_everything(self, seed):
+            torch.manual_seed(seed)
+
+        def to_device(self, module):
+            return module
+
+        def setup(self, model, optimizer):
+            return WrappedModule(model), optimizer
+
+        def setup_dataloaders(self, *loaders, **kwargs):
+            return loaders
+
+    class FakeTokenizer:
+        pad_token_id = 0
+        eos_token_id = 0
+        pad_token = "<pad>"
+        eos_token = "<pad>"
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+    class FakeTargetModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(32, 8)
+            self.lm_head = nn.Linear(8, 32, bias=False)
+            self.config = type("Cfg", (), {"pad_token_id": 0})()
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    class FakeDrafter(nn.Module):
+        mask_token_id = 1
+
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8)
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+        def extract_ctx_features(self, hidden_states):
+            return hidden_states
+
+    monkeypatch.setattr(trainer_mod, "Fabric", FakeFabric)
+    monkeypatch.setattr(trainer_mod, "AutoTokenizer", FakeTokenizer)
+    monkeypatch.setattr(trainer_mod, "AutoModelForCausalLM", FakeTargetModel)
+    monkeypatch.setattr(trainer_mod, "DFlashDraftModel", FakeDrafter)
+    monkeypatch.setattr(trainer_mod, "build_dataloaders", lambda **kwargs: ([], []))
+
+    trainer = Trainer(
+        config=TrainerConfig(
+            checkpoint_path=str(tmp_path / "ckpts"),
+            no_wandb=True,
+            precision="32-true",
+            spec_eval_datasets=(),
+        ),
+        target="fake-target",
+        data=DataModuleConfig(
+            path="unused.h5",
+            batch_size=1,
+            tree_seq_depth=2,
+        ),
+        drafter="fake-drafter",
+    )
+
+    assert isinstance(trainer.drafter_model, WrappedModule)
+    assert isinstance(trainer.raw_drafter, FakeDrafter)
+    assert hasattr(trainer.raw_drafter, "extract_ctx_features")
 
 
 def test_trainer_accepts_prunable_tree_type(monkeypatch, tmp_path: Path) -> None:
