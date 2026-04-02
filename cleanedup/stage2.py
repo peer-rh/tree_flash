@@ -356,6 +356,38 @@ def _score_hidden_states(hidden_states: torch.Tensor, lm_head) -> tuple[torch.Te
     return sorted_token_ids.to(torch.long), sorted_token_probs.to(torch.float32)
 
 
+def select_anchor_positions(
+    *,
+    is_response: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    next_token_probs: torch.Tensor,
+    alpha: float,
+    max_trees: int,
+) -> tuple[list[int], list[float]]:
+    if max_trees <= 0:
+        raise ValueError("max_trees must be positive.")
+    if is_response.ndim != 1 or valid_tokens.ndim != 1 or next_token_probs.ndim != 1:
+        raise ValueError("Expected 1D tensors for anchor selection.")
+    if is_response.numel() < 2:
+        return [], []
+
+    anchor_mask = is_response[:-1] & valid_tokens[1:] & (next_token_probs[1:] <= float(alpha))
+    candidate_positions = torch.nonzero(anchor_mask, as_tuple=False).squeeze(-1)
+    if candidate_positions.numel() == 0:
+        return [], []
+
+    candidate_probs = next_token_probs[1:].gather(0, candidate_positions).to(torch.float32)
+    if int(candidate_positions.numel()) > max_trees:
+        hardest = torch.argsort(candidate_probs, descending=False, stable=True)[:max_trees]
+        candidate_positions = candidate_positions[hardest]
+        candidate_probs = candidate_probs[hardest]
+        in_order = torch.argsort(candidate_positions, stable=True)
+        candidate_positions = candidate_positions[in_order]
+        candidate_probs = candidate_probs[in_order]
+
+    return candidate_positions.tolist(), [float(prob) for prob in candidate_probs.tolist()]
+
+
 def _select_children(
     *,
     sorted_token_ids: torch.Tensor,
@@ -461,7 +493,6 @@ def _append_children(
     node_creation_index: torch.Tensor,
     next_free_node_idx: torch.Tensor,
     next_creation_index: torch.Tensor,
-    ancestor_self: torch.Tensor,
 ) -> None:
     if batch_idx.numel() == 0:
         return
@@ -481,7 +512,6 @@ def _append_children(
 
     parent_depth = node_depths[batch_idx, tree_idx, parent_idx]
     parent_path_prob = node_path_probs[batch_idx, tree_idx, parent_idx]
-    parent_ancestor = ancestor_self[batch_idx, tree_idx, parent_idx]
 
     batch_grid = batch_idx.unsqueeze(-1).expand(-1, cap)
     tree_grid = tree_idx.unsqueeze(-1).expand(-1, cap)
@@ -489,7 +519,6 @@ def _append_children(
     depth_grid = (parent_depth + 1).unsqueeze(-1).expand(-1, cap)
     path_prob_grid = parent_path_prob.unsqueeze(-1) * child_local_probs
     creation_grid = next_creation_index[batch_idx, tree_idx].unsqueeze(-1) + slot_offsets
-    ancestor_grid = parent_ancestor.unsqueeze(1).expand(-1, cap, -1)
 
     flat_batch = batch_grid[valid_child]
     flat_tree = tree_grid[valid_child]
@@ -507,8 +536,6 @@ def _append_children(
     node_valid[flat_batch, flat_tree, flat_slot] = True
     frontier[flat_batch, flat_tree, flat_slot] = True
     node_creation_index[flat_batch, flat_tree, flat_slot] = creation_grid[valid_child]
-    ancestor_self[flat_batch, flat_tree, flat_slot] = ancestor_grid[valid_child]
-    ancestor_self[flat_batch, flat_tree, flat_slot, flat_slot] = True
 
     has_children = child_count_per_parent > 0
     if bool(has_children.any().item()):
@@ -525,6 +552,29 @@ def _append_children(
 
     next_free_node_idx[batch_idx, tree_idx] = base_slots + child_count_per_parent
     next_creation_index[batch_idx, tree_idx] = next_creation_index[batch_idx, tree_idx] + child_count_per_parent
+
+
+def _compute_cached_ancestor_mask(
+    *,
+    query_node_idx: torch.Tensor,
+    cached_idx: torch.Tensor,
+    node_parent_indices: torch.Tensor,
+    query_depths: torch.Tensor,
+) -> torch.Tensor:
+    if cached_idx.numel() == 0:
+        return torch.zeros_like(cached_idx, dtype=torch.bool)
+
+    current = query_node_idx
+    ancestor_mask = cached_idx.eq(current.unsqueeze(-1))
+    max_steps = int(query_depths.max().item())
+    for _ in range(max_steps):
+        parent_idx = node_parent_indices.gather(2, current.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+        valid_parent = parent_idx.ge(0)
+        if not bool(valid_parent.any().item()):
+            break
+        current = torch.where(valid_parent, parent_idx, current)
+        ancestor_mask = ancestor_mask | (valid_parent.unsqueeze(-1) & cached_idx.eq(current.unsqueeze(-1)))
+    return ancestor_mask
 
 
 def _build_flex_attention_mask(
@@ -575,11 +625,11 @@ def _build_flex_attention_mask(
     )
 
 
-def process_batch(batch, model, alpha, num_attend_tokens, depth, max_top_k):
+def process_batch(batch, model, alpha, num_attend_tokens, max_trees, max_top_k):
     if max_top_k <= 0:
         raise ValueError("max_top_k must be positive.")
-    if depth < 0:
-        raise ValueError("depth must be non-negative.")
+    if max_trees <= 0:
+        raise ValueError("max_trees must be positive.")
 
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
@@ -615,46 +665,58 @@ def process_batch(batch, model, alpha, num_attend_tokens, depth, max_top_k):
     response_start = response_interval[:, 0].unsqueeze(-1)
     response_end = response_interval[:, 1].unsqueeze(-1)
     is_response = (positions >= response_start) & (positions < response_end)
-    anchor_mask = is_response[:, :-1] & valid_tokens[:, 1:] & (next_token_probs[:, 1:] <= float(alpha))
-    anchor_counts = anchor_mask.sum(dim=-1)
-    max_trees = max(int(anchor_counts.max().item()), 1)
-    anchor_order = anchor_mask.to(torch.long).cumsum(dim=-1) - 1
+    anchor_positions_per_row: list[list[int]] = []
+    anchor_probs_per_row: list[list[float]] = []
+    anchor_count_list: list[int] = []
+    for row_idx in range(batch_size):
+        row_anchor_positions, row_anchor_probs = select_anchor_positions(
+            is_response=is_response[row_idx],
+            valid_tokens=valid_tokens[row_idx],
+            next_token_probs=next_token_probs[row_idx],
+            alpha=alpha,
+            max_trees=max_trees,
+        )
+        anchor_positions_per_row.append(row_anchor_positions)
+        anchor_probs_per_row.append(row_anchor_probs)
+        anchor_count_list.append(len(row_anchor_positions))
 
-    anchor_positions = torch.zeros((batch_size, max_trees), dtype=torch.long, device=device)
-    anchor_probs = torch.zeros((batch_size, max_trees), dtype=torch.float32, device=device)
-    if bool(anchor_mask.any().item()):
-        batch_grid = torch.arange(batch_size, device=device).unsqueeze(-1).expand(-1, seq_len - 1)
-        slot_idx = anchor_order[anchor_mask]
-        anchor_positions[batch_grid[anchor_mask], slot_idx] = positions[:, :-1][anchor_mask]
-        anchor_probs[batch_grid[anchor_mask], slot_idx] = next_token_probs[:, 1:][anchor_mask]
+    anchor_counts = torch.tensor(anchor_count_list, dtype=torch.long, device=device)
+    batch_max_trees = max(max(anchor_count_list, default=0), 1)
 
-    tree_active = torch.arange(max_trees, device=device).unsqueeze(0) < anchor_counts.unsqueeze(-1)
+    anchor_positions = torch.zeros((batch_size, batch_max_trees), dtype=torch.long, device=device)
+    anchor_probs = torch.zeros((batch_size, batch_max_trees), dtype=torch.float32, device=device)
+    for row_idx, (row_positions, row_probs) in enumerate(zip(anchor_positions_per_row, anchor_probs_per_row, strict=True)):
+        if not row_positions:
+            continue
+        count = len(row_positions)
+        anchor_positions[row_idx, :count] = torch.tensor(row_positions, dtype=torch.long, device=device)
+        anchor_probs[row_idx, :count] = torch.tensor(row_probs, dtype=torch.float32, device=device)
+
+    tree_active = torch.arange(batch_max_trees, device=device).unsqueeze(0) < anchor_counts.unsqueeze(-1)
     max_nodes = 1 + (num_attend_tokens + 1) * max_top_k
 
-    node_token_ids = torch.full((batch_size, max_trees, max_nodes), IGNORE_IDX, dtype=torch.long, device=device)
-    node_parent_indices = torch.full((batch_size, max_trees, max_nodes), -1, dtype=torch.long, device=device)
-    node_depths = torch.zeros((batch_size, max_trees, max_nodes), dtype=torch.long, device=device)
-    node_local_probs = torch.zeros((batch_size, max_trees, max_nodes), dtype=torch.float32, device=device)
-    node_path_probs = torch.zeros((batch_size, max_trees, max_nodes), dtype=torch.float32, device=device)
-    node_ranks = torch.zeros((batch_size, max_trees, max_nodes), dtype=torch.long, device=device)
-    node_main_pos = torch.full((batch_size, max_trees, max_nodes), IGNORE_IDX, dtype=torch.long, device=device)
-    node_is_main = torch.zeros((batch_size, max_trees, max_nodes), dtype=torch.bool, device=device)
-    node_valid = torch.zeros((batch_size, max_trees, max_nodes), dtype=torch.bool, device=device)
-    node_expanded = torch.zeros((batch_size, max_trees, max_nodes), dtype=torch.bool, device=device)
-    frontier = torch.zeros((batch_size, max_trees, max_nodes), dtype=torch.bool, device=device)
-    first_child = torch.full((batch_size, max_trees, max_nodes), -1, dtype=torch.long, device=device)
-    child_count = torch.zeros((batch_size, max_trees, max_nodes), dtype=torch.long, device=device)
-    node_creation_index = torch.full((batch_size, max_trees, max_nodes), max_nodes * 2, dtype=torch.long, device=device)
-    ancestor_self = torch.zeros((batch_size, max_trees, max_nodes, max_nodes), dtype=torch.bool, device=device)
+    node_token_ids = torch.full((batch_size, batch_max_trees, max_nodes), IGNORE_IDX, dtype=torch.long, device=device)
+    node_parent_indices = torch.full((batch_size, batch_max_trees, max_nodes), -1, dtype=torch.long, device=device)
+    node_depths = torch.zeros((batch_size, batch_max_trees, max_nodes), dtype=torch.long, device=device)
+    node_local_probs = torch.zeros((batch_size, batch_max_trees, max_nodes), dtype=torch.float32, device=device)
+    node_path_probs = torch.zeros((batch_size, batch_max_trees, max_nodes), dtype=torch.float32, device=device)
+    node_ranks = torch.zeros((batch_size, batch_max_trees, max_nodes), dtype=torch.long, device=device)
+    node_main_pos = torch.full((batch_size, batch_max_trees, max_nodes), IGNORE_IDX, dtype=torch.long, device=device)
+    node_is_main = torch.zeros((batch_size, batch_max_trees, max_nodes), dtype=torch.bool, device=device)
+    node_valid = torch.zeros((batch_size, batch_max_trees, max_nodes), dtype=torch.bool, device=device)
+    node_expanded = torch.zeros((batch_size, batch_max_trees, max_nodes), dtype=torch.bool, device=device)
+    frontier = torch.zeros((batch_size, batch_max_trees, max_nodes), dtype=torch.bool, device=device)
+    first_child = torch.full((batch_size, batch_max_trees, max_nodes), -1, dtype=torch.long, device=device)
+    child_count = torch.zeros((batch_size, batch_max_trees, max_nodes), dtype=torch.long, device=device)
+    node_creation_index = torch.full((batch_size, batch_max_trees, max_nodes), max_nodes * 2, dtype=torch.long, device=device)
     next_free_node_idx = tree_active.to(torch.long)
-    next_creation_index = torch.zeros((batch_size, max_trees), dtype=torch.long, device=device)
-    expanded_count = torch.zeros((batch_size, max_trees), dtype=torch.long, device=device)
-    expansion_history = torch.full((batch_size, num_attend_tokens, max_trees), -1, dtype=torch.long, device=device)
+    next_creation_index = torch.zeros((batch_size, batch_max_trees), dtype=torch.long, device=device)
+    expanded_count = torch.zeros((batch_size, batch_max_trees), dtype=torch.long, device=device)
+    expansion_history = torch.full((batch_size, num_attend_tokens, batch_max_trees), -1, dtype=torch.long, device=device)
 
     node_valid[:, :, 0] = tree_active
     node_local_probs[:, :, 0] = tree_active.to(torch.float32)
     node_path_probs[:, :, 0] = tree_active.to(torch.float32)
-    ancestor_self[:, :, 0, 0] = tree_active
 
     root_batch_idx, root_tree_idx = torch.nonzero(tree_active, as_tuple=True)
     if root_batch_idx.numel() > 0:
@@ -696,18 +758,16 @@ def process_batch(batch, model, alpha, num_attend_tokens, depth, max_top_k):
             node_creation_index=node_creation_index,
             next_free_node_idx=next_free_node_idx,
             next_creation_index=next_creation_index,
-            ancestor_self=ancestor_self,
         )
 
-    fallback_token = input_ids[:, :1].expand(-1, max_trees)
-    eye_trees = torch.eye(max_trees, dtype=torch.bool, device=device).unsqueeze(0)
+    fallback_token = input_ids[:, :1].expand(-1, batch_max_trees)
+    eye_trees = torch.eye(batch_max_trees, dtype=torch.bool, device=device).unsqueeze(0)
 
     for step in range(num_attend_tokens):
         eligible = (
             tree_active.unsqueeze(-1)
             & frontier
             & ~node_expanded
-            & (node_depths < depth)
             & (expanded_count < num_attend_tokens).unsqueeze(-1)
         )
         query_valid = eligible.any(dim=-1)
@@ -737,25 +797,26 @@ def process_batch(batch, model, alpha, num_attend_tokens, depth, max_top_k):
         query_depths = node_depths.gather(2, chosen_node_idx.unsqueeze(-1)).squeeze(-1)
         query_pos = torch.where(query_valid, anchor_positions + query_depths, torch.zeros_like(anchor_positions))
 
-        total_tree_keys = (step + 1) * max_trees
+        total_tree_keys = (step + 1) * batch_max_trees
         tree_key_valid = torch.zeros((batch_size, total_tree_keys), dtype=torch.bool, device=device)
-        tree_can_attend = torch.zeros((batch_size, max_trees, total_tree_keys), dtype=torch.bool, device=device)
+        tree_can_attend = torch.zeros((batch_size, batch_max_trees, total_tree_keys), dtype=torch.bool, device=device)
 
         if step > 0:
             cached_idx = expansion_history[:, :step, :].permute(0, 2, 1)
             cached_valid = cached_idx.ge(0)
             cached_idx_clamped = cached_idx.clamp(min=0)
-            ancestor_rows = ancestor_self.gather(
-                2,
-                chosen_node_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, max_nodes),
-            ).squeeze(2)
-            cached_is_ancestor = ancestor_rows.gather(2, cached_idx_clamped)
+            cached_is_ancestor = _compute_cached_ancestor_mask(
+                query_node_idx=chosen_node_idx,
+                cached_idx=cached_idx_clamped,
+                node_parent_indices=node_parent_indices,
+                query_depths=query_depths,
+            )
             prev_attend = (cached_valid & cached_is_ancestor).unsqueeze(-1) & eye_trees.unsqueeze(2)
-            tree_key_valid[:, : step * max_trees] = expansion_history[:, :step, :].permute(0, 2, 1).reshape(batch_size, -1).ge(0)
-            tree_can_attend[:, :, : step * max_trees] = prev_attend.reshape(batch_size, max_trees, step * max_trees)
+            tree_key_valid[:, : step * batch_max_trees] = expansion_history[:, :step, :].permute(0, 2, 1).reshape(batch_size, -1).ge(0)
+            tree_can_attend[:, :, : step * batch_max_trees] = prev_attend.reshape(batch_size, batch_max_trees, step * batch_max_trees)
 
-        tree_key_valid[:, step * max_trees : (step + 1) * max_trees] = query_valid
-        tree_can_attend[:, :, step * max_trees : (step + 1) * max_trees] = query_valid.unsqueeze(-1) & eye_trees
+        tree_key_valid[:, step * batch_max_trees : (step + 1) * batch_max_trees] = query_valid
+        tree_can_attend[:, :, step * batch_max_trees : (step + 1) * batch_max_trees] = query_valid.unsqueeze(-1) & eye_trees
         flex_mask = _build_flex_attention_mask(
             anchor_positions=anchor_positions,
             query_valid=query_valid,
@@ -766,8 +827,8 @@ def process_batch(batch, model, alpha, num_attend_tokens, depth, max_top_k):
         )
 
         cache_position = torch.arange(
-            seq_len + step * max_trees,
-            seq_len + (step + 1) * max_trees,
+            seq_len + step * batch_max_trees,
+            seq_len + (step + 1) * batch_max_trees,
             device=device,
         )
         step_out = _call_with_supported_kwargs(
@@ -830,7 +891,6 @@ def process_batch(batch, model, alpha, num_attend_tokens, depth, max_top_k):
             node_creation_index=node_creation_index,
             next_free_node_idx=next_free_node_idx,
             next_creation_index=next_creation_index,
-            ancestor_self=ancestor_self,
         )
 
     sequences: list[GeneratedSequenceTree] = []
@@ -1151,7 +1211,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--alpha", type=float, default=0.9)
     parser.add_argument("--num-attend-tokens", type=int, default=512)
-    parser.add_argument("--depth", type=int, default=12)
+    parser.add_argument("--max-trees", type=int, default=512)
     parser.add_argument("--max-top-k", type=int, default=8)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", default="bfloat16", choices=["float32", "float16", "bfloat16"])
@@ -1187,7 +1247,7 @@ def main():
             "model_name_or_path": args.model,
             "alpha": float(args.alpha),
             "num_attend_tokens": int(args.num_attend_tokens),
-            "depth": int(args.depth),
+            "max_trees": int(args.max_trees),
             "max_top_k": int(args.max_top_k),
         }
         output_path = Path(args.output)
@@ -1208,7 +1268,7 @@ def main():
                         model=model,
                         alpha=args.alpha,
                         num_attend_tokens=args.num_attend_tokens,
-                        depth=args.depth,
+                        max_trees=args.max_trees,
                         max_top_k=args.max_top_k,
                     )
                     flush_hdf5(hf, sequences)
