@@ -464,6 +464,28 @@ class TreeFlashTrainer:
             )
             return self.raw_drafter.extract_ctx_features(target_out.hidden_states)
 
+    def _build_prune_targets(self, tree_info) -> torch.Tensor:
+        """Mark nodes whose full ancestor chain stays on the primary path."""
+        off_primary_ancestors = tree_info.tree_mask & (~tree_info.primary_path_mask.unsqueeze(-2))
+        return (~off_primary_ancestors.any(dim=-1)).to(torch.float32)
+
+    def _compute_prune_loss_sum(
+        self,
+        *,
+        q_logits: torch.Tensor,
+        q_targets: torch.Tensor,
+        flat_valid_mask: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Compute focal BCE for prune-head supervision on valid non-root nodes."""
+        q_logits = q_logits.float()
+        bce = F.binary_cross_entropy_with_logits(q_logits, q_targets, reduction="none")
+        probs = torch.sigmoid(q_logits)
+        pt = torch.where(q_targets > 0.5, probs, 1.0 - probs)
+        focal_factor = (1.0 - pt).pow(2.0)
+        prune_loss = bce * focal_factor
+        return prune_loss[flat_valid_mask].sum().to(dtype)
+
     def _forward_batch(self, batch: PackedBatch, *, profile: bool) -> dict[str, Any]:
         batch = batch.to(self.fabric.device)
         zero = torch.zeros((), device=self.fabric.device)
@@ -546,9 +568,13 @@ class TreeFlashTrainer:
             weights=flat_weights,
             valid_mask=flat_valid_mask,
         )
-        q_targets = predictions.eq(flat_labels).to(torch.float32)
-        q_loss = F.binary_cross_entropy_with_logits(q_logits.float(), q_targets, reduction="none")
-        prune_loss_sum = q_loss[flat_valid_mask].sum().to(draft_hidden_states.dtype)
+        q_targets = self._build_prune_targets(tree_info).reshape(batch_size, num_anchors * tree_size)
+        prune_loss_sum = self._compute_prune_loss_sum(
+            q_logits=q_logits,
+            q_targets=q_targets,
+            flat_valid_mask=flat_valid_mask,
+            dtype=draft_hidden_states.dtype,
+        )
         ce_time = time.perf_counter() - ce_start if profile else 0.0
 
         ce_loss = loss_sum / max(valid_count, 1)
