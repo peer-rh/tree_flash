@@ -53,6 +53,7 @@ import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
+import tqdm
 
 from .stage2 import (
     CompiledCallable,
@@ -984,6 +985,9 @@ def _generate_sequence_trees_with_verifier_batch(
                 tree_key_valid_mask[row_idx, current_key_idx] = True
 
         mask_start = time.perf_counter()
+        print(
+            "running model..."
+        )
         attention_mask = _build_single_sequence_attention_mask(
             query_anchor_positions=query_anchor_positions,
             query_valid_mask=query_valid_mask,
@@ -1007,6 +1011,9 @@ def _generate_sequence_trees_with_verifier_batch(
             use_cache=True,
         )
         new_hidden_states, kv_cache = _extract_hidden_and_cache(base_out)
+        print(
+            "ran model"
+        )
         real_hidden_states = new_hidden_states[query_valid_mask]
         child_sorted_ids, child_sorted_probs = _score_hidden_states_with_candidates(
             real_hidden_states,
@@ -1719,7 +1726,7 @@ def main() -> None:
             n_node_written = 0
 
             pending: list[tuple[int, list[int], list[int]]] = []
-            for record in records:
+            for record in tqdm.tqdm(records):
                 pending.append((int(record["record_idx"]), record["prompt_ids"], record["response_ids"]))
                 if len(pending) < args.batch_size:
                     continue
