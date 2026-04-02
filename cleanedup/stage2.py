@@ -19,6 +19,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 IGNORE_IDX = -1
+TOKENIZATION_BATCH_SIZE = 1024
 
 
 @dataclass
@@ -141,35 +142,37 @@ def _list_jsonl_files(datapath: str) -> list[Path]:
     return files
 
 
-def _normalize_record(
-    row: dict[str, Any],
+def _normalize_input_record(
     *,
-    tokenizer,
+    input_ids: list[int],
+    response_interval: list[int],
     seq_len: int,
     record_idx: int,
 ) -> dict[str, Any] | None:
-    if "input_ids" in row and "response_interval" in row:
-        input_ids = [int(token_id) for token_id in row["input_ids"]]
-        response_interval = [int(position) for position in row["response_interval"]]
-        if len(response_interval) != 2:
-            raise ValueError("response_interval must contain exactly two positions.")
-        if not input_ids or response_interval[0] >= response_interval[1]:
-            return None
-        if response_interval[0] < 0 or response_interval[1] > len(input_ids):
-            raise ValueError("response_interval is out of bounds for input_ids.")
-        if len(input_ids) > seq_len:
-            return None
-        return {
-            "record_idx": record_idx,
-            "input_ids": input_ids,
-            "response_interval": response_interval,
-        }
+    input_ids = [int(token_id) for token_id in input_ids]
+    response_interval = [int(position) for position in response_interval]
+    if len(response_interval) != 2:
+        raise ValueError("response_interval must contain exactly two positions.")
+    if not input_ids or response_interval[0] >= response_interval[1]:
+        return None
+    if response_interval[0] < 0 or response_interval[1] > len(input_ids):
+        raise ValueError("response_interval is out of bounds for input_ids.")
+    if len(input_ids) > seq_len:
+        return None
+    return {
+        "record_idx": record_idx,
+        "input_ids": input_ids,
+        "response_interval": response_interval,
+    }
 
-    if "prompt" not in row or "response" not in row:
-        raise ValueError("Expected either input_ids/response_interval or prompt/response columns.")
 
-    prompt_ids = tokenizer(row["prompt"], add_special_tokens=False)["input_ids"]
-    response_ids = tokenizer(row["response"], add_special_tokens=False)["input_ids"]
+def _normalize_prompt_response_ids(
+    *,
+    prompt_ids: list[int],
+    response_ids: list[int],
+    seq_len: int,
+    record_idx: int,
+) -> dict[str, Any] | None:
     if not prompt_ids or not response_ids:
         return None
     total_ids = prompt_ids + response_ids
@@ -180,6 +183,31 @@ def _normalize_record(
         "input_ids": total_ids,
         "response_interval": [len(prompt_ids), len(total_ids)],
     }
+
+
+def _flush_pending_prompt_rows(
+    pending_rows: list[dict[str, Any]],
+    *,
+    tokenizer,
+    seq_len: int,
+    records: list[dict[str, Any]],
+) -> None:
+    if not pending_rows:
+        return
+    prompts = [str(row["prompt"]) for row in pending_rows]
+    responses = [str(row["response"]) for row in pending_rows]
+    prompt_ids_batch = tokenizer(prompts, add_special_tokens=False)["input_ids"]
+    response_ids_batch = tokenizer(responses, add_special_tokens=False)["input_ids"]
+    for prompt_ids, response_ids in zip(prompt_ids_batch, response_ids_batch, strict=True):
+        normalized = _normalize_prompt_response_ids(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            seq_len=seq_len,
+            record_idx=len(records),
+        )
+        if normalized is not None:
+            records.append(normalized)
+    pending_rows.clear()
 
 
 def load_records(datapath: str, tokenizer, seq_len: int) -> list[dict[str, Any]]:
@@ -196,10 +224,42 @@ def load_records(datapath: str, tokenizer, seq_len: int) -> list[dict[str, Any]]
                     source_rows.append(json.loads(raw_line))
 
     records: list[dict[str, Any]] = []
+    pending_prompt_rows: list[dict[str, Any]] = []
     for row in source_rows:
-        normalized = _normalize_record(row, tokenizer=tokenizer, seq_len=seq_len, record_idx=len(records))
-        if normalized is not None:
-            records.append(normalized)
+        if "input_ids" in row and "response_interval" in row:
+            _flush_pending_prompt_rows(
+                pending_prompt_rows,
+                tokenizer=tokenizer,
+                seq_len=seq_len,
+                records=records,
+            )
+            normalized = _normalize_input_record(
+                input_ids=row["input_ids"],
+                response_interval=row["response_interval"],
+                seq_len=seq_len,
+                record_idx=len(records),
+            )
+            if normalized is not None:
+                records.append(normalized)
+            continue
+
+        if "prompt" not in row or "response" not in row:
+            raise ValueError("Expected either input_ids/response_interval or prompt/response columns.")
+        pending_prompt_rows.append(row)
+        if len(pending_prompt_rows) >= TOKENIZATION_BATCH_SIZE:
+            _flush_pending_prompt_rows(
+                pending_prompt_rows,
+                tokenizer=tokenizer,
+                seq_len=seq_len,
+                records=records,
+            )
+
+    _flush_pending_prompt_rows(
+        pending_prompt_rows,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        records=records,
+    )
     if not records:
         raise ValueError("No usable prompt/response records were found.")
     return records
@@ -818,7 +878,7 @@ def process_batch(batch, model, alpha, num_attend_tokens, depth, max_top_k):
     return sequences
 
 
-def initialize_hdf5(hf: h5py.File) -> None:
+def initialize_hdf5(hf: h5py.File, attrs: dict[str, Any] | None = None) -> None:
     hf.create_dataset("main_path_ids", shape=(0,), maxshape=(None,), dtype="int32")
     hf.create_dataset("main_path_offsets", shape=(1,), maxshape=(None,), dtype="int64")
     hf["main_path_offsets"][0] = 0
@@ -842,6 +902,9 @@ def initialize_hdf5(hf: h5py.File) -> None:
     hf.create_dataset("node_child_count", shape=(0,), maxshape=(None,), dtype="int32")
     hf.attrs["format_version"] = "stage2"
     hf.attrs["attn_implementation"] = "flex_attention"
+    if attrs:
+        for key, value in attrs.items():
+            hf.attrs[key] = value
 
 
 def _append_1d(hf: h5py.File, name: str, values, dtype=None) -> None:
@@ -1045,8 +1108,12 @@ def merge_hdf5_parts(
             str(path): stack.enter_context(h5py.File(path, "r"))
             for path in part_paths
         }
+        merged_attrs: dict[str, Any] = {}
+        if part_paths:
+            first_part = part_handles[str(part_paths[0])]
+            merged_attrs = {str(key): first_part.attrs[key] for key in first_part.attrs.keys()}
         with h5py.File(output_path, "w") as hf:
-            initialize_hdf5(hf)
+            initialize_hdf5(hf, attrs=merged_attrs)
             written = 0
             for entry in manifest:
                 sequence_buf.append(_load_sequence_from_hdf5(part_handles[entry.part_path], entry))
@@ -1115,6 +1182,14 @@ def main():
             args.batch_size,
             ctx=ctx,
         )
+        hdf5_attrs = {
+            "tokenizer_name_or_path": tokenizer_name,
+            "model_name_or_path": args.model,
+            "alpha": float(args.alpha),
+            "num_attend_tokens": int(args.num_attend_tokens),
+            "depth": int(args.depth),
+            "max_top_k": int(args.max_top_k),
+        }
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         part_path = output_path
@@ -1125,7 +1200,7 @@ def main():
             ctx.log(f"Running Stage 2 with torchrun across {ctx.world_size} ranks.")
 
         with h5py.File(part_path, "w") as hf:
-            initialize_hdf5(hf)
+            initialize_hdf5(hf, attrs=hdf5_attrs)
             with torch.no_grad():
                 for batch in dataloader:
                     sequences = process_batch(
