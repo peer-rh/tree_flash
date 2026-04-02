@@ -63,6 +63,23 @@ def get_dataloader(datapath: str, tokenizer, seq_len: int, batch_size: int):
     try:
         from datasets import load_dataset
         records = load_dataset(datapath, split="train")
+        def tokenize_and_filter(batch):
+            input_ids = []
+            response_intervals = []
+            for prompt, response in zip(batch["prompt"], batch["response"]):
+                prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+                response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
+                total_ids = prompt_ids + response_ids
+                if not prompt_ids or not response_ids or len(total_ids) > seq_len:
+                    continue
+                input_ids.append(total_ids)
+                response_intervals.append([len(prompt_ids), len(total_ids)])
+            return {
+                "input_ids": input_ids,
+                "response_interval": response_intervals,
+            }
+
+        records = recoreds.map(tokenize_and_filter, batched=True, remove_columns=records.column_names)
     except Exception:
         records: list[dict[str, Any]] = []
         for file_path in _list_jsonl_files(datapath):
