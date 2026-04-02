@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import os
+import shutil
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,6 +13,7 @@ from typing import Any
 import h5py
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -45,6 +49,84 @@ class GeneratedSequenceTree:
     anchors: list[GeneratedAnchorTree]
 
 
+@dataclass(frozen=True)
+class DistributedContext:
+    rank: int
+    world_size: int
+    local_rank: int
+    device: torch.device
+    backend: str | None = None
+
+    @property
+    def is_distributed(self) -> bool:
+        return self.world_size > 1
+
+    @property
+    def is_primary(self) -> bool:
+        return self.rank == 0
+
+    def log(self, message: str) -> None:
+        if self.is_primary:
+            print(message, flush=True)
+
+    def barrier(self) -> None:
+        if self.is_distributed and dist.is_initialized():
+            dist.barrier()
+
+    def shutdown(self) -> None:
+        if self.is_distributed and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@dataclass(frozen=True)
+class HDF5MergeEntry:
+    record_idx: int
+    part_path: str
+    seq_idx: int
+    main_start: int
+    main_end: int
+    anchor_start: int
+    anchor_end: int
+    node_start: int
+    node_end: int
+
+
+def init_distributed_context(device_name: str | None = None) -> DistributedContext:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if world_size <= 1:
+        if device_name is None:
+            device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        return DistributedContext(
+            rank=0,
+            world_size=1,
+            local_rank=0,
+            device=torch.device(device_name),
+            backend=None,
+        )
+
+    requested_device = torch.device(device_name or "cuda")
+    if requested_device.type != "cuda":
+        raise ValueError("Torchrun Stage 2 device parallelism requires CUDA devices.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Multi-GPU Stage 2 requires CUDA when launched with torchrun.")
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is unavailable in this PyTorch build.")
+
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+    return DistributedContext(
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=torch.device("cuda", local_rank),
+        backend="nccl",
+    )
+
+
 def _list_jsonl_files(datapath: str) -> list[Path]:
     path = Path(datapath)
     if path.is_file():
@@ -59,54 +141,79 @@ def _list_jsonl_files(datapath: str) -> list[Path]:
     return files
 
 
-def get_dataloader(datapath: str, tokenizer, seq_len: int, batch_size: int):
+def _normalize_record(
+    row: dict[str, Any],
+    *,
+    tokenizer,
+    seq_len: int,
+    record_idx: int,
+) -> dict[str, Any] | None:
+    if "input_ids" in row and "response_interval" in row:
+        input_ids = [int(token_id) for token_id in row["input_ids"]]
+        response_interval = [int(position) for position in row["response_interval"]]
+        if len(response_interval) != 2:
+            raise ValueError("response_interval must contain exactly two positions.")
+        if not input_ids or response_interval[0] >= response_interval[1]:
+            return None
+        if response_interval[0] < 0 or response_interval[1] > len(input_ids):
+            raise ValueError("response_interval is out of bounds for input_ids.")
+        if len(input_ids) > seq_len:
+            return None
+        return {
+            "record_idx": record_idx,
+            "input_ids": input_ids,
+            "response_interval": response_interval,
+        }
+
+    if "prompt" not in row or "response" not in row:
+        raise ValueError("Expected either input_ids/response_interval or prompt/response columns.")
+
+    prompt_ids = tokenizer(row["prompt"], add_special_tokens=False)["input_ids"]
+    response_ids = tokenizer(row["response"], add_special_tokens=False)["input_ids"]
+    if not prompt_ids or not response_ids:
+        return None
+    total_ids = prompt_ids + response_ids
+    if len(total_ids) > seq_len:
+        return None
+    return {
+        "record_idx": record_idx,
+        "input_ids": total_ids,
+        "response_interval": [len(prompt_ids), len(total_ids)],
+    }
+
+
+def load_records(datapath: str, tokenizer, seq_len: int) -> list[dict[str, Any]]:
     try:
         from datasets import load_dataset
-        records = load_dataset(datapath, split="train")
-        def tokenize_and_filter(batch):
-            input_ids = []
-            response_intervals = []
-            for prompt, response in zip(batch["prompt"], batch["response"]):
-                prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-                response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
-                total_ids = prompt_ids + response_ids
-                if not prompt_ids or not response_ids or len(total_ids) > seq_len:
-                    continue
-                input_ids.append(total_ids)
-                response_intervals.append([len(prompt_ids), len(total_ids)])
-            return {
-                "input_ids": input_ids,
-                "response_interval": response_intervals,
-            }
-
-        records = recoreds.map(tokenize_and_filter, batched=True, remove_columns=records.column_names)
+        source_rows = load_dataset(datapath, split="train")
     except Exception:
-        records: list[dict[str, Any]] = []
+        source_rows = []
         for file_path in _list_jsonl_files(datapath):
             with file_path.open("r", encoding="utf-8") as handle:
                 for raw_line in handle:
                     if not raw_line.strip():
                         continue
-                    row = json.loads(raw_line)
-                    if "prompt" not in row or "response" not in row:
-                        raise ValueError(f"Missing prompt/response columns in {file_path}")
-                    prompt_ids = tokenizer(row["prompt"], add_special_tokens=False)["input_ids"]
-                    response_ids = tokenizer(row["response"], add_special_tokens=False)["input_ids"]
-                    if not prompt_ids or not response_ids:
-                        continue
-                    total_ids = prompt_ids + response_ids
-                    if len(total_ids) > seq_len:
-                        continue
-                    records.append(
-                        {
-                            "record_idx": len(records),
-                            "input_ids": total_ids,
-                            "response_interval": [len(prompt_ids), len(total_ids)],
-                        }
-                    )
+                    source_rows.append(json.loads(raw_line))
 
-        if not records:
-            raise ValueError("No usable prompt/response records were found.")
+    records: list[dict[str, Any]] = []
+    for row in source_rows:
+        normalized = _normalize_record(row, tokenizer=tokenizer, seq_len=seq_len, record_idx=len(records))
+        if normalized is not None:
+            records.append(normalized)
+    if not records:
+        raise ValueError("No usable prompt/response records were found.")
+    return records
+
+
+def shard_records_for_rank(records: list[dict[str, Any]], ctx: DistributedContext) -> list[dict[str, Any]]:
+    if not ctx.is_distributed:
+        return records
+    return [record for idx, record in enumerate(records) if idx % ctx.world_size == ctx.rank]
+
+
+def build_dataloader(records: list[dict[str, Any]], tokenizer, batch_size: int):
+    if not records:
+        raise ValueError("No usable prompt/response records were found for this rank.")
 
     pad_token_id = tokenizer.pad_token_id
     if pad_token_id is None:
@@ -135,6 +242,20 @@ def get_dataloader(datapath: str, tokenizer, seq_len: int, batch_size: int):
         }
 
     return DataLoader(records, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+
+
+def get_dataloader(
+    datapath: str,
+    tokenizer,
+    seq_len: int,
+    batch_size: int,
+    *,
+    ctx: DistributedContext | None = None,
+):
+    records = load_records(datapath, tokenizer, seq_len)
+    if ctx is not None:
+        records = shard_records_for_rank(records, ctx)
+    return build_dataloader(records, tokenizer, batch_size)
 
 
 def _get_base_model(model):
@@ -798,6 +919,150 @@ def flush_hdf5(hf: h5py.File, sequences: list[GeneratedSequenceTree]) -> None:
     hf["anchor_node_offsets"][-(len(anchor_node_offsets) - 1) :] = np.asarray(anchor_node_offsets[1:], dtype=np.int64)
 
 
+def build_parts_dir(output_path: Path) -> Path:
+    return Path(f"{output_path}.parts")
+
+
+def build_rank_part_path(output_path: Path, rank: int) -> Path:
+    return build_parts_dir(output_path) / f"rank_{rank:05d}.h5"
+
+
+def prepare_parts_dir(parts_dir: Path, ctx: DistributedContext) -> None:
+    if not ctx.is_distributed:
+        if parts_dir.exists():
+            raise FileExistsError(
+                f"Temporary Stage 2 parts directory already exists: {parts_dir}. "
+                "Remove it or choose a different --output path before rerunning."
+            )
+        parts_dir.mkdir(parents=True, exist_ok=False)
+        return
+
+    status = torch.ones(1, device=ctx.device, dtype=torch.int32)
+    if ctx.is_primary:
+        try:
+            if parts_dir.exists():
+                raise FileExistsError(
+                    f"Temporary Stage 2 parts directory already exists: {parts_dir}. "
+                    "Remove it or choose a different --output path before rerunning."
+                )
+            parts_dir.mkdir(parents=True, exist_ok=False)
+        except Exception:
+            status.zero_()
+    dist.broadcast(status, src=0)
+    if int(status.item()) != 1:
+        raise RuntimeError(f"Could not prepare temporary Stage 2 parts directory: {parts_dir}")
+
+
+def collect_merge_manifest(part_paths: list[Path]) -> list[HDF5MergeEntry]:
+    manifest: list[HDF5MergeEntry] = []
+    for part_path in part_paths:
+        with h5py.File(part_path, "r") as hf:
+            record_idx = hf["record_idx"][:]
+            main_offsets = hf["main_path_offsets"][:]
+            seq_anchor_offsets = hf["sequence_anchor_offsets"][:]
+            anchor_node_offsets = hf["anchor_node_offsets"][:]
+            if main_offsets.shape[0] != record_idx.shape[0] + 1:
+                raise ValueError(
+                    f"Mismatched main_path_offsets and record_idx lengths in {part_path}: "
+                    f"{main_offsets.shape[0]} vs {record_idx.shape[0]}"
+                )
+            if seq_anchor_offsets.shape[0] != record_idx.shape[0] + 1:
+                raise ValueError(
+                    f"Mismatched sequence_anchor_offsets and record_idx lengths in {part_path}: "
+                    f"{seq_anchor_offsets.shape[0]} vs {record_idx.shape[0]}"
+                )
+            for seq_idx, seq_record_idx in enumerate(record_idx.tolist()):
+                anchor_start = int(seq_anchor_offsets[seq_idx])
+                anchor_end = int(seq_anchor_offsets[seq_idx + 1])
+                manifest.append(
+                    HDF5MergeEntry(
+                        record_idx=int(seq_record_idx),
+                        part_path=str(part_path),
+                        seq_idx=seq_idx,
+                        main_start=int(main_offsets[seq_idx]),
+                        main_end=int(main_offsets[seq_idx + 1]),
+                        anchor_start=anchor_start,
+                        anchor_end=anchor_end,
+                        node_start=int(anchor_node_offsets[anchor_start]),
+                        node_end=int(anchor_node_offsets[anchor_end]),
+                    )
+                )
+    manifest.sort(key=lambda entry: entry.record_idx)
+    return manifest
+
+
+def _load_sequence_from_hdf5(hf: h5py.File, entry: HDF5MergeEntry) -> GeneratedSequenceTree:
+    anchors: list[GeneratedAnchorTree] = []
+    anchor_node_offsets = hf["anchor_node_offsets"]
+    for anchor_idx in range(entry.anchor_start, entry.anchor_end):
+        node_start = int(anchor_node_offsets[anchor_idx])
+        node_end = int(anchor_node_offsets[anchor_idx + 1])
+        nodes: list[SequenceTreeNode] = []
+        for node_idx in range(node_start, node_end):
+            nodes.append(
+                SequenceTreeNode(
+                    token_id=int(hf["node_token_ids"][node_idx]),
+                    parent_index=int(hf["node_parent_indices"][node_idx]),
+                    depth=int(hf["node_depths"][node_idx]),
+                    local_prob=float(hf["node_local_probs"][node_idx]),
+                    path_prob=float(hf["node_path_probs"][node_idx]),
+                    rank=int(hf["node_ranks"][node_idx]),
+                    main_path_position=int(hf["node_main_path_positions"][node_idx]),
+                    is_main_path=bool(hf["node_is_main_path"][node_idx]),
+                    child_indices=[
+                        int(hf["node_first_child"][node_idx]),
+                        int(hf["node_child_count"][node_idx]),
+                    ],
+                )
+            )
+        anchors.append(
+            GeneratedAnchorTree(
+                anchor_main_path_position=int(hf["anchor_main_path_positions"][anchor_idx]),
+                anchor_next_token_prob=float(hf["anchor_next_token_probs"][anchor_idx]),
+                nodes=nodes,
+            )
+        )
+    return GeneratedSequenceTree(
+        record_idx=entry.record_idx,
+        main_path_ids=[int(token_id) for token_id in hf["main_path_ids"][entry.main_start : entry.main_end]],
+        response_start_position=int(hf["response_start_positions"][entry.seq_idx]),
+        anchors=anchors,
+    )
+
+
+def merge_hdf5_parts(
+    *,
+    part_paths: list[Path],
+    output_path: Path,
+    log_fn,
+) -> int:
+    manifest = collect_merge_manifest(part_paths)
+    sequence_buf: list[GeneratedSequenceTree] = []
+    flush_every = 128
+
+    with ExitStack() as stack:
+        part_handles = {
+            str(path): stack.enter_context(h5py.File(path, "r"))
+            for path in part_paths
+        }
+        with h5py.File(output_path, "w") as hf:
+            initialize_hdf5(hf)
+            written = 0
+            for entry in manifest:
+                sequence_buf.append(_load_sequence_from_hdf5(part_handles[entry.part_path], entry))
+                if len(sequence_buf) >= flush_every:
+                    flush_hdf5(hf, sequence_buf)
+                    written += len(sequence_buf)
+                    sequence_buf.clear()
+                    log_fn(f"Merged sequences: {written}")
+
+            if sequence_buf:
+                flush_hdf5(hf, sequence_buf)
+                written += len(sequence_buf)
+                sequence_buf.clear()
+    return len(manifest)
+
+
 def _parse_dtype(dtype_name: str) -> torch.dtype:
     mapping = {
         "float32": torch.float32,
@@ -824,41 +1089,71 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", default="bfloat16", choices=["float32", "float16", "bfloat16"])
     args = parser.parse_args()
+    ctx = init_distributed_context(args.device)
+    try:
+        tokenizer_name = args.tokenizer or args.model
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        if tokenizer.pad_token_id is None:
+            if tokenizer.eos_token_id is None:
+                raise ValueError("Tokenizer must define either pad_token_id or eos_token_id.")
+            tokenizer.pad_token = tokenizer.eos_token
 
-    tokenizer_name = args.tokenizer or args.model
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token_id is None:
-            raise ValueError("Tokenizer must define either pad_token_id or eos_token_id.")
-        tokenizer.pad_token = tokenizer.eos_token
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=_parse_dtype(args.dtype),
+            attn_implementation="flex_attention",
+        ).to(ctx.device)
+        model.eval()
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=_parse_dtype(args.dtype),
-        attn_implementation="flex_attention",
-    ).to(args.device)
-    model.eval()
+        if getattr(model.config, "_attn_implementation", None) != "flex_attention":
+            raise ValueError("The loaded model is not configured for flex_attention.")
 
-    if getattr(model.config, "_attn_implementation", None) != "flex_attention":
-        raise ValueError("The loaded model is not configured for flex_attention.")
+        dataloader = get_dataloader(
+            args.input,
+            tokenizer,
+            args.seq_len,
+            args.batch_size,
+            ctx=ctx,
+        )
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        part_path = output_path
+        if ctx.is_distributed:
+            parts_dir = build_parts_dir(output_path)
+            prepare_parts_dir(parts_dir, ctx)
+            part_path = build_rank_part_path(output_path, ctx.rank)
+            ctx.log(f"Running Stage 2 with torchrun across {ctx.world_size} ranks.")
 
-    dataloader = get_dataloader(args.input, tokenizer, args.seq_len, args.batch_size)
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+        with h5py.File(part_path, "w") as hf:
+            initialize_hdf5(hf)
+            with torch.no_grad():
+                for batch in dataloader:
+                    sequences = process_batch(
+                        batch=batch,
+                        model=model,
+                        alpha=args.alpha,
+                        num_attend_tokens=args.num_attend_tokens,
+                        depth=args.depth,
+                        max_top_k=args.max_top_k,
+                    )
+                    flush_hdf5(hf, sequences)
 
-    with h5py.File(output_path, "w") as hf:
-        initialize_hdf5(hf)
-        with torch.no_grad():
-            for batch in dataloader:
-                sequences = process_batch(
-                    batch=batch,
-                    model=model,
-                    alpha=args.alpha,
-                    num_attend_tokens=args.num_attend_tokens,
-                    depth=args.depth,
-                    max_top_k=args.max_top_k,
+        if ctx.is_distributed:
+            ctx.barrier()
+            if ctx.is_primary:
+                part_paths = [build_rank_part_path(output_path, rank) for rank in range(ctx.world_size)]
+                ctx.log(f"Merging {len(part_paths)} Stage 2 rank shards into {output_path}")
+                total_sequences = merge_hdf5_parts(
+                    part_paths=part_paths,
+                    output_path=output_path,
+                    log_fn=ctx.log,
                 )
-                flush_hdf5(hf, sequences)
+                shutil.rmtree(build_parts_dir(output_path))
+                ctx.log(f"Done. Sequences: {total_sequences}")
+        else:
+            ctx.log(f"Done. Wrote Stage 2 output to {output_path}")
+    finally:
+        ctx.shutdown()
 
 
 if __name__ == "__main__":
