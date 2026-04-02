@@ -43,6 +43,10 @@ python cleaned-up/infer.py --target Qwen/Qwen3-4B --drafter path/to/drafter --pr
 - `infer.py`
   - one speculative decoding entrypoint
   - fixed tree + q-head pruning + target verification
+- `spec_decode.py`
+  - local cleaned-up speculative decoding core
+  - target-cache + drafter-cache handling
+  - q-head-only pruning and tree verification
 - `utils.py`
   - tiny shared helpers (`unwrap_model`, LR schedule, sampling)
 
@@ -127,8 +131,14 @@ Inference keeps one path:
 5. commit the deepest accepted path
 
 `infer.py` intentionally reuses the existing low-level speculative-decoding
-helpers from `src/spec_decode.py` so the cleaned-up code stays short and easy to
-scan.
+helpers from the local `spec_decode.py` module so the cleaned-up code stays
+self-contained and easy to scan.
+
+This cleaned-up speculative decoder is intentionally narrower than `src/`:
+
+- it keeps target-model and drafter caching
+- it uses q-head pruning only
+- it does not carry AR-head branches or legacy inference support
 
 ## Compile Notes
 

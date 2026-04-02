@@ -7,7 +7,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from model import build_inference_tree, load_drafter_model
-from src.spec_decode import speculative_generate_from_ids
+from spec_decode import speculative_generate_from_ids
 
 
 @torch.inference_mode()
