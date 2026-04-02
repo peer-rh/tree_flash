@@ -23,6 +23,13 @@ except ImportError:
     cce_linear_cross_entropy = None
 
 
+def _safe_div(numerator: float, denominator: int) -> float:
+    """Return `numerator / denominator` with a zero fallback."""
+    if denominator <= 0:
+        return 0.0
+    return float(numerator) / float(denominator)
+
+
 @dataclass
 class TrainerConfig:
     """Minimal trainer configuration for the cleaned-up path."""
@@ -486,6 +493,105 @@ class TreeFlashTrainer:
         prune_loss = bce * focal_factor
         return prune_loss[flat_valid_mask].sum().to(dtype)
 
+    def _empty_tree_metric_totals(self) -> dict[str, float | int]:
+        return {
+            "tree_match_count": 0,
+            "tree_total_count": 0,
+            "main_match_count": 0,
+            "main_total_count": 0,
+            "acceptance_depth_sum": 0.0,
+            "acceptance_anchor_count": 0,
+            "sibling_collision_count": 0,
+            "sibling_pair_count": 0,
+            "useful_anchor_count": 0,
+            "usefulness_anchor_count": 0,
+        }
+
+    def _compute_tree_metric_totals(
+        self,
+        *,
+        predictions: torch.Tensor,
+        labels: torch.Tensor,
+        valid_mask: torch.Tensor,
+        tree_cum_probs: torch.Tensor,
+        tree_valid_mask: torch.Tensor,
+        anchor_valid_mask: torch.Tensor,
+        tree_info,
+    ) -> dict[str, float | int]:
+        """Compute tree-structured metric totals from one batch."""
+        totals = self._empty_tree_metric_totals()
+        totals["tree_match_count"] = int((predictions.eq(labels) & valid_mask).sum().item())
+        totals["tree_total_count"] = int(valid_mask.sum().item())
+        batch_size, num_anchors, tree_size = predictions.shape
+        device = predictions.device
+        depth = tree_info.depth.clamp(0, tree_size - 1)
+        score_scale = tree_cum_probs.abs().amax().to(torch.float32) + 1.0
+        ranking_score = depth.to(torch.float32) * score_scale + tree_cum_probs.to(torch.float32)
+
+        off_main_candidates = valid_mask & (~tree_info.primary_path_mask)
+        primary_candidates = tree_valid_mask & tree_info.primary_path_mask
+
+        neg_inf = torch.full_like(ranking_score, float("-inf"))
+        off_main_scores = torch.where(off_main_candidates, ranking_score, neg_inf)
+        primary_scores = torch.where(primary_candidates, ranking_score, neg_inf)
+        has_off_main = off_main_candidates.any(dim=-1)
+        selected_off_main = off_main_scores.argmax(dim=-1)
+        selected_primary = primary_scores.argmax(dim=-1)
+        basis_endpoint = torch.where(has_off_main, selected_off_main, selected_primary)
+
+        basis_endpoint_index = basis_endpoint.unsqueeze(-1).unsqueeze(-1).expand(batch_size, num_anchors, 1, tree_size)
+        basis_path_mask = tree_info.tree_mask.gather(2, basis_endpoint_index).squeeze(2) & tree_valid_mask
+
+        depth_one_hot = F.one_hot(depth, num_classes=tree_size).to(torch.bool)
+        basis_depth_mask = basis_path_mask.unsqueeze(-1) & depth_one_hot
+        basis_depth_exists = basis_depth_mask.any(dim=2)
+        basis_target_by_depth = (basis_depth_mask.to(labels.dtype) * labels.unsqueeze(-1)).sum(dim=2)
+
+        node_basis_target = basis_target_by_depth.gather(2, depth)
+        node_has_basis_target = basis_depth_exists.gather(2, depth)
+
+        main_comparable_mask = valid_mask & node_has_basis_target
+        totals["main_total_count"] = int(main_comparable_mask.sum().item())
+        totals["main_match_count"] = int((predictions.eq(node_basis_target) & main_comparable_mask).sum().item())
+
+        node_matches_basis = tree_valid_mask & node_has_basis_target & predictions.eq(node_basis_target)
+        ancestor_failure = tree_info.tree_mask & (~node_matches_basis.unsqueeze(-2))
+        ancestor_chain_ok = ~ancestor_failure.any(dim=-1)
+        accepted_node_mask = valid_mask & ancestor_chain_ok
+
+        best_depth_per_anchor = torch.where(
+            accepted_node_mask,
+            depth,
+            torch.zeros_like(depth),
+        ).amax(dim=-1)
+        anchor_valid_float = anchor_valid_mask.to(torch.float32)
+        totals["acceptance_anchor_count"] = int(anchor_valid_mask.sum().item())
+        totals["usefulness_anchor_count"] = int(anchor_valid_mask.sum().item())
+        totals["acceptance_depth_sum"] = float(
+            (best_depth_per_anchor.to(torch.float32) * anchor_valid_float).sum().item()
+        )
+
+        best_depth_mask = accepted_node_mask & depth.eq(best_depth_per_anchor.unsqueeze(-1))
+        useful_anchor_mask = (best_depth_mask & (~basis_path_mask)).any(dim=-1) & anchor_valid_mask
+        totals["useful_anchor_count"] = int(useful_anchor_mask.sum().item())
+
+        parent_idx = tree_info.parent_idx
+        upper_triangle = torch.triu(
+            torch.ones((tree_size, tree_size), dtype=torch.bool, device=device),
+            diagonal=1,
+        ).view(1, 1, tree_size, tree_size)
+        sibling_pair_mask = (
+            valid_mask.unsqueeze(-1)
+            & valid_mask.unsqueeze(-2)
+            & parent_idx.unsqueeze(-1).eq(parent_idx.unsqueeze(-2))
+            & parent_idx.unsqueeze(-1).ge(0)
+            & upper_triangle
+        )
+        collision_mask = sibling_pair_mask & predictions.unsqueeze(-1).eq(predictions.unsqueeze(-2))
+        totals["sibling_pair_count"] = int(sibling_pair_mask.sum().item())
+        totals["sibling_collision_count"] = int(collision_mask.sum().item())
+        return totals
+
     def _forward_batch(self, batch: PackedBatch, *, profile: bool) -> dict[str, Any]:
         batch = batch.to(self.fabric.device)
         zero = torch.zeros((), device=self.fabric.device)
@@ -495,7 +601,7 @@ class TreeFlashTrainer:
                 "ce_loss": zero,
                 "prune_loss": zero,
                 "valid_count": 0,
-                "token_accuracy": 0.0,
+                **self._empty_tree_metric_totals(),
                 "prefill_time": 0.0,
                 "mask_time": 0.0,
                 "drafter_time": 0.0,
@@ -509,7 +615,7 @@ class TreeFlashTrainer:
                 "ce_loss": zero,
                 "prune_loss": zero,
                 "valid_count": 0,
-                "token_accuracy": 0.0,
+                **self._empty_tree_metric_totals(),
                 "prefill_time": 0.0,
                 "mask_time": 0.0,
                 "drafter_time": 0.0,
@@ -580,14 +686,22 @@ class TreeFlashTrainer:
         ce_loss = loss_sum / max(valid_count, 1)
         prune_loss = prune_loss_sum / max(valid_count, 1)
         loss = ce_loss + self.config.prune_loss_lambda * prune_loss
-        token_matches = predictions.eq(flat_labels) & flat_valid_mask
-        token_accuracy = float(token_matches.sum().item()) / max(valid_count, 1)
+        predictions = predictions.view(batch_size, num_anchors, tree_size)
+        metric_totals = self._compute_tree_metric_totals(
+            predictions=predictions,
+            labels=batch.tree_labels,
+            valid_mask=valid_mask,
+            tree_cum_probs=batch.tree_cum_probs,
+            tree_valid_mask=batch.tree_valid_mask,
+            anchor_valid_mask=batch.anchor_valid_mask,
+            tree_info=tree_info,
+        )
         return {
             "loss": loss,
             "ce_loss": ce_loss,
             "prune_loss": prune_loss,
             "valid_count": valid_count,
-            "token_accuracy": token_accuracy,
+            **metric_totals,
             "prefill_time": prefill_time,
             "mask_time": mask_time,
             "drafter_time": drafter_time,
@@ -628,7 +742,16 @@ class TreeFlashTrainer:
         total_ce = 0.0
         total_prune = 0.0
         total_valid = 0
-        total_accuracy = 0.0
+        total_tree_matches = 0
+        total_tree_count = 0
+        total_main_matches = 0
+        total_main_count = 0
+        total_acceptance_depth = 0.0
+        total_acceptance_anchors = 0
+        total_sibling_collisions = 0
+        total_sibling_pairs = 0
+        total_useful_anchors = 0
+        total_usefulness_anchors = 0
         for batch_idx, batch in enumerate(self.eval_loader):
             if batch_idx >= self.config.eval_batches:
                 break
@@ -638,26 +761,75 @@ class TreeFlashTrainer:
             total_loss += float(result["loss"].item()) * valid_count
             total_ce += float(result["ce_loss"].item()) * valid_count
             total_prune += float(result["prune_loss"].item()) * valid_count
-            total_accuracy += float(result["token_accuracy"]) * valid_count
+            total_tree_matches += int(result["tree_match_count"])
+            total_tree_count += int(result["tree_total_count"])
+            total_main_matches += int(result["main_match_count"])
+            total_main_count += int(result["main_total_count"])
+            total_acceptance_depth += float(result["acceptance_depth_sum"])
+            total_acceptance_anchors += int(result["acceptance_anchor_count"])
+            total_sibling_collisions += int(result["sibling_collision_count"])
+            total_sibling_pairs += int(result["sibling_pair_count"])
+            total_useful_anchors += int(result["useful_anchor_count"])
+            total_usefulness_anchors += int(result["usefulness_anchor_count"])
 
         reduced = self.fabric.all_reduce(
             torch.tensor(
-                [total_loss, total_ce, total_prune, float(total_valid), total_accuracy],
+                [
+                    total_loss,
+                    total_ce,
+                    total_prune,
+                    float(total_valid),
+                    float(total_tree_matches),
+                    float(total_tree_count),
+                    float(total_main_matches),
+                    float(total_main_count),
+                    total_acceptance_depth,
+                    float(total_acceptance_anchors),
+                    float(total_sibling_collisions),
+                    float(total_sibling_pairs),
+                    float(total_useful_anchors),
+                    float(total_usefulness_anchors),
+                ],
                 dtype=torch.float64,
                 device=self.fabric.device,
             ),
             reduce_op="sum",
         ) if getattr(self.fabric, "world_size", 1) > 1 else torch.tensor(
-            [total_loss, total_ce, total_prune, float(total_valid), total_accuracy],
+            [
+                total_loss,
+                total_ce,
+                total_prune,
+                float(total_valid),
+                float(total_tree_matches),
+                float(total_tree_count),
+                float(total_main_matches),
+                float(total_main_count),
+                total_acceptance_depth,
+                float(total_acceptance_anchors),
+                float(total_sibling_collisions),
+                float(total_sibling_pairs),
+                float(total_useful_anchors),
+                float(total_usefulness_anchors),
+            ],
             dtype=torch.float64,
             device=self.fabric.device,
         )
         total_valid = int(round(float(reduced[3].item())))
+        tree_accuracy = _safe_div(float(reduced[4].item()), int(round(float(reduced[5].item()))))
+        main_accuracy = _safe_div(float(reduced[6].item()), int(round(float(reduced[7].item()))))
+        acceptance_proxy = _safe_div(float(reduced[8].item()), int(round(float(reduced[9].item()))))
+        sibling_collision_rate = _safe_div(float(reduced[10].item()), int(round(float(reduced[11].item()))))
+        tree_usefulness = _safe_div(float(reduced[12].item()), int(round(float(reduced[13].item()))))
         metrics = {
             "eval/loss": float(reduced[0].item()) / max(total_valid, 1),
             "eval/ce_loss": float(reduced[1].item()) / max(total_valid, 1),
             "eval/prune_loss": float(reduced[2].item()) / max(total_valid, 1),
-            "eval/token_accuracy": float(reduced[4].item()) / max(total_valid, 1),
+            "eval/tree_accuracy": tree_accuracy,
+            "eval/token_accuracy": tree_accuracy,
+            "eval/main_accuracy": main_accuracy,
+            "eval/acceptance_proxy": acceptance_proxy,
+            "eval/sibling_collision_rate": sibling_collision_rate,
+            "eval/tree_usefulness": tree_usefulness,
         }
         self.drafter_model.train()
         return metrics
@@ -672,7 +844,16 @@ class TreeFlashTrainer:
         accumulated_loss = 0.0
         accumulated_ce = 0.0
         accumulated_prune = 0.0
-        accumulated_accuracy = 0.0
+        accumulated_tree_matches = 0
+        accumulated_tree_count = 0
+        accumulated_main_matches = 0
+        accumulated_main_count = 0
+        accumulated_acceptance_depth = 0.0
+        accumulated_acceptance_anchors = 0
+        accumulated_sibling_collisions = 0
+        accumulated_sibling_pairs = 0
+        accumulated_useful_anchors = 0
+        accumulated_usefulness_anchors = 0
         accumulated_prefill = 0.0
         accumulated_mask = 0.0
         accumulated_drafter = 0.0
@@ -693,7 +874,16 @@ class TreeFlashTrainer:
                 accumulated_loss += float(result["loss"].detach().item())
                 accumulated_ce += float(result["ce_loss"].detach().item())
                 accumulated_prune += float(result["prune_loss"].detach().item())
-                accumulated_accuracy += float(result["token_accuracy"])
+                accumulated_tree_matches += int(result["tree_match_count"])
+                accumulated_tree_count += int(result["tree_total_count"])
+                accumulated_main_matches += int(result["main_match_count"])
+                accumulated_main_count += int(result["main_total_count"])
+                accumulated_acceptance_depth += float(result["acceptance_depth_sum"])
+                accumulated_acceptance_anchors += int(result["acceptance_anchor_count"])
+                accumulated_sibling_collisions += int(result["sibling_collision_count"])
+                accumulated_sibling_pairs += int(result["sibling_pair_count"])
+                accumulated_useful_anchors += int(result["useful_anchor_count"])
+                accumulated_usefulness_anchors += int(result["usefulness_anchor_count"])
                 accumulated_prefill += float(result["prefill_time"])
                 accumulated_mask += float(result["mask_time"])
                 accumulated_drafter += float(result["drafter_time"])
@@ -718,11 +908,21 @@ class TreeFlashTrainer:
                 self.global_step = optimizer_step
 
                 denom = max(self.config.grad_accum_steps, 1)
+                tree_accuracy = _safe_div(accumulated_tree_matches, accumulated_tree_count)
+                main_accuracy = _safe_div(accumulated_main_matches, accumulated_main_count)
+                acceptance_proxy = _safe_div(accumulated_acceptance_depth, accumulated_acceptance_anchors)
+                sibling_collision_rate = _safe_div(accumulated_sibling_collisions, accumulated_sibling_pairs)
+                tree_usefulness = _safe_div(accumulated_useful_anchors, accumulated_usefulness_anchors)
                 train_metrics = {
                     "train/loss": accumulated_loss / denom,
                     "train/ce_loss": accumulated_ce / denom,
                     "train/prune_loss": accumulated_prune / denom,
-                    "train/token_accuracy": accumulated_accuracy / denom,
+                    "train/tree_accuracy": tree_accuracy,
+                    "train/token_accuracy": tree_accuracy,
+                    "train/main_accuracy": main_accuracy,
+                    "train/acceptance_proxy": acceptance_proxy,
+                    "train/sibling_collision_rate": sibling_collision_rate,
+                    "train/tree_usefulness": tree_usefulness,
                     "train/lr": lr,
                 }
                 if profile:
@@ -738,7 +938,11 @@ class TreeFlashTrainer:
                     print(
                         f"step={self.global_step} loss={train_metrics['train/loss']:.4f} "
                         f"ce={train_metrics['train/ce_loss']:.4f} prune={train_metrics['train/prune_loss']:.4f} "
-                        f"acc={train_metrics['train/token_accuracy']:.3f} lr={lr:.2e}",
+                        f"tree_acc={train_metrics['train/tree_accuracy']:.3f} "
+                        f"main_acc={train_metrics['train/main_accuracy']:.3f} "
+                        f"accept={train_metrics['train/acceptance_proxy']:.3f} "
+                        f"sib_coll={train_metrics['train/sibling_collision_rate']:.3f} "
+                        f"useful={train_metrics['train/tree_usefulness']:.3f} lr={lr:.2e}",
                         flush=True,
                     )
                 if self.config.log_every > 0 and self.global_step % self.config.log_every == 0:
@@ -747,7 +951,16 @@ class TreeFlashTrainer:
                 accumulated_loss = 0.0
                 accumulated_ce = 0.0
                 accumulated_prune = 0.0
-                accumulated_accuracy = 0.0
+                accumulated_tree_matches = 0
+                accumulated_tree_count = 0
+                accumulated_main_matches = 0
+                accumulated_main_count = 0
+                accumulated_acceptance_depth = 0.0
+                accumulated_acceptance_anchors = 0
+                accumulated_sibling_collisions = 0
+                accumulated_sibling_pairs = 0
+                accumulated_useful_anchors = 0
+                accumulated_usefulness_anchors = 0
                 accumulated_prefill = 0.0
                 accumulated_mask = 0.0
                 accumulated_drafter = 0.0
@@ -758,7 +971,11 @@ class TreeFlashTrainer:
                     if self.fabric.is_global_zero:
                         print(
                             f"[eval step={self.global_step}] loss={metrics['eval/loss']:.4f} "
-                            f"acc={metrics['eval/token_accuracy']:.3f}",
+                            f"tree_acc={metrics['eval/tree_accuracy']:.3f} "
+                            f"main_acc={metrics['eval/main_accuracy']:.3f} "
+                            f"accept={metrics['eval/acceptance_proxy']:.3f} "
+                            f"sib_coll={metrics['eval/sibling_collision_rate']:.3f} "
+                            f"useful={metrics['eval/tree_usefulness']:.3f}",
                             flush=True,
                         )
                     self._log(metrics, self.global_step)

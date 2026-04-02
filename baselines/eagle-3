@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+EAGLE_REPO_ARG="${EAGLE_REPO:-}"
+OFFICIAL_MODEL=""
+EA_MODEL=""
+OUTPUT_DIR=""
+
+ARGS=("$@")
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --eagle-repo)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "missing value for --eagle-repo" >&2
+        exit 2
+      fi
+      EAGLE_REPO_ARG="$1"
+      ;;
+    --official-eagle3-model)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "missing value for --official-eagle3-model" >&2
+        exit 2
+      fi
+      OFFICIAL_MODEL="$1"
+      ;;
+    --ea-model)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "missing value for --ea-model" >&2
+        exit 2
+      fi
+      EA_MODEL="$1"
+      ;;
+    --output-dir)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "missing value for --output-dir" >&2
+        exit 2
+      fi
+      OUTPUT_DIR="$1"
+      ;;
+  esac
+  shift
+done
+
+if [[ -z "${EAGLE_REPO_ARG}" ]]; then
+  echo "An upstream EAGLE checkout is required via --eagle-repo or EAGLE_REPO." >&2
+  exit 2
+fi
+
+if [[ -n "${OFFICIAL_MODEL}" && -n "${EA_MODEL}" ]]; then
+  echo "Pass exactly one of --official-eagle3-model or --ea-model." >&2
+  exit 2
+fi
+
+if [[ -z "${OFFICIAL_MODEL}" && -z "${EA_MODEL}" ]]; then
+  echo "An EAGLE-3 checkpoint is required via --official-eagle3-model or --ea-model." >&2
+  exit 2
+fi
+
+SELECTED_MODEL="${OFFICIAL_MODEL:-$EA_MODEL}"
+if [[ -z "${OUTPUT_DIR}" ]]; then
+  MODEL_SLUG="${SELECTED_MODEL//\//__}"
+  MODEL_SLUG="${MODEL_SLUG//:/__}"
+  OUTPUT_DIR="${REPO_ROOT}/outputs/baselines/eagle-3/${MODEL_SLUG}"
+  ARGS+=("--output-dir" "${OUTPUT_DIR}")
+fi
+
+cd "${REPO_ROOT}"
+exec uv run -m baselines.eagle_3_eval "${ARGS[@]}"
