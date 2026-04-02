@@ -28,6 +28,11 @@ python cleaned-up/infer.py --target Qwen/Qwen3-4B --drafter path/to/drafter --pr
   - sequence-tree dataset reader
   - packed batch construction
   - dynamic training-subtree sampling
+- `stage2_v2.py`
+  - standalone cleaned-up Stage 2 v2 generator
+  - JSONL and HF dataset input loading
+  - flex-attention verifier expansion with `StaticCache`
+  - compile-friendly fixed-round tree growth
 - `model.py`
   - rank-aware relation ids
   - dynamic `TreeInfo` builder for padded trees
@@ -82,8 +87,8 @@ Each stored node contains:
 - `main_path_position`
 - `is_main_path`
 
-`data.py` wraps the existing Stage 2 v2 HDF5 writer helpers instead of
-re-implementing the low-level file layout.
+`stage2_v2.py` owns the cleaned-up Stage 2 v2 writer and generator path.
+`data.py` reads and writes the same local Stage 2 v2 schema.
 
 ### 3. Training
 

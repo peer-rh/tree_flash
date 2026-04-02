@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import BatchSampler, DataLoader, Dataset, SequentialSampler, Subset, random_split
 
-from data_pipeline.stage2_v2 import (
+from stage2_v2 import (
     GeneratedAnchorTree,
     GeneratedSequenceTree,
     SequenceTreeNode,
