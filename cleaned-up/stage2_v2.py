@@ -838,25 +838,7 @@ def _dummy_anchor_position_for_row(
 
 
 def _build_static_cache(model, *, batch_size: int, max_cache_len: int):
-    signature = inspect.signature(StaticCache)
-    first_param = next(model.parameters(), None)
-    device = first_param.device if first_param is not None else torch.device("cpu")
-    dtype = getattr(model, "dtype", None)
-    if dtype is None:
-        dtype = first_param.dtype if first_param is not None else torch.float32
-    kwargs: dict[str, Any] = {
-        "config": model.config,
-        "max_cache_len": int(max_cache_len),
-        "device": device,
-        "dtype": dtype,
-    }
-    if "max_batch_size" in signature.parameters:
-        kwargs["max_batch_size"] = int(batch_size)
-    elif "batch_size" in signature.parameters:
-        kwargs["batch_size"] = int(batch_size)
-    else:
-        raise TypeError("Unsupported StaticCache signature.")
-    return StaticCache(**kwargs)
+    return StaticCache(model.config, max_cache_len=int(max_cache_len))
 
 
 def _append_children_to_tensor_state(
