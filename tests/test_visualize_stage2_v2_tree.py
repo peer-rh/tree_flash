@@ -159,6 +159,45 @@ def test_load_stage2_v2_tree_includes_backbone_and_all_anchor_nodes(tmp_path: Pa
     assert [node.path_prob for node in tree.nodes[5:]] == pytest.approx([0.6, 0.4, 0.42, 0.8, 0.2], rel=1e-6)
 
 
+def test_assign_x_slots_pins_main_path_left_and_packs_anchor_nodes_by_row(tmp_path: Path) -> None:
+    fixture_path = tmp_path / "stage2_v2_visualizer.h5"
+    _write_visualizer_fixture(fixture_path)
+
+    tree = vis_mod.load_stage2_v2_tree(fixture_path, sequence_index=0)
+    x_slots = vis_mod._assign_x_slots(tree.nodes)
+
+    row_slots: dict[int, list[tuple[str, int, int]]] = {}
+    for node in tree.nodes:
+        row_slots.setdefault(node.position_id, []).append(
+            (
+                node.source,
+                int(x_slots[node.index]),
+                node.rank,
+            )
+        )
+
+    for position_id, entries in row_slots.items():
+        main_slots = [slot for source, slot, _ in entries if source == "main"]
+        anchor_slots = sorted(slot for source, slot, _ in entries if source == "anchor")
+        if main_slots:
+            assert main_slots == [0], f"main node for row {position_id} should be in the leftmost slot"
+            assert anchor_slots == list(range(1, 1 + len(anchor_slots)))
+
+    row3_anchor_ranks = [node.rank for node in tree.nodes if node.position_id == 3 and node.source == "anchor"]
+    row3_anchor_slots = [
+        int(x_slots[node.index]) for node in tree.nodes if node.position_id == 3 and node.source == "anchor"
+    ]
+    assert row3_anchor_ranks == [1, 2]
+    assert row3_anchor_slots == [1, 2]
+
+    row4_anchor_tokens = [node.token_id for node in tree.nodes if node.position_id == 4 and node.source == "anchor"]
+    row4_anchor_slots = [
+        int(x_slots[node.index]) for node in tree.nodes if node.position_id == 4 and node.source == "anchor"
+    ]
+    assert row4_anchor_tokens == [23, 23, 44]
+    assert row4_anchor_slots == [1, 2, 3]
+
+
 def test_render_stage2_v2_tree_html_contains_main_path_and_branch_tokens(tmp_path: Path, monkeypatch) -> None:
     fixture_path = tmp_path / "stage2_v2_visualizer.h5"
     _write_visualizer_fixture(fixture_path)

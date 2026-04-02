@@ -7,6 +7,10 @@ from pathlib import Path
 
 import h5py
 from transformers import AutoTokenizer
+import sys
+
+sys.setrecursionlimit(10000)
+
 
 
 @dataclass(frozen=True)
@@ -210,29 +214,37 @@ def load_stage2_v2_tree(
             tokenizer_name_or_path=resolved_tokenizer,
             nodes=tuple(updated_nodes),
         )
+def _row_slot_sort_key(node: VisualTreeNode) -> tuple[int, int, int, int]:
+    if node.source == "main":
+        return (0, node.main_path_position or 0, 0, node.index)
+    return (
+        1,
+        node.anchor_main_path_position or 0,
+        node.rank,
+        node.stored_node_index if node.stored_node_index is not None else node.index,
+    )
 
 
 def _assign_x_slots(nodes: tuple[VisualTreeNode, ...]) -> dict[int, float]:
-    root_candidates = [node.index for node in nodes if node.parent_index < 0]
-    if len(root_candidates) != 1:
-        raise ValueError(f"Expected exactly one root node, found {len(root_candidates)}.")
+    rows: dict[int, list[VisualTreeNode]] = {}
+    for node in nodes:
+        rows.setdefault(node.position_id, []).append(node)
 
     x_slots: dict[int, float] = {}
-    next_leaf_slot = 0
+    for position_id in sorted(rows):
+        row_nodes = rows[position_id]
+        main_nodes = [node for node in row_nodes if node.source == "main"]
+        anchor_nodes = [node for node in row_nodes if node.source != "main"]
+        if len(main_nodes) > 1:
+            raise ValueError(f"Expected at most one main node at position_id={position_id}, found {len(main_nodes)}.")
 
-    def visit(node_index: int) -> float:
-        nonlocal next_leaf_slot
-        children = list(nodes[node_index].child_indices)
-        if not children:
-            slot = float(next_leaf_slot)
-            next_leaf_slot += 1
-        else:
-            child_slots = [visit(child_index) for child_index in children]
-            slot = sum(child_slots) / len(child_slots)
-        x_slots[node_index] = slot
-        return slot
+        ordered_row: list[VisualTreeNode] = []
+        if main_nodes:
+            ordered_row.extend(sorted(main_nodes, key=_row_slot_sort_key))
+        ordered_row.extend(sorted(anchor_nodes, key=_row_slot_sort_key))
 
-    visit(root_candidates[0])
+        for slot, node in enumerate(ordered_row):
+            x_slots[node.index] = float(slot)
     return x_slots
 
 
