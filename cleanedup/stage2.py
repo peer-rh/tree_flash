@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import tqdm
 
 
 IGNORE_IDX = -1
@@ -1262,7 +1263,7 @@ def main():
         with h5py.File(part_path, "w") as hf:
             initialize_hdf5(hf, attrs=hdf5_attrs)
             with torch.no_grad():
-                for batch in dataloader:
+                for batch in tqdm.tqdm(dataloader):
                     sequences = process_batch(
                         batch=batch,
                         model=model,
