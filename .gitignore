@@ -9,3 +9,4 @@ data
 outputs
 venv-2.9
 vis.html
+wandb

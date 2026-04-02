@@ -117,7 +117,7 @@ python -m src.trainer \
     --tree_type branch_off --tree_args "$TREE_JSON" \
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
-    --data.path /capstor/store/cscs/2go/go60/prheinbo/q3_4b_stage2.h5 --data.batch_size 4 --data.num_anchors 512 --data.tree_seq_depth 15   \
+    --data.path /capstor/store/cscs/2go/go60/prheinbo/q3_4b_stage2.h5 --data.batch_size 2 --data.num_anchors 512 --data.tree_seq_depth 15   \
     --trainer.save_every 2048 --trainer.precision bf16-true --trainer.grad_accum_steps 8 --trainer.num_epochs 6 \
     --trainer.eval_every 2048 --trainer.wandb_run_name $EXPERIMENT_NAME --trainer.checkpoint_path $OUTPUT_DIR/checkpoints \
     --trainer.anchor_chunk_size null --trainer.ce_chunk_size 32768 \
