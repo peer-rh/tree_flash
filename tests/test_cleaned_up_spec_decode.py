@@ -143,7 +143,8 @@ def test_draft_tree_uses_q_head_outputs_and_crops_drafter_cache() -> None:
     target_embeddings = FakeEmbedding(hidden_size=3)
     target_lm_head = FakeLmHead(vocab_size=16)
     drafter_cache = FakeCache(seq_length=4)
-    drafter = FakeDrafter(torch.tensor([0.0, 2.0]), mask_token_id=77)
+    q_logits = torch.arange(tree_processor.block_size, dtype=torch.float32)
+    drafter = FakeDrafter(q_logits, mask_token_id=77)
     target_ctx_features = torch.ones((1, 3, 2), dtype=torch.float32)
 
     tree_token_ids, draft_logits, draft_token_probs, tree_info, pruning_scores = cleaned_up_spec_decode.draft_tree(
@@ -161,15 +162,18 @@ def test_draft_tree_uses_q_head_outputs_and_crops_drafter_cache() -> None:
     )
 
     assert target_embeddings.last_ids is not None
-    assert target_embeddings.last_ids.tolist() == [[5, 77]]
+    assert target_embeddings.last_ids.tolist() == [[5] + [77] * (tree_info.block_size - 1)]
     assert drafter.calls[0]["use_cache"] is True
     assert drafter.calls[0]["return_aux"] is True
-    assert drafter.calls[0]["position_ids"].tolist() == [[4, 5, 6, 10, 11]]
+    expected_position_ids = [[4, 5, 6] + (tree_info.depth + 10).tolist()]
+    assert drafter.calls[0]["position_ids"].tolist() == expected_position_ids
     assert drafter_cache.crop_calls == [7]
     assert tree_token_ids.tolist()[0] == 5
     assert draft_logits.shape == (tree_info.block_size, 16)
     assert draft_token_probs.shape == (tree_info.block_size,)
-    assert torch.allclose(pruning_scores, torch.tensor([1.0, torch.sigmoid(torch.tensor(2.0)).item()]))
+    expected_pruning_scores = torch.sigmoid(q_logits)
+    expected_pruning_scores[0] = 1.0
+    assert torch.allclose(pruning_scores, expected_pruning_scores)
 
 
 def test_prune_drafted_tree_preserves_ancestor_closure() -> None:
@@ -180,7 +184,7 @@ def test_prune_drafted_tree_preserves_ancestor_closure() -> None:
     draft_token_probs = torch.linspace(1.0, 0.1, steps=tree_info.block_size, dtype=torch.float32)
     node_correctness_probs = torch.tensor([1.0, 0.2, 0.4, 0.3, 0.9, 0.8, 0.1, 0.7], dtype=torch.float32)
 
-    pruned_tokens, _, _, pruned_info = cleaned_up_spec_decode.prune_drafted_tree(
+    pruned_tokens, _, _, pruned_scores, pruned_info = cleaned_up_spec_decode.prune_drafted_tree(
         tree_token_ids=tree_token_ids,
         draft_logits=draft_logits,
         draft_token_probs=draft_token_probs,
@@ -190,14 +194,14 @@ def test_prune_drafted_tree_preserves_ancestor_closure() -> None:
     )
 
     assert pruned_tokens.tolist() == [0, 4, 5, 7]
+    assert pruned_scores.tolist() == pytest.approx([1.0, 0.9, 0.8, 0.7])
     assert pruned_info.parent_idx.tolist() == [-1, 0, 1, 2]
 
 
 def test_build_acceptance_mask_handles_greedy_and_temperature_modes(monkeypatch) -> None:
-    tree_info = BlockTreeProcessor(tree_seq_depth=2, sub_tree_paths=[]).build_tree_info(
-        batch_size=1,
-        num_blocks=1,
-        device=torch.device("cpu"),
+    tree_info = SimpleNamespace(
+        block_size=2,
+        parent_idx=torch.tensor([-1, 0], dtype=torch.long),
     )
     tree_token_ids = torch.tensor([3, 4], dtype=torch.long)
     verifier_logits = torch.tensor(
@@ -207,10 +211,10 @@ def test_build_acceptance_mask_handles_greedy_and_temperature_modes(monkeypatch)
         ],
         dtype=torch.float32,
     )
-    draft_token_probs = torch.tensor([1.0, 0.4], dtype=torch.float32)
+    q_scores = torch.tensor([1.0, 0.4], dtype=torch.float32)
 
     greedy = cleaned_up_spec_decode.build_acceptance_mask(
-        draft_token_probs=draft_token_probs,
+        q_scores=q_scores,
         verifier_logits=verifier_logits,
         tree_token_ids=tree_token_ids,
         tree_info=tree_info,
@@ -220,13 +224,41 @@ def test_build_acceptance_mask_handles_greedy_and_temperature_modes(monkeypatch)
 
     monkeypatch.setattr(cleaned_up_spec_decode.torch, "rand", lambda *args, **kwargs: torch.tensor(0.2))
     sampled = cleaned_up_spec_decode.build_acceptance_mask(
-        draft_token_probs=draft_token_probs,
+        q_scores=q_scores,
         verifier_logits=verifier_logits,
         tree_token_ids=tree_token_ids,
         tree_info=tree_info,
         temperature=1.0,
     )
     assert sampled.tolist() == [True, True]
+
+
+def test_build_acceptance_mask_normalizes_q_scores_per_parent(monkeypatch) -> None:
+    tree_info = SimpleNamespace(
+        block_size=3,
+        parent_idx=torch.tensor([-1, 0, 0], dtype=torch.long),
+    )
+    tree_token_ids = torch.tensor([3, 0, 1], dtype=torch.long)
+    verifier_logits = torch.tensor(
+        [
+            [0.0, 0.0, -10.0, -10.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    q_scores = torch.tensor([1.0, 1.0, 2.0], dtype=torch.float32)
+
+    monkeypatch.setattr(cleaned_up_spec_decode.torch, "rand", lambda *args, **kwargs: torch.tensor(0.8))
+    accepted = cleaned_up_spec_decode.build_acceptance_mask(
+        q_scores=q_scores,
+        verifier_logits=verifier_logits,
+        tree_token_ids=tree_token_ids,
+        tree_info=tree_info,
+        temperature=1.0,
+    )
+
+    assert accepted.tolist() == [True, True, False]
 
 
 def test_speculative_generate_from_ids_preserves_caches_across_steps(monkeypatch) -> None:
@@ -244,11 +276,18 @@ def test_speculative_generate_from_ids_preserves_caches_across_steps(monkeypatch
         return past_key_values
 
     monkeypatch.setattr(cleaned_up_spec_decode, "trim_dynamic_cache", fake_trim_dynamic_cache)
-
-    tree_info = BlockTreeProcessor(tree_seq_depth=2, sub_tree_paths=[]).build_tree_info(
-        batch_size=1,
-        num_blocks=1,
-        device=torch.device("cpu"),
+    tree_info = SimpleNamespace(
+        block_size=2,
+        parent_idx=torch.tensor([-1, 0], dtype=torch.long),
+        depth=torch.tensor([0, 1], dtype=torch.long),
+        tree_mask=torch.tensor(
+            [
+                [True, False],
+                [True, True],
+            ],
+            dtype=torch.bool,
+        ),
+        primary_path_mask=torch.tensor([True, True], dtype=torch.bool),
     )
     call_state = {"draft": 0}
 
@@ -317,16 +356,16 @@ def test_speculative_generate_from_ids_preserves_caches_across_steps(monkeypatch
         tokenizer=tokenizer,
         prompt_ids=torch.tensor([9, 8], dtype=torch.long),
         tree_processor=tree_processor,
-        max_new_tokens=3,
+        max_new_tokens=5,
         temperature=0.0,
     )
 
     assert call_state["draft"] == 2
     assert trim_calls == [(2, [0, 1]), (4, [0, 1])]
-    assert result.continuation_ids.tolist() == [1, 4, 4]
+    assert result.continuation_ids.tolist() == [4, 4, 4, 4]
     assert result.acceptance_lengths == [1, 1]
     assert result.drafted_tokens == 2
-    assert result.committed_tokens == 3
+    assert result.committed_tokens == 5
 
 
 def test_cleaned_up_infer_uses_local_spec_decode() -> None:

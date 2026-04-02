@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 
 import torch
@@ -7,6 +8,8 @@ from transformers.cache_utils import Cache, DynamicCache
 
 from src.trees import PrunableTreeProcessor, TreeInfo, subset_tree_info
 from utils import gather_token_probability, sample_from_logits, unwrap_model
+
+sys.modules.setdefault("spec_decode", sys.modules[__name__])
 
 
 @dataclass
@@ -143,7 +146,7 @@ def prune_drafted_tree(
     tree_info: TreeInfo,
     node_correctness_probs: torch.Tensor,
     candidate_tree_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TreeInfo]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, TreeInfo]:
     """Prune a drafted tree down to a smaller ancestor-closed subset."""
     keep_indices = select_pruned_keep_indices(
         tree_info=tree_info,
@@ -151,7 +154,7 @@ def prune_drafted_tree(
         candidate_tree_size=candidate_tree_size,
     )
     if len(keep_indices) == tree_info.block_size:
-        return tree_token_ids, draft_logits, draft_token_probs, tree_info
+        return tree_token_ids, draft_logits, draft_token_probs, node_correctness_probs, tree_info
 
     keep = torch.tensor(keep_indices, dtype=torch.long, device=tree_token_ids.device)
     pruned_tree_info = subset_tree_info(tree_info, keep)
@@ -159,6 +162,7 @@ def prune_drafted_tree(
         tree_token_ids.index_select(0, keep),
         draft_logits.index_select(0, keep),
         draft_token_probs.index_select(0, keep),
+        node_correctness_probs.index_select(0, keep),
         pruned_tree_info,
     )
 
@@ -190,8 +194,8 @@ def draft_tree(
             torch.arange(pre_len, pre_len + target_ctx_features.shape[1], device=device),
             tree_position_ids.squeeze(0),
         ],
-        dim=1,
-    )
+        dim=0,
+    ).unsqueeze(0)
     draft_hidden_states, _, q_logits = drafter_model(
         hidden_states=noise_embeddings,
         position_ids=position_ids,
@@ -243,7 +247,7 @@ def verify_tree(
 
 def build_acceptance_mask(
     *,
-    draft_token_probs: torch.Tensor,
+    q_scores: torch.Tensor,
     verifier_logits: torch.Tensor,
     tree_token_ids: torch.Tensor,
     tree_info: TreeInfo,
@@ -259,6 +263,21 @@ def build_acceptance_mask(
             accepted[node_idx] = tree_token_ids[node_idx] == target_token
         return accepted
 
+    proposal_probs = q_scores.to(device=tree_token_ids.device, dtype=torch.float32).clone()
+    proposal_probs[0] = 1.0
+    for parent_idx in range(tree_info.block_size):
+        child_mask = tree_info.parent_idx == parent_idx
+        child_indices = torch.nonzero(child_mask, as_tuple=False).squeeze(-1)
+        if child_indices.numel() == 0:
+            continue
+        child_scores = proposal_probs.index_select(0, child_indices).clamp_min(0.0)
+        score_sum = child_scores.sum()
+        if float(score_sum.item()) <= 0.0:
+            child_scores = torch.full_like(child_scores, 1.0 / float(child_indices.numel()))
+        else:
+            child_scores = child_scores / score_sum
+        proposal_probs.index_copy_(0, child_indices, child_scores)
+
     for node_idx in range(1, tree_info.block_size):
         parent_idx = int(tree_info.parent_idx[node_idx].item())
         target_prob = gather_token_probability(
@@ -266,8 +285,8 @@ def build_acceptance_mask(
             tree_token_ids[node_idx].view(1),
             temperature,
         )[0]
-        draft_prob = draft_token_probs[node_idx].clamp_min(1e-8)
-        accept_prob = torch.clamp(target_prob / draft_prob, max=1.0)
+        proposal_prob = proposal_probs[node_idx].clamp_min(1e-8)
+        accept_prob = torch.clamp(target_prob / proposal_prob, max=1.0)
         accepted[node_idx] = torch.rand((), device=tree_token_ids.device) <= accept_prob
     return accepted
 
@@ -338,7 +357,7 @@ def speculative_generate_from_ids(
         )
         drafted_tokens += tree_info.block_size - 1
         if isinstance(tree_processor, PrunableTreeProcessor):
-            tree_token_ids, draft_logits, draft_token_probs, tree_info = prune_drafted_tree(
+            tree_token_ids, draft_logits, draft_token_probs, pruning_scores, tree_info = prune_drafted_tree(
                 tree_token_ids=tree_token_ids,
                 draft_logits=draft_logits,
                 draft_token_probs=draft_token_probs,
@@ -356,7 +375,7 @@ def speculative_generate_from_ids(
             target_cache=target_cache,
         )
         accepted_mask = build_acceptance_mask(
-            draft_token_probs=draft_token_probs,
+            q_scores=pruning_scores,
             verifier_logits=verifier_logits,
             tree_token_ids=tree_token_ids,
             tree_info=tree_info,
